@@ -1,0 +1,10 @@
+# Project conventions
+
+* Only record traps that are easy to fall into (specific and actionable). Do not describe module layout or data flow: that goes stale fast and can be learned by reading the code.
+* When a session uncovers something worth recording, list it in the reply under "Suggested .rules additions" and let the user decide. Do not edit `.rules` in passing.
+* Write comments only to explain *why*; never comments that restate the code.
+
+# Commit rules
+
+* Keep commit messages short: a one-line imperative title (in Chinese, no `feat:` / `fix:` style prefixes, no trailing punctuation), followed by one bullet per feature or fix describing what changed in searchable terms. Leave code details such as function names, file names and config keys to the diff.
+* One commit does one thing; formatting and dependency upgrades go in commits separate from feature changes.
