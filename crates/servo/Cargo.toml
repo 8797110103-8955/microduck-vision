@@ -1,0 +1,21 @@
+[package]
+name = "servo"
+description = "Product-agnostic servo definitions, protocol adapters, drivers and test doubles; body and UI policy stay above this crate."
+# The boundary intentionally excludes body templates, joint order, IMU wiring and UI policy.
+autotests = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustypot.workspace = true
+serialport.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+duck-control = { path = "../../vendor/microduck/duck-control" }
+
+[[test]]
+name = "servo"
+path = "tests/servo.rs"

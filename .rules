@@ -1,10 +1,14 @@
+> Agents keep temporary, project-related files (scratch scripts, logs, notes) in `.agentic/`.
+> Record only traps that are easy to fall into, not module layout. File format changes get no compatibility code.
+
 # Project conventions
 
-* Only record traps that are easy to fall into (specific and actionable). Do not describe module layout or data flow: that goes stale fast and can be learned by reading the code.
-* When a session uncovers something worth recording, list it in the reply under "Suggested .rules additions" and let the user decide. Do not edit `.rules` in passing.
-* Write comments only to explain *why*; never comments that restate the code.
+* `vendor/` is official code pinned to a release: never edit it or run `git subtree pull`. Use it directly, and port only what cannot be used as is.
+* `crates/` holds only product-agnostic foundation APIs. Product logic (virtual machines, robots, storage, UI flows) belongs to the app.
+* Put a crate's boundary with other crates in a comment right under its Cargo `description`.
 
 # Commit rules
 
-* Keep commit messages short: a one-line imperative title (in Chinese, no `feat:` / `fix:` style prefixes, no trailing punctuation), followed by one bullet per feature or fix describing what changed in searchable terms. Leave code details such as function names, file names and config keys to the diff.
-* One commit does one thing; formatting and dependency upgrades go in commits separate from feature changes.
+* Explain *why*; the diff already shows what changed.
+* Keep the title short and imperative, using stable, searchable domain, module, or behavior keywords without implementation details.
+* The body is optional; when needed, mention only user-visible behavior, important constraints, or compatibility information. Leave function names, file names, and config keys to the diff unless they are important search terms.
