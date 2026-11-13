@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/servo"]
+members = ["crates/servo", "crates/duck-body", "crates/loop-body"]
 exclude = ["vendor", "old", "apps"]
 
 [workspace.package]
@@ -13,3 +13,5 @@ license = "Apache-2.0"
 rustypot = "1.13.1"
 serialport = { version = "4.10.1", default-features = false }
 thiserror = "2.0.21"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"

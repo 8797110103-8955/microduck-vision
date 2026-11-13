@@ -5,6 +5,7 @@
 
 * `vendor/` is official code pinned to a release: never edit it or run `git subtree pull`. Use it directly, and port only what cannot be used as is.
 * `crates/` holds only product-agnostic foundation APIs. Product logic (virtual machines, robots, storage, UI flows) belongs to the app.
+* Static assets used by the desktop UI belong in `apps/desktop/assets`; do not add UI static assets under `apps/desktop/src/assets`.
 * Put a crate's boundary with other crates in a comment right under its Cargo `description`.
 
 # Commit rules

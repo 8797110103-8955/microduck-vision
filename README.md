@@ -10,7 +10,7 @@
 ```bash
 cd apps/desktop
 pnpm install
-pnpm tauri dev
+pnpm dev
 ```
 
 - 检查：`pnpm lint`、`pnpm test`；打包：`pnpm release`。

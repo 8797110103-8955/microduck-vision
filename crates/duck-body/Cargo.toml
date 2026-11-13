@@ -1,0 +1,23 @@
+[package]
+name = "duck-body"
+description = "Virtual body templates, kinematics and dynamics boundaries without real servo I/O."
+# The boundary intentionally excludes ServoDriver, serial ports, machine instances and UI policy.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duck-ipc-proto = { path = "../../vendor/microduck/duck-ipc-proto" }
+kinematics = { path = "../../vendor/microduck/kinematics" }
+roxmltree = "0.21.2"
+serde.workspace = true
+specta = { version = "=2.0.0-rc.28", features = ["derive"] }
+thiserror.workspace = true
+toml.workspace = true
+servo = { path = "../servo" }
+
+[[test]]
+name = "duck_body"
+path = "tests/duck_body.rs"
+
