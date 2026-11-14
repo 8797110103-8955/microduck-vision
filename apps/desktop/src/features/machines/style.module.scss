@@ -1,0 +1,239 @@
+@use "../../styles/tokens" as *;
+
+.page {
+  animation: rise 0.2s ease-out;
+}
+
+.physicalMachinesPage {
+  display: grid;
+  gap: 16px;
+  min-height: 0;
+  margin: 30px 32px 0 0;
+  padding-bottom: 30px;
+
+  .panelCard {
+    padding: 20px;
+    border: 1px solid $border;
+    border-radius: 12px;
+    background: $surface;
+    box-shadow: 0 5px 16px rgba(35, 30, 18, 0.04);
+  }
+
+  .smallButton {
+    padding: 6px 9px;
+    font-size: 12px;
+  }
+
+  .danger {
+    border-color: #f3c5c6;
+    color: $red;
+    background: $surface;
+  }
+
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    width: max-content;
+    padding: 4px 8px;
+    border: 1px solid $border;
+    border-radius: 99px;
+    color: $muted;
+    background: $surface-2;
+    font-size: 11px;
+
+    &.ok {
+      color: $green;
+      border-color: rgba($green, 0.4);
+      background: rgba($green, 0.1);
+    }
+  }
+
+  .emptyState {
+    padding: 45px;
+    color: $muted;
+    text-align: center;
+    border-style: dashed;
+  }
+
+  .physicalConnectionBar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 12px;
+
+    label {
+      display: grid;
+      gap: 5px;
+      min-width: 180px;
+      color: $muted;
+      font-size: 12px;
+    }
+  }
+
+  .physicalAutoReconnect {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: auto;
+  }
+
+  .physicalDetected,
+  .physicalMachineList {
+    display: grid;
+    gap: 10px;
+  }
+
+  .physicalDetected {
+    &.clickable {
+      cursor: pointer;
+
+      &:hover,
+      &:focus-visible {
+        border-color: rgba($accent, 0.65);
+        outline: none;
+      }
+    }
+  }
+
+  .physicalDetectedHeader,
+  .physicalDetectedTitle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .physicalDetectedHeader {
+    justify-content: space-between;
+  }
+
+  .candidateAdd {
+    color: $accent;
+    font-size: 20px;
+    line-height: 1;
+  }
+
+  .physicalDetectedStatus,
+  .physicalDetectedCensus {
+    color: $muted;
+    font-size: 12px;
+  }
+
+  .physicalDetectedCensus {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+
+    code {
+      color: $text;
+    }
+  }
+
+  .physicalMachineRow {
+    padding: 13px;
+    border: 1px solid $border;
+    border-radius: 9px;
+    background: $surface-2;
+
+    &.connected {
+      border-color: rgba($green, 0.55);
+    }
+  }
+
+  .physicalMachineSummary,
+  .physicalMachineActions,
+  .physicalCensusLine {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .physicalMachineSummary {
+    width: 100%;
+  }
+
+  .physicalExpand {
+    width: 28px;
+    padding: 5px;
+    border: 0;
+    background: transparent;
+  }
+
+  .physicalExpandIcon {
+    display: block;
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid $muted;
+    border-bottom: 2px solid $muted;
+    transform: rotate(-45deg);
+
+    .expanded & {
+      transform: rotate(45deg);
+    }
+  }
+
+  .physicalFact {
+    display: grid;
+    gap: 3px;
+    min-width: 130px;
+    color: $muted;
+    font-size: 12px;
+  }
+
+  .physicalVirtualMachine {
+    flex: 1;
+  }
+
+  .physicalNameField {
+    display: grid;
+    gap: 4px;
+    min-width: 170px;
+    flex: 1;
+
+    input {
+      min-height: 30px;
+    }
+  }
+
+  .physicalMachineDetails {
+    display: grid;
+    gap: 10px;
+    margin: 10px 0 0 38px;
+    padding-top: 10px;
+    border-top: 1px solid $border;
+    color: $muted;
+    font-size: 12px;
+  }
+
+  .physicalCensusLine {
+    flex-wrap: wrap;
+  }
+
+  .physicalDelete {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 980px) {
+  .physicalMachinesPage {
+    .physicalMachineSummary {
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+
+    .physicalNameField {
+      min-width: 150px;
+    }
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0.3;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

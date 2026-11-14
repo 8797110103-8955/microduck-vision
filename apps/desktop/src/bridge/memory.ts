@@ -1,0 +1,786 @@
+import type {
+  ActionRecord,
+  LoopAction,
+  LoopStatus,
+  PhysicalMachine,
+  PolicyEntry,
+  PhysicalMachineDetectInput,
+  PhysicalMachineProbeInput,
+  PhysicalMachineReconnectInput,
+  PhysicalMachineSaveInput,
+  PhysicalMachineInput,
+  SceneInfo,
+  SceneFrame,
+  ServoCatalogEntry,
+  ServoModelKey,
+  VirtualMachine,
+} from "./types";
+import type { DesktopBackend } from "./types";
+
+function simulationFor(catalog: ServoCatalogEntry[], model: ServoModelKey) {
+  const entry = catalog.find((item) => item.key === model) ?? catalog[0];
+  if (!entry) throw new Error(`Missing servo profile for ${model}`);
+  return {
+    damping: entry.simDamping,
+    frictionLoss: entry.simFrictionLoss,
+    armature: entry.simArmature,
+    kp: entry.simKp,
+    forceRange: entry.simForceRange,
+  };
+}
+
+function sameCensus(a: PhysicalMachine["census"], b: PhysicalMachine["census"]) {
+  const leftCensus = a ?? [];
+  const rightCensus = b ?? [];
+  if (!leftCensus.length || leftCensus.length !== rightCensus.length) return false;
+  const left = leftCensus
+    .map((servo) => `${servo.servoId}:${servo.model.trim().toLowerCase()}`)
+    .toSorted();
+  const right = rightCensus
+    .map((servo) => `${servo.servoId}:${servo.model.trim().toLowerCase()}`)
+    .toSorted();
+  return left.every((value, index) => value === right[index]);
+}
+
+function censusFingerprint(census: NonNullable<PhysicalMachine["census"]>) {
+  return md5Hex(
+    census
+      .toSorted((a, b) => a.servoId - b.servoId)
+      .map((servo) => `${servo.servoId}:${servo.model.trim().toLowerCase()}`)
+      .join("\0"),
+  );
+}
+
+const md5Rotate = (value: number, count: number) => (value << count) | (value >>> (32 - count));
+const md5Little = (value: number) =>
+  Array.from({ length: 4 }, (_, index) => (value >>> (8 * index)) & 0xff);
+const md5Add = (...values: number[]) => values.reduce((sum, value) => (sum + value) >>> 0, 0);
+
+function md5Hex(text: string): string {
+  const source = Array.from(new TextEncoder().encode(text));
+  const bitLength = source.length * 8;
+  source.push(0x80);
+  while (source.length % 64 !== 56) source.push(0);
+  for (let index = 0; index < 8; index += 1) source.push((bitLength / 2 ** (8 * index)) & 0xff);
+  let a0 = 0x67452301;
+  let b0 = 0xefcdab89;
+  let c0 = 0x98badcfe;
+  let d0 = 0x10325476;
+  const shifts = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+  const constants = Array.from(
+    { length: 64 },
+    (_, index) => Math.floor(Math.abs(Math.sin(index + 1)) * 2 ** 32) >>> 0,
+  );
+  for (let offset = 0; offset < source.length; offset += 64) {
+    const words = Array.from({ length: 16 }, (_, index) => {
+      const base = offset + index * 4;
+      return (
+        (source[base] |
+          (source[base + 1] << 8) |
+          (source[base + 2] << 16) |
+          (source[base + 3] << 24)) >>>
+        0
+      );
+    });
+    let a = a0;
+    let b = b0;
+    let c = c0;
+    let d = d0;
+    for (let index = 0; index < 64; index += 1) {
+      let f: number;
+      let g: number;
+      if (index < 16) {
+        f = (b & c) | (~b & d);
+        g = index;
+      } else if (index < 32) {
+        f = (d & b) | (~d & c);
+        g = (5 * index + 1) % 16;
+      } else if (index < 48) {
+        f = b ^ c ^ d;
+        g = (3 * index + 5) % 16;
+      } else {
+        f = c ^ (b | ~d);
+        g = (7 * index) % 16;
+      }
+      const next = d;
+      d = c;
+      c = b;
+      b = md5Add(
+        b,
+        md5Rotate(
+          md5Add(a, f, constants[index], words[g]),
+          shifts[Math.floor(index / 16) * 4 + (index % 4)],
+        ),
+      );
+      a = next;
+    }
+    a0 = (a0 + a) >>> 0;
+    b0 = (b0 + b) >>> 0;
+    c0 = (c0 + c) >>> 0;
+    d0 = (d0 + d) >>> 0;
+  }
+  return [...md5Little(a0), ...md5Little(b0), ...md5Little(c0), ...md5Little(d0)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+const browserCatalog: ServoCatalogEntry[] = (["hd1910", "xl330"] as ServoModelKey[]).map((key) => ({
+  key,
+  label: key === "hd1910" ? "飞特 HD1910" : "XL330",
+  protocol: "browser",
+  defaultBinding: key === "hd1910",
+  capabilities: [],
+  modelNumber: 0,
+  resolution: 0,
+  kpDivisor: null,
+  pwmLimit: null,
+  defaultBaud: 0,
+  baudRates: [],
+  registerCount: 0,
+  supportsFastSync: false,
+  supportsCenterCalibration: false,
+  resetNeedsUnlock: false,
+  supportsReboot: false,
+  protocolDefinition: "browser",
+  velocityRadPerCount: null,
+  voltsPerCount: null,
+  milliampsPerCount: null,
+  moveBlock: [],
+  massG: null,
+  baselineMassG: null,
+  hardwareMassG: null,
+  hardwareGearRatio: null,
+  hardwareBacklashDeg: null,
+  hardwareVoltageRange: [null, null],
+  datasheetTorqueConstant: null,
+  noLoadSpeedRpm: null,
+  peakStallTorqueKgCm: null,
+  bamMotor: "browser",
+  bamModel: "browser",
+  bamVin: null,
+  bamKp: null,
+  bamErrorGain: null,
+  bamMaxPwm: null,
+  bamKt: null,
+  bamResistance: null,
+  bamArmature: 0.0018,
+  bamQOffset: null,
+  bamCommandDelay: null,
+  bamFrictionBase: null,
+  bamFrictionStribeck: null,
+  bamFrictionViscous: null,
+  bamLoadFrictionMotor: null,
+  bamLoadFrictionExternal: null,
+  bamLoadFrictionMotorStribeck: null,
+  bamLoadFrictionExternalStribeck: null,
+  bamLoadFrictionMotorQuad: null,
+  bamLoadFrictionExternalQuad: null,
+  bamDthetaStribeck: null,
+  bamAlpha: null,
+  kpFw: null,
+  vinRange: [null, null],
+  vinDropGainRange: [null, null],
+  vinMin: null,
+  delaySteps: [0, 0],
+  backlashDeg: null,
+  pAtKpFw: null,
+  simDamping: 0.053,
+  simFrictionLoss: 0.0048,
+  simArmature: 0.0018,
+  simKp: 0.55,
+  simForceRange: 0.96,
+}));
+
+export class MemoryBackend implements DesktopBackend {
+  readonly calls: Array<{ name: string; value?: unknown }> = [];
+  private machines: VirtualMachine[];
+  private physical: PhysicalMachine[] = [];
+  private autoReconnect = true;
+  private actionList: ActionRecord[] = [
+    { id: "stand", name: "站立", kind: "pose", updatedAt: "内置", source: "builtin" },
+    { id: "sit", name: "坐下", kind: "pose", updatedAt: "内置", source: "builtin" },
+  ];
+  private status: LoopStatus | null = null;
+  private previewStatus: LoopStatus | null = null;
+  private policies: PolicyEntry[] = [
+    {
+      id: "alpha-walking",
+      name: "Alpha Walking",
+      file: "alpha_walking.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_walking.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "velstand",
+      name: "Velstand（行走与站立）",
+      file: "velstand.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/velstand.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "alpha-stand",
+      name: "Alpha Stand",
+      file: "alpha_stand.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_stand.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "roller",
+      name: "Roller",
+      file: "roller.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roller.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "alpha-sitstand",
+      name: "Sitstand",
+      file: "alpha_sitstand.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_sitstand.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "alpha-ground-pick",
+      name: "Ground Pick",
+      file: "alpha_ground_pick.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_ground_pick.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "roller-crouch",
+      name: "Crouch",
+      file: "roller_crouch.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roller_crouch.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "roulade",
+      name: "Roulade",
+      file: "roulade.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roulade.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "ball-kick-left",
+      name: "Kick Left",
+      file: "ball_kick_left.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/ball_kick_left.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "ball-kick-right",
+      name: "Kick Right",
+      file: "ball_kick_right.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/ball_kick_right.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+  ];
+
+  private readonly catalog: ServoCatalogEntry[];
+
+  constructor(catalog: ServoCatalogEntry[]) {
+    this.catalog = catalog.length ? catalog : browserCatalog;
+    this.machines = [
+      {
+        id: "official-hd1910",
+        name: "机器 0",
+        bodyId: "official",
+        servoModel: "hd1910",
+        simulation: simulationFor(this.catalog, "hd1910"),
+        startupSelected: true,
+        referencedBy: [],
+      },
+    ];
+  }
+
+  async officialSceneModel(): Promise<SceneInfo> {
+    this.calls.push({ name: "officialSceneModel" });
+    return {
+      meshDir: "",
+      model: {
+        bodies: [{ name: "official-duck", geoms: [] }],
+        joints: [],
+        trunkHeight: 0.2,
+        headCamera: null,
+      },
+    };
+  }
+
+  async officialSceneFrame(positions: number[]): Promise<SceneFrame> {
+    this.calls.push({ name: "officialSceneFrame", value: positions });
+    return { bodies: [[0, 0, 0, 1, 0, 0, 0]], markers: [] };
+  }
+
+  async servoCatalog() {
+    this.calls.push({ name: "servoCatalog" });
+    return this.catalog.map((entry) => ({ ...entry, capabilities: [...entry.capabilities] }));
+  }
+
+  async virtualMachines() {
+    this.calls.push({ name: "virtualMachines" });
+    return this.machines.map((machine) => ({
+      ...machine,
+      referencedBy: [...machine.referencedBy],
+    }));
+  }
+
+  async physicalMachines() {
+    this.calls.push({ name: "physicalMachines" });
+    return this.physical.map((machine) => ({
+      ...machine,
+      onlineServoIds: [...machine.onlineServoIds],
+    }));
+  }
+
+  async physicalPorts() {
+    this.calls.push({ name: "physicalPorts" });
+    return [
+      { portName: "COM1", vid: null, pid: null, adapterSerial: null, product: "Memory port" },
+    ];
+  }
+
+  async autoReconnectEnabled() {
+    this.calls.push({ name: "autoReconnectEnabled" });
+    return this.autoReconnect;
+  }
+
+  async setAutoReconnectEnabled(enabled: boolean) {
+    this.calls.push({ name: "setAutoReconnectEnabled", value: enabled });
+    this.autoReconnect = enabled;
+    return enabled;
+  }
+
+  async physicalBaudChoices() {
+    this.calls.push({ name: "physicalBaudChoices" });
+    return [1_000_000, 576_000, 115_200, 57_600];
+  }
+
+  async probePhysicalMachine(input: PhysicalMachineProbeInput) {
+    this.calls.push({ name: "probePhysicalMachine", value: input });
+    return this.detectPhysicalMachine({
+      census: [
+        { servoId: 1, model: "hd1910" },
+        { servoId: 2, model: "hd1910" },
+      ],
+      reconnectHint: input.reconnectHint,
+    });
+  }
+
+  async detectPhysicalMachine(input: PhysicalMachineDetectInput) {
+    this.calls.push({ name: "detectPhysicalMachine", value: input });
+    const census = input.census
+      .map((servo) => ({ servoId: servo.servoId, model: servo.model.trim().toLowerCase() }))
+      .toSorted((a, b) => a.servoId - b.servoId);
+    const valid =
+      census.length > 0 &&
+      census.every(
+        (servo, index) =>
+          (servo.model === "hd1910" || servo.model === "xl330") &&
+          (index === 0 || census[index - 1].servoId !== servo.servoId),
+      );
+    const md5 = valid ? censusFingerprint(census) : null;
+    const matches = valid
+      ? this.physical.filter((machine) => sameCensus(machine.census, census))
+      : [];
+    return {
+      census,
+      md5,
+      reconnectHint: input.reconnectHint,
+      matchResult: !valid
+        ? ("incompleteCensus" as const)
+        : matches.length > 1
+          ? ("identityConflict" as const)
+          : matches.length === 1
+            ? { unique: { physical_machine_id: matches[0].id } }
+            : ("new" as const),
+      diagnostics: !valid
+        ? ["IncompleteCensus" as const]
+        : matches.length > 1
+          ? ["IdentityConflict" as const]
+          : [],
+    };
+  }
+
+  async savePhysicalMachine(input: PhysicalMachineSaveInput) {
+    this.calls.push({ name: "savePhysicalMachine", value: input });
+    const detected = await this.detectPhysicalMachine({
+      census: input.census,
+      reconnectHint: input.reconnectHint,
+    });
+    if (!detected.md5 || detected.matchResult !== "new")
+      throw new Error("physical machine identity is not a unique new census");
+    const machine: PhysicalMachine = {
+      id: `physical-${this.physical.length + 1}`,
+      name: input.name?.trim() || detected.md5,
+      usbPort: input.reconnectHint?.portName ?? "",
+      machineCode: detected.md5,
+      census: detected.census,
+      reconnectHint: input.reconnectHint,
+      virtualMachineId: null,
+      onlineServoIds: detected.census.map((servo) => servo.servoId),
+      connected: true,
+      lastSeen: "刚刚",
+    };
+    this.physical.push(machine);
+    return {
+      ...machine,
+      census: [...(machine.census ?? [])],
+      onlineServoIds: [...machine.onlineServoIds],
+    };
+  }
+
+  async disconnectPhysicalMachine(id: string) {
+    this.calls.push({ name: "disconnectPhysicalMachine", value: id });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    machine.connected = false;
+    return {
+      ...machine,
+      census: [...(machine.census ?? [])],
+      onlineServoIds: [...machine.onlineServoIds],
+    };
+  }
+
+  async reconnectPhysicalMachine(input: PhysicalMachineReconnectInput) {
+    this.calls.push({ name: "reconnectPhysicalMachine", value: input });
+    const machine = this.physical.find((entry) => entry.id === input.id);
+    if (!machine) throw new Error(`unknown physical machine: ${input.id}`);
+    if (!sameCensus(machine.census, input.census)) {
+      machine.connected = false;
+      throw new Error("reconnect census does not match saved physical machine");
+    }
+    machine.connected = true;
+    machine.lastSeen = "刚刚";
+    machine.reconnectHint = input.reconnectHint;
+    machine.usbPort = input.reconnectHint?.portName ?? machine.usbPort;
+    machine.machineCode = censusFingerprint(machine.census ?? []);
+    return {
+      ...machine,
+      census: [...(machine.census ?? [])],
+      onlineServoIds: [...machine.onlineServoIds],
+    };
+  }
+
+  async autoReconnectPhysicalMachine(id: string, baud: number) {
+    this.calls.push({ name: "autoReconnectPhysicalMachine", value: { id, baud } });
+    return this.reconnectPhysicalMachine({
+      id,
+      census: this.physical.find((machine) => machine.id === id)?.census ?? [],
+      reconnectHint: this.physical.find((machine) => machine.id === id)?.reconnectHint ?? null,
+    });
+  }
+
+  async createPhysicalMachine(input: PhysicalMachineInput) {
+    const machine: PhysicalMachine = {
+      ...input,
+      census: [],
+      reconnectHint: input.usbPort
+        ? { portName: input.usbPort, vid: null, pid: null, adapterSerial: null, product: null }
+        : null,
+      id: `physical-${this.physical.length + 1}`,
+      virtualMachineId: null,
+      onlineServoIds: [],
+      connected: false,
+      lastSeen: null,
+    };
+    this.calls.push({ name: "createPhysicalMachine", value: machine });
+    this.physical.push(machine);
+    return { ...machine };
+  }
+
+  async connectPhysicalMachine(id: string) {
+    this.calls.push({ name: "connectPhysicalMachine", value: id });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    machine.connected = true;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async mountPhysicalMachine(id: string, virtualMachineId: string) {
+    this.calls.push({ name: "mountPhysicalMachine", value: { id, virtualMachineId } });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    if (!this.machines.some((entry) => entry.id === virtualMachineId))
+      throw new Error("unknown virtual machine");
+    machine.virtualMachineId = virtualMachineId;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async deletePhysicalMachine(id: string) {
+    this.calls.push({ name: "deletePhysicalMachine", value: id });
+    this.physical = this.physical.filter((machine) => machine.id !== id);
+  }
+
+  async renamePhysicalMachine(id: string, name: string) {
+    this.calls.push({ name: "renamePhysicalMachine", value: { id, name } });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    machine.name = name;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async scanPhysicalMachine(id: string) {
+    this.calls.push({ name: "scanPhysicalMachine", value: id });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    machine.onlineServoIds = machine.census?.length
+      ? machine.census.map((servo) => servo.servoId)
+      : [1, 2];
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async policyList() {
+    this.calls.push({ name: "policyList" });
+    return this.policies.map((policy) => ({ ...policy }));
+  }
+
+  async policyDownload(id: string) {
+    this.calls.push({ name: "policyDownload", value: id });
+    const policy = this.policies.find((entry) => entry.id === id);
+    if (!policy) throw new Error(`unknown policy: ${id}`);
+    policy.cached = true;
+    policy.size = 42;
+    policy.selected = true;
+    this.policies.forEach((entry) => (entry.selected = entry.id === id));
+    return { ...policy };
+  }
+
+  async policySelect(id: string) {
+    this.calls.push({ name: "policySelect", value: id });
+    const policy = this.policies.find((entry) => entry.id === id);
+    if (!policy?.cached) throw new Error("请先下载这个官方策略");
+    this.policies.forEach((entry) => (entry.selected = entry.id === id));
+    return { ...policy, selected: true };
+  }
+
+  async createVirtualMachine(
+    input: Pick<VirtualMachine, "name" | "bodyId" | "servoModel" | "simulation">,
+  ) {
+    const machine: VirtualMachine = {
+      ...input,
+      name: input.name.trim() || `机器 ${this.machines.length}`,
+      id: `virtual-${this.machines.length + 1}`,
+      startupSelected: false,
+      referencedBy: [],
+    };
+    this.calls.push({ name: "createVirtualMachine", value: machine });
+    this.machines.push(machine);
+    return { ...machine, referencedBy: [] };
+  }
+
+  async setStartupVirtualMachine(id: string) {
+    this.calls.push({ name: "setStartupVirtualMachine", value: id });
+    this.machines = this.machines.map((machine) => ({
+      ...machine,
+      startupSelected: machine.id === id,
+    }));
+  }
+
+  async deleteVirtualMachine(id: string) {
+    this.calls.push({ name: "deleteVirtualMachine", value: id });
+    this.machines = this.machines.filter((machine) => machine.id !== id);
+  }
+
+  async renameVirtualMachine(id: string, name: string) {
+    this.calls.push({ name: "renameVirtualMachine", value: { id, name } });
+    const machine = this.machines.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown virtual machine: ${id}`);
+    machine.name = name;
+    return { ...machine, referencedBy: [...machine.referencedBy] };
+  }
+
+  async actions() {
+    this.calls.push({ name: "actions" });
+    return this.actionList.map((action) => ({ ...action }));
+  }
+
+  async createAction(input: Pick<ActionRecord, "name" | "kind">) {
+    const action: ActionRecord = {
+      ...input,
+      id: `action-${this.actionList.length + 1}`,
+      updatedAt: "刚刚",
+      source: "user",
+    };
+    this.calls.push({ name: "createAction", value: action });
+    this.actionList.push(action);
+    return { ...action };
+  }
+
+  async deleteAction(id: string) {
+    this.calls.push({ name: "deleteAction", value: id });
+    const action = this.actionList.find((entry) => entry.id === id);
+    if (action?.source === "builtin") throw new Error("内置动作不能删除");
+    this.actionList = this.actionList.filter((entry) => entry.id !== id);
+  }
+
+  async loopOpen(input: {
+    virtualMachineId: string;
+    servoIds: number[];
+    physicalMachineId?: string;
+    policyId?: string;
+  }) {
+    this.calls.push({ name: "loopOpen", value: input });
+    const count = input.servoIds.length;
+    this.status = {
+      phase: "limp",
+      session: 0,
+      tick: 0,
+      torque: false,
+      positions: Array(count).fill(0),
+      targets: Array(count).fill(0),
+      sensorFailures: 0,
+      lastError: null,
+    };
+    return this.status;
+  }
+
+  async loopCommand(targets: number[]) {
+    this.calls.push({ name: "loopCommand", value: targets });
+    if (!this.status) throw new Error("loop is closed");
+    this.status = { ...this.status, targets: [...targets] };
+  }
+
+  async loopAction(action: LoopAction) {
+    this.calls.push({ name: "loopAction", value: action });
+    if (!this.status) throw new Error("loop is closed");
+    if (action.kind === "power") {
+      this.status = { ...this.status, phase: action.on ? "homing" : "limp", torque: action.on };
+    } else if (
+      action.kind === "drive" &&
+      action.on &&
+      (this.status.phase === "ready" || this.status.phase === "holding")
+    ) {
+      this.status = { ...this.status, phase: "driving" };
+    } else if (action.kind === "drive" && !action.on && this.status.phase === "driving") {
+      this.status = { ...this.status, phase: "holding" };
+    } else if (action.kind === "stop") {
+      this.status = { ...this.status, phase: "stopped", torque: false };
+    } else if (action.kind === "estop") {
+      this.status = { ...this.status, phase: "estop", torque: false };
+    } else if (action.kind === "reconnect") {
+      this.status = {
+        ...this.status,
+        phase: "reconnecting",
+        session: action.session,
+        torque: false,
+      };
+    }
+    return this.status;
+  }
+
+  async loopTick() {
+    this.calls.push({ name: "loopTick" });
+    if (!this.status) throw new Error("loop is closed");
+    const phase =
+      this.status.phase === "homing" && this.status.tick >= 4 ? "ready" : this.status.phase;
+    this.status = {
+      ...this.status,
+      phase,
+      tick: this.status.tick + 1,
+      positions: [...this.status.targets],
+    };
+    return this.status;
+  }
+
+  async loopStatus() {
+    this.calls.push({ name: "loopStatus" });
+    return this.status;
+  }
+
+  async loopClose() {
+    this.calls.push({ name: "loopClose" });
+    this.status = null;
+  }
+
+  async previewLoopOpen(virtualMachineId: string) {
+    this.calls.push({ name: "previewLoopOpen", value: virtualMachineId });
+    if (!this.machines.some((machine) => machine.id === virtualMachineId))
+      throw new Error(`unknown virtual machine: ${virtualMachineId}`);
+    this.previewStatus = {
+      phase: "ready",
+      session: 1,
+      tick: 0,
+      torque: false,
+      positions: Array(15).fill(0),
+      targets: Array(15).fill(0),
+      sensorFailures: 0,
+      lastError: null,
+    };
+    return {
+      ...this.previewStatus,
+      positions: [...this.previewStatus.positions],
+      targets: [...this.previewStatus.targets],
+    };
+  }
+
+  async previewLoopPolicy(id: string) {
+    this.calls.push({ name: "previewLoopPolicy", value: id });
+    if (!this.previewStatus) throw new Error("preview loop is closed");
+    const policy = this.policies.find((entry) => entry.id === id);
+    if (!policy?.cached) throw new Error("请先下载这个官方策略");
+    this.previewStatus = { ...this.previewStatus, torque: true, lastError: null };
+    return {
+      ...this.previewStatus,
+      positions: [...this.previewStatus.positions],
+      targets: [...this.previewStatus.targets],
+    };
+  }
+
+  async previewLoopTick() {
+    this.calls.push({ name: "previewLoopTick" });
+    if (!this.previewStatus) throw new Error("preview loop is closed");
+    const tick = this.previewStatus.tick + 1;
+    const targets = this.previewStatus.torque
+      ? Array.from({ length: 15 }, (_, index) => Math.sin(tick / 12 + index * 0.18) * 0.08)
+      : this.previewStatus.targets;
+    this.previewStatus = {
+      ...this.previewStatus,
+      phase:
+        this.previewStatus.torque && this.previewStatus.phase === "ready"
+          ? "driving"
+          : this.previewStatus.phase,
+      tick,
+      targets: [...targets],
+      positions: [...targets],
+    };
+    return {
+      ...this.previewStatus,
+      positions: [...this.previewStatus.positions],
+      targets: [...this.previewStatus.targets],
+    };
+  }
+
+  async previewLoopClose() {
+    this.calls.push({ name: "previewLoopClose" });
+    this.previewStatus = null;
+  }
+}

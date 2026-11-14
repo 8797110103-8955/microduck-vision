@@ -1,0 +1,4 @@
+{
+  "extends": ["../../.oxlintrc.json"],
+  "ignorePatterns": ["dist/**", "src-tauri/**", "src/bindings.ts"]
+}

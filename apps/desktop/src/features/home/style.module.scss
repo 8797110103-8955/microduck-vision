@@ -1,0 +1,300 @@
+@use "../../styles/tokens" as *;
+
+.page {
+  animation: rise 0.2s ease-out;
+}
+
+.homePage {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+
+  &.hidden {
+    display: none;
+  }
+
+  .danger {
+    border-color: #f3c5c6;
+    color: $red;
+    background: $surface;
+  }
+
+  .homeEstop {
+    position: absolute;
+    right: 20px;
+    bottom: 20px;
+    z-index: 10;
+    padding: 8px 16px;
+
+    small {
+      display: inline;
+      margin-left: 5px;
+    }
+  }
+}
+
+.previewPage {
+  position: fixed;
+  inset: 72px 16px 32px 50vw;
+  z-index: 20;
+  min-height: 0;
+  padding: 30px 32px;
+  border: 1px solid $border;
+  border-radius: 12px;
+  background: $background;
+  box-shadow: 0 18px 50px rgba(35, 30, 18, 0.18);
+}
+
+.previewMachineRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  margin-bottom: 22px;
+
+  strong {
+    color: $text;
+    font-size: 16px;
+  }
+
+  span {
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.previewLoopBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 18px;
+
+  button {
+    padding: 6px 12px;
+    border: 1px solid $border;
+    border-radius: 7px;
+    color: $text;
+    background: $surface;
+
+    &:hover:not(:disabled) {
+      border-color: rgba($accent, 0.7);
+    }
+
+    &:disabled {
+      cursor: default;
+      opacity: 0.5;
+    }
+  }
+
+  small {
+    color: $muted;
+    font-size: 11px;
+  }
+}
+
+.previewStatusDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #aaa59a;
+
+  &.online {
+    background: $green;
+  }
+
+  &.offline {
+    background: #aaa59a;
+  }
+}
+
+.previewPolicyList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+
+  button {
+    min-height: 38px;
+    padding: 8px 10px;
+    border: 1px solid $border;
+    border-radius: 8px;
+    color: $text;
+    background: $surface;
+    text-align: left;
+
+    &:hover,
+    &.selected {
+      border-color: rgba($accent, 0.7);
+      background: rgba($accent, 0.12);
+    }
+  }
+}
+
+.previewEmpty,
+.previewError {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: $muted;
+  font-size: 12px;
+}
+
+.previewError {
+  margin-bottom: 12px;
+  color: $red;
+}
+
+.officialDuckStage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: $background;
+
+  .muted {
+    color: $muted;
+  }
+
+  .danger {
+    border-color: #f3c5c6;
+    color: $red;
+    background: $surface;
+  }
+
+  .stageBar {
+    position: absolute;
+    top: 10px;
+    right: 16px;
+    left: 16px;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    pointer-events: none;
+
+    > * {
+      pointer-events: auto;
+    }
+  }
+
+  .seg {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+
+    button {
+      padding: 5px 10px;
+      border: 0;
+      color: $muted;
+      background: none;
+
+      &:hover,
+      &.on {
+        color: $text;
+      }
+
+      &.on {
+        font-weight: 600;
+      }
+    }
+  }
+
+  .stageBody {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .viewport {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    background: radial-gradient(circle at 50% 40%, #fffdf6, $background);
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  }
+
+  .duckLabel {
+    position: absolute;
+    z-index: 2;
+    transform: translate(-50%, -50%);
+    padding: 4px 8px;
+    border: 1px solid rgba($accent, 0.65);
+    border-radius: 99px;
+    color: #8d6500;
+    background: rgba($surface, 0.92);
+    font-size: 11px;
+    pointer-events: none;
+  }
+
+  .marker {
+    position: absolute;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 5px;
+    transform: translate(-50%, -50%);
+    border: 2px solid #fff;
+    border-radius: 12px;
+    color: #fff;
+    background: #9a968c;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    cursor: pointer;
+
+    &.online {
+      background: $green;
+    }
+
+    &.warn {
+      background: $amber;
+    }
+
+    &.missing {
+      background: $red;
+    }
+
+    &.unknown,
+    &.unmapped {
+      background: #9a968c;
+    }
+
+    &.chip {
+      position: static;
+      display: inline-block;
+      min-width: 9px;
+      width: 9px;
+      height: 9px;
+      padding: 0;
+      transform: none;
+      border: 0;
+      border-radius: 50%;
+      box-shadow: none;
+      cursor: default;
+    }
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0.3;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

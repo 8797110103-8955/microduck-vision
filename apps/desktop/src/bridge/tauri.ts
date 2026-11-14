@@ -1,0 +1,50 @@
+import { commands } from "../../generated/types";
+import type { DesktopBackend } from "./types";
+
+const discard = (promise: Promise<unknown>): Promise<void> => promise.then(() => undefined);
+export function createTauriBackend(): DesktopBackend {
+  return {
+    servoCatalog: () => commands.servoCatalog(),
+    virtualMachines: () => commands.virtualMachines(),
+    physicalMachines: () => commands.physicalMachines(),
+    autoReconnectEnabled: () => commands.autoReconnectEnabled(),
+    setAutoReconnectEnabled: (enabled) => commands.setAutoReconnectEnabled(enabled),
+    physicalPorts: () => commands.physicalPorts(),
+    physicalBaudChoices: () => commands.physicalBaudChoices(),
+    probePhysicalMachine: (input) => commands.physicalMachineProbe(input),
+    detectPhysicalMachine: (input) => commands.physicalMachineDetect(input),
+    savePhysicalMachine: (input) => commands.physicalMachineSave(input),
+    disconnectPhysicalMachine: (id) => commands.physicalMachineDisconnect(id),
+    reconnectPhysicalMachine: (input) => commands.physicalMachineReconnect(input),
+    autoReconnectPhysicalMachine: (id, baud) => commands.physicalMachineAutoReconnect(id, baud),
+    createPhysicalMachine: (input) => commands.physicalMachineCreate(input),
+    connectPhysicalMachine: (id) => commands.physicalMachineConnect(id),
+    mountPhysicalMachine: (id, virtualMachineId) =>
+      commands.physicalMachineMount(id, virtualMachineId),
+    deletePhysicalMachine: (id) => discard(commands.physicalMachineDelete(id)),
+    renamePhysicalMachine: (id, name) => commands.physicalMachineRename(id, name),
+    scanPhysicalMachine: (id) => commands.physicalMachineScan(id),
+    policyList: () => commands.policyList(),
+    policyDownload: (id) => commands.policyDownload(id),
+    policySelect: (id) => commands.policySelect(id),
+    createVirtualMachine: (input) => commands.virtualMachineCreate(input),
+    setStartupVirtualMachine: (id) => discard(commands.virtualMachineSetStartup(id)),
+    deleteVirtualMachine: (id) => discard(commands.virtualMachineDelete(id)),
+    renameVirtualMachine: (id, name) => commands.virtualMachineRename(id, name),
+    actions: () => commands.actions(),
+    createAction: (input) => commands.actionCreate(input),
+    deleteAction: (id) => discard(commands.actionDelete(id)),
+    loopOpen: (input) => commands.loopOpen(input),
+    loopCommand: (targets) => discard(commands.loopCommand(targets)),
+    loopAction: (action) => commands.loopAction(action),
+    loopTick: () => commands.loopTick(),
+    loopStatus: () => commands.loopStatus(),
+    loopClose: () => discard(commands.loopClose()),
+    previewLoopOpen: (virtualMachineId) => commands.previewLoopOpen(virtualMachineId),
+    previewLoopPolicy: (policyId) => commands.previewLoopPolicy(policyId),
+    previewLoopTick: () => commands.previewLoopTick(),
+    previewLoopClose: () => discard(commands.previewLoopClose()),
+    officialSceneModel: () => commands.officialSceneModel(),
+    officialSceneFrame: (positions) => commands.officialSceneFrame(positions),
+  };
+}

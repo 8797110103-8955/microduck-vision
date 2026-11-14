@@ -1,0 +1,83 @@
+@use "./tokens" as *;
+
+:root {
+  font-family: sans-serif, "Segoe UI", "PingFang SC", "Microsoft YaHei";
+  color: $text;
+  background: $background;
+  font-size: 13px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 980px;
+  min-height: 100vh;
+  margin: 0;
+  background: $background;
+  cursor: default;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 1px solid $border;
+  border-radius: 8px;
+  padding: 6px 13px;
+  color: $text;
+  background: $surface;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    opacity 0.15s ease;
+
+  &:hover:not(:disabled) {
+    border-color: #cfcabd;
+    background: #fffdf8;
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+}
+
+input,
+select {
+  min-height: 34px;
+  border: 1px solid $border;
+  border-radius: 7px;
+  padding: 5px 8px;
+  outline: none;
+  color: $text;
+  background: transparent;
+
+  &:focus {
+    outline: 2px solid #ffe08a;
+    border-color: $accent;
+  }
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 11px 10px;
+  border-bottom: 1px solid rgba($border, 0.75);
+  text-align: left;
+}
+
+th {
+  color: $muted;
+  font-size: 11px;
+  font-weight: 500;
+}

@@ -1,0 +1,8 @@
+{
+  "ignorePatterns": [
+    "dist/**",
+    "generated/**",
+    "src-tauri/gen/**",
+    "src/bindings.ts"
+  ]
+}

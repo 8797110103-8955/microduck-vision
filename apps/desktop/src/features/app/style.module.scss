@@ -1,0 +1,162 @@
+@use "../../styles/tokens" as *;
+
+.appShell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+
+  > main {
+    position: relative;
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 0;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0;
+
+    &.homeMain {
+      width: 100%;
+      max-width: none;
+      padding: 0;
+    }
+
+    &.settingsMain {
+      max-width: none;
+    }
+  }
+}
+
+.titlebarAppIcon {
+  display: block;
+  width: 18px;
+  height: 18px;
+  margin: 0 8px 0 4px;
+  object-fit: contain;
+  cursor: pointer;
+}
+
+.titlebarServoStatus {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 4px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 0;
+  color: $muted;
+  background: transparent;
+  font-size: 11px;
+  white-space: nowrap;
+  user-select: none;
+
+  &:hover:not(:disabled) {
+    color: $text;
+    background: #e9e9e9;
+  }
+}
+
+.titlebarMachineTabs {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  gap: 2px;
+
+  button {
+    min-width: 58px;
+    padding: 0 10px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    color: $muted;
+    background: transparent;
+    font-size: 11px;
+
+    &:hover {
+      color: $text;
+      background: #e9e9e9;
+    }
+
+    &.active {
+      color: #8d6500;
+      border-bottom-color: $accent;
+      font-weight: 600;
+    }
+  }
+}
+
+.titlebarStatusDot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #bbb;
+
+  &.ok {
+    background: $green;
+  }
+}
+
+.titlebarSettingsButton {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: $text;
+  background: transparent;
+
+  &:hover:not(:disabled) {
+    background: #e9e9e9;
+  }
+
+  &.active {
+    color: #8d6500;
+    background: rgba($accent, 0.16);
+  }
+
+  &:active:not(:disabled) {
+    background: #d9d9d9;
+  }
+}
+
+.titlebarSettingsIcon {
+  display: block;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.statusPage {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  gap: 14px;
+  min-height: 100%;
+  padding: 32px;
+  text-align: center;
+}
+
+.statusPage h1,
+.statusPage p {
+  margin: 0;
+}
+
+.statusError {
+  color: $red;
+
+  p {
+    max-width: 680px;
+    color: $text;
+  }
+}
+
+.statusLoading {
+  color: $muted;
+}

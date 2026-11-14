@@ -1,0 +1,136 @@
+@use "../../styles/tokens" as *;
+
+.page {
+  animation: rise 0.2s ease-out;
+}
+
+.policyPage {
+  display: grid;
+  gap: 16px;
+  min-height: 100%;
+  margin: 30px 32px 0 0;
+  padding-bottom: 30px;
+}
+
+.policyHeader,
+.cardTitle,
+.policyRow {
+  display: flex;
+  align-items: center;
+}
+
+.policyHeader,
+.cardTitle,
+.policyRow {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.policyHeader {
+  h1,
+  p {
+    margin: 0;
+  }
+
+  p,
+  .cardTitle span,
+  .muted {
+    color: $muted;
+  }
+
+  p {
+    margin-top: 5px;
+    font-size: 12px;
+  }
+}
+
+.policyCard {
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid $border;
+  border-radius: 12px;
+  background: $surface;
+  box-shadow: 0 5px 16px rgba(35, 30, 18, 0.04);
+}
+
+.cardTitle {
+  h2 {
+    margin: 0;
+    font-size: 16px;
+  }
+
+  span {
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.policyList {
+  display: grid;
+  gap: 8px;
+}
+
+.policyRow {
+  padding: 12px;
+  border: 1px solid $border;
+  border-radius: 8px;
+  background: $surface-2;
+
+  &.selected {
+    border-color: rgba($accent, 0.7);
+  }
+}
+
+.policyMain {
+  display: grid;
+  gap: 4px;
+
+  code,
+  small {
+    color: $muted;
+    font-size: 11px;
+  }
+}
+
+.policyActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.primary,
+.selectedButton {
+  border-color: $accent;
+  background: $accent;
+  font-weight: 600;
+}
+
+.cachedLabel {
+  color: $muted;
+  font-size: 12px;
+}
+
+.muted {
+  margin: 0;
+  color: $muted;
+  font-size: 12px;
+}
+
+.error {
+  margin: 0;
+  color: $red;
+  font-size: 12px;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0.3;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

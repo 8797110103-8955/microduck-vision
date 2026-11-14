@@ -1,0 +1,271 @@
+@use "../../styles/tokens" as *;
+
+.page {
+  animation: rise 0.2s ease-out;
+}
+
+.simulationPage {
+  min-height: 0;
+  margin: 30px 32px 0 0;
+  padding-bottom: 30px;
+
+  .panelCard {
+    padding: 20px;
+    border: 1px solid $border;
+    border-radius: 12px;
+    background: $surface;
+    box-shadow: 0 5px 16px rgba(35, 30, 18, 0.04);
+  }
+
+  .muted,
+  .machineModel {
+    color: $muted;
+  }
+
+  .primary {
+    border-color: $accent;
+    background: $accent;
+    font-weight: 600;
+  }
+
+  .danger {
+    border-color: #f3c5c6;
+    color: $red;
+    background: $surface;
+  }
+
+  .smallButton {
+    padding: 6px 9px;
+    font-size: 12px;
+  }
+
+  .machineMain {
+    display: flex;
+    justify-content: space-between;
+
+    .machineName {
+      display: flex;
+
+      strong {
+        display: block;
+        cursor: text;
+      }
+    }
+  }
+
+  .machineModel {
+    min-width: 110px;
+  }
+
+  .startup {
+    color: $muted;
+    background: transparent;
+
+    &.active {
+      color: $green;
+      border-color: rgba($green, 0.45);
+    }
+  }
+
+  .simulationToolbar {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
+  .simulationAdd {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 50%;
+    color: $text;
+    font-size: 20px;
+    line-height: 1;
+  }
+
+  .simulationCreatePanel {
+    position: absolute;
+    top: 40px;
+    right: 0;
+    z-index: 5;
+    display: grid;
+    gap: 12px;
+    width: min(410px, 100%);
+    padding: 16px;
+    border: 1px solid $border;
+    border-radius: 10px;
+    background: $surface;
+    box-shadow: 0 12px 32px rgba(35, 30, 18, 0.14);
+
+    label {
+      display: grid;
+      gap: 5px;
+      color: $muted;
+      font-size: 12px;
+    }
+  }
+
+  .simulationCreateParameters {
+    display: grid;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px solid $border;
+  }
+
+  .simulationParameterInput {
+    display: grid;
+    grid-template-columns: 1fr 110px;
+    align-items: center;
+    gap: 12px;
+
+    span {
+      display: grid;
+      gap: 2px;
+    }
+
+    small {
+      color: $muted;
+      font-size: 10px;
+    }
+  }
+
+  .simulationCreateActions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 5px;
+  }
+
+  .simulationList {
+    display: grid;
+    gap: 9px;
+  }
+
+  .simulationRow {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid $border;
+    border-radius: 8px;
+    background: $surface-2;
+    cursor: pointer;
+
+    &.selected {
+      border-color: rgba($accent, 0.65);
+    }
+  }
+
+  .simulationRow .expandButton {
+    display: grid;
+    flex: 0 0 30px;
+    place-items: center;
+    width: 30px;
+    padding: 6px 0;
+  }
+
+  .simulationExpandIcon {
+    display: block;
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid $muted;
+    border-bottom: 2px solid $muted;
+    transform: rotate(-45deg);
+  }
+
+  .simulationRow .expandButton.expanded .simulationExpandIcon {
+    transform: rotate(45deg);
+  }
+
+  .simulationMachineName {
+    flex: 1;
+    min-width: 220px;
+  }
+
+  .simulationNameInput {
+    flex: 1;
+    min-width: 180px;
+    height: 30px;
+    min-height: 0;
+  }
+
+  .simulationSeparator {
+    margin: 0 7px;
+    color: $border;
+  }
+
+  .simulationPhysical {
+    color: $muted;
+    font-size: 12px;
+  }
+
+  .simulationExpanded {
+    display: grid;
+    flex-basis: 100%;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    align-items: start;
+    gap: 14px;
+    margin: 4px 0 0 40px;
+    padding-top: 12px;
+    border-top: 1px solid $border;
+  }
+
+  .simulationParameterList {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(90px, 1fr));
+    gap: 8px;
+    color: $muted;
+
+    strong {
+      grid-column: 1 / -1;
+      color: $text;
+    }
+
+    span {
+      display: grid;
+      gap: 3px;
+    }
+
+    b {
+      color: $text;
+      font-size: 11px;
+      font-weight: 500;
+    }
+  }
+}
+
+@media (max-width: 760px) {
+  .simulationPage {
+    .simulationExpanded {
+      grid-template-columns: auto auto;
+    }
+
+    .simulationParameterList {
+      grid-column: 1 / -1;
+      grid-template-columns: repeat(2, minmax(90px, 1fr));
+    }
+  }
+}
+
+.simulationCard {
+  min-height: 0;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0.3;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
