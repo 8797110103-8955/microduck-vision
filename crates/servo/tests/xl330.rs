@@ -18,7 +18,6 @@ use crate::support::ScriptedPort;
 use std::time::Duration;
 
 #[test]
-#[ignore = "signature-first stage: vendor contract test is not executed yet"]
 fn servo_public_keys_and_vendor_types_compile() {
     let _ = ServoTelemetry;
     let _ = ServoCommand;
@@ -117,7 +116,6 @@ fn xl330_memory_bus_round_trips_vendor_registers_and_presence() {
 }
 
 #[test]
-#[ignore = "signature-first stage: vendor contract test is not executed yet"]
 fn servo_driver_signatures_accept_vendor_adapter_shape() {
     fn accepts_driver<D: ServoDriver + ?Sized>(_driver: &mut D) {}
     fn accepts_raw_bus<B: RawBus>(_bus: &mut B) {}
@@ -135,7 +133,6 @@ fn servo_driver_signatures_accept_vendor_adapter_shape() {
 }
 
 #[test]
-#[ignore = "signature-first stage: vendor contract test is not executed yet"]
 fn vendor_xl330_definition_and_conversions_are_the_protocol_baseline() {
     let definition = rustypot::servo::dynamixel::xl330::DEFINITION;
     assert_eq!(definition.protocol, 2);
@@ -153,7 +150,6 @@ fn vendor_xl330_definition_and_conversions_are_the_protocol_baseline() {
 }
 
 #[test]
-#[ignore = "signature-first stage: vendor contract test is not executed yet"]
 fn vendor_fake_io_preserves_the_control_loop_contract() -> VendorResult<()> {
     let mut io = FakeIo::new();
     let mut positions = [0.0; NUM_JOINTS];
@@ -164,7 +160,6 @@ fn vendor_fake_io_preserves_the_control_loop_contract() -> VendorResult<()> {
 }
 
 #[test]
-#[ignore = "signature-first stage: vendor controller path is not executed yet"]
 fn vendor_xl330_controller_protocol_two_path_compiles() {
     let controller = Xl330Controller::new()
         .with_protocol_v2()

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rustypot::servo::feetech::scs0009::Scs0009Controller;
@@ -66,6 +67,19 @@ impl RustypotFeetechBus {
                 .with_serial_port(port)
                 .with_protocol_v1(),
         )
+    }
+
+    /// Discover every answering STS servo with one broadcast ping and a model read
+    /// per responder. This avoids waiting once for every absent ID on the bus.
+    pub fn broadcast_scan_all(&mut self) -> Result<BTreeMap<u8, u16>, ServoError> {
+        match self {
+            Self::Sts(controller) => controller
+                .broadcast_scan_all()
+                .map_err(|error| ServoError::Bus(error.to_string())),
+            Self::Scs(_) => Err(ServoError::NotImplemented(
+                "SCS broadcast scan is not supported",
+            )),
+        }
     }
 }
 

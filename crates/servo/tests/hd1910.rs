@@ -112,7 +112,6 @@ const HD1910_REGISTER_FACTS: &[(&str, u8, u8, &str, bool)] = &[
 ];
 
 #[test]
-#[ignore]
 fn feetech_public_protocol_and_driver_signatures_compile() {
     let _ = HD1910;
     let _ = STS3215;
@@ -124,7 +123,6 @@ fn feetech_public_protocol_and_driver_signatures_compile() {
 }
 
 #[test]
-#[ignore]
 fn feetech_model_identity_bytes_match_the_mapping_record() {
     assert_eq!(model_from_identity(SCS_IDENTITY), ServoModel::Scs0009);
     assert_eq!(model_from_identity(STS_IDENTITY), ServoModel::Sts3215);
@@ -132,7 +130,6 @@ fn feetech_model_identity_bytes_match_the_mapping_record() {
 }
 
 #[test]
-#[ignore]
 fn hd1910_definition_uses_the_sts_rustypot_register_family() {
     assert_eq!(DEFINITION.protocol, 1);
     assert_eq!(DEFINITION.info.resolution, Some(4096));
@@ -142,7 +139,6 @@ fn hd1910_definition_uses_the_sts_rustypot_register_family() {
 }
 
 #[test]
-#[ignore]
 fn hd1910_corrected_register_facts_match_the_feetech_mapping() {
     for &(name, address, width, area, writable) in HD1910_REGISTER_FACTS {
         let _ = (name, address, width, area, writable);
@@ -154,7 +150,6 @@ fn hd1910_corrected_register_facts_match_the_feetech_mapping() {
 }
 
 #[test]
-#[ignore]
 fn hd1910_does_not_reuse_sts_factory_meanings_at_82_and_83() {
     assert!(register("e_fk").is_some());
     assert!(register("vk").is_some());
@@ -163,7 +158,6 @@ fn hd1910_does_not_reuse_sts_factory_meanings_at_82_and_83() {
 }
 
 #[test]
-#[ignore]
 fn feetech_baud_codes_match_the_mapping_record() {
     let expected = [
         (1_000_000, 0),
@@ -181,7 +175,6 @@ fn feetech_baud_codes_match_the_mapping_record() {
 }
 
 #[test]
-#[ignore]
 fn feetech_restore_and_motion_blocks_are_model_specific() {
     assert_eq!(reset_instruction(ServoModel::Hd1910), Some(0x06));
     assert_eq!(reset_instruction(ServoModel::Sts3215), Some(0x06));
@@ -196,13 +189,11 @@ fn feetech_restore_and_motion_blocks_are_model_specific() {
 }
 
 #[test]
-#[ignore]
 fn scs_support_state_is_explicit_after_identity_detection() {
     assert!(protocol_for_model(ServoModel::Scs0009).is_some());
 }
 
 #[test]
-#[ignore]
 fn feetech_protocol_one_frame_vectors_match_the_web_tool() -> Result<(), ServoError> {
     let ping = encode_frame(1, 0x01, &[])?;
     assert_eq!(ping, vec![0xFF, 0xFF, 1, 2, 1, 0xFB]);
@@ -214,7 +205,6 @@ fn feetech_protocol_one_frame_vectors_match_the_web_tool() -> Result<(), ServoEr
 }
 
 #[test]
-#[ignore]
 fn feetech_register_encoding_preserves_model_byte_order() -> Result<(), ServoError> {
     let little_endian = encode_register("goal_position", 0x1234)?;
     assert_eq!(little_endian, vec![0x34, 0x12]);
@@ -224,7 +214,6 @@ fn feetech_register_encoding_preserves_model_byte_order() -> Result<(), ServoErr
 }
 
 #[test]
-#[ignore]
 fn feetech_signed_magnitude_speed_and_load_vectors_are_preserved() -> Result<(), ServoError> {
     assert_eq!(decode_register("present_speed", &[0x64, 0x00])?, 100);
     assert_eq!(decode_register("present_speed", &[0x64, 0x80])?, -100);
@@ -233,7 +222,6 @@ fn feetech_signed_magnitude_speed_and_load_vectors_are_preserved() -> Result<(),
 }
 
 #[test]
-#[ignore]
 fn feetech_unit_projections_cover_position_speed_current_voltage_and_temperature() {
     assert_eq!(position_steps_from_rad(ServoModel::Hd1910, 0.0), Ok(2048));
     assert!((velocity_rad_s_from_raw(ServoModel::Hd1910, 0) - 0.0).abs() < 1e-12);
@@ -243,7 +231,6 @@ fn feetech_unit_projections_cover_position_speed_current_voltage_and_temperature
 }
 
 #[test]
-#[ignore]
 fn hd1910_eeprom_lock_write_restore_sequence_is_explicit() -> Result<(), ServoError> {
     let unlock = encode_register("lock", 0)?;
     let write = encode_register("p_coefficient", 32)?;
@@ -255,7 +242,6 @@ fn hd1910_eeprom_lock_write_restore_sequence_is_explicit() -> Result<(), ServoEr
 }
 
 #[test]
-#[ignore]
 fn hd1910_xdat_header_and_49_byte_window_round_trip() -> Result<(), ServoError> {
     let mut bytes = [0u8; 51];
     bytes[1] = 0x28;
@@ -267,7 +253,6 @@ fn hd1910_xdat_header_and_49_byte_window_round_trip() -> Result<(), ServoError> 
 }
 
 #[test]
-#[ignore]
 fn hd1910_default_binding_exposes_the_expected_driver_shape() {
     fn accepts_driver<D: FeetechDriver + ?Sized>(_driver: &mut D) {}
     fn accepts_bus<B: FeetechRawBus + ?Sized>(_bus: &mut B) {}
@@ -280,7 +265,6 @@ fn hd1910_default_binding_exposes_the_expected_driver_shape() {
 }
 
 #[test]
-#[ignore]
 fn hd1910_protocol_errors_are_structured() {
     let _ = ServoError::UnknownRegister("missing".into());
     let _ = ServoError::ShortRead {

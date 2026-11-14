@@ -14,7 +14,7 @@ pnpm dev
 ```
 
 - 检查：`pnpm lint`、`pnpm test`；打包：`pnpm release`。
-- 运行官方策略：把 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) `v9` 下载到 `%APPDATA%\microduck\library\policies\official\`；仿真还需要按 `vendor/microduck_rl` 的说明启动 `duck-body`。
+- 运行官方策略：在策略页面按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 中的官方 ONNX 到 `%APPDATA%\microduck-vision\library\policies\official\`；仿真还需要按 `vendor/microduck_rl` 的说明启动 `duck-body`。
 
 ## 和官方的关系
 

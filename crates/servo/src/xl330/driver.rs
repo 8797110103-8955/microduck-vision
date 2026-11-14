@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
@@ -226,6 +227,14 @@ impl RustypotXl330Bus {
             .with_protocol_v2();
         controller.set_fast_sync_read(fast_sync_read);
         Self { controller }
+    }
+
+    /// Discover every answering XL330 servo with one broadcast ping and a model read
+    /// per responder. This avoids waiting once for every absent ID on the bus.
+    pub fn broadcast_scan_all(&mut self) -> Result<BTreeMap<u8, u16>, ServoError> {
+        self.controller
+            .broadcast_scan_all()
+            .map_err(|error| ServoError::Bus(error.to_string()))
     }
 }
 

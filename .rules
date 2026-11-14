@@ -7,6 +7,7 @@
 * `crates/` holds only product-agnostic foundation APIs. Product logic (virtual machines, robots, storage, UI flows) belongs to the app.
 * Static assets used by the desktop UI belong in `apps/desktop/assets`; do not add UI static assets under `apps/desktop/src/assets`.
 * Put a crate's boundary with other crates in a comment right under its Cargo `description`.
+* In TypeScript, derive types from existing types and function return values; do not hand-write duplicate state or result types when inference can provide them.
 
 # Commit rules
 

@@ -1,0 +1,24 @@
+[package]
+name = "loop-body"
+description = "Servo-backed body control loop with shared policy execution, not policy storage or UI state."
+# The boundary excludes body assets, servo register facts, policy storage and UI state. The policy
+# executor itself belongs here so virtual and physical drivers share one control path.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duck-body = { path = "../duck-body" }
+duck-control = { path = "../../vendor/microduck/duck-control" }
+servo = { path = "../servo" }
+serde.workspace = true
+thiserror.workspace = true
+
+[[test]]
+name = "body_loop"
+path = "tests/body_loop.rs"
+
+[[test]]
+name = "policy_loop"
+path = "tests/policy_loop.rs"
