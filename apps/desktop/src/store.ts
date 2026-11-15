@@ -38,6 +38,7 @@ export function createDesktopStore() {
     selectedPolicyId: null as string | null,
     actions: [] as Awaited<ReturnType<DesktopBackend["actions"]>>,
     loop: null as Awaited<ReturnType<DesktopBackend["loopStatus"]>>,
+    debugPose: null as number[] | null,
     previewLoop: null as Awaited<ReturnType<DesktopBackend["loopStatus"]>>,
     selectedVirtualMachine: null as string | null,
     selectedVirtualMachineManual: false,

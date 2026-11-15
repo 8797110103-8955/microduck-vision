@@ -8,7 +8,7 @@ mod policy;
 mod types;
 
 pub use body::BodyLoop;
-pub use policy::PolicyLoop;
+pub use policy::{PolicyLoop, PolicyTrace};
 pub use types::{
     BodyCommand, BodyRuntimeView, Calibration, JointCalibration, LoopAction, LoopBinding,
     LoopConfig, LoopError, LoopPhase, LoopStatus, ServoBinding,

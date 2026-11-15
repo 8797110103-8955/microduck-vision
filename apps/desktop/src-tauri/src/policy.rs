@@ -30,6 +30,31 @@ struct ManifestPolicy {
     file: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    slot: Option<String>,
+    #[serde(default)]
+    duration_s: Option<f64>,
+    #[serde(default)]
+    command: Option<PolicyCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PolicyCommand {
+    pub slot: Option<String>,
+    pub encoding: Option<String>,
+    pub idle: Option<[f64; 3]>,
+    pub twist: Option<String>,
+    pub head: Option<String>,
+    pub body: Option<String>,
+    #[serde(alias = "period_s")]
+    pub period_s: Option<f64>,
+    #[serde(alias = "end_phase")]
+    pub end_phase: Option<f64>,
+    pub sit: Option<f64>,
+    pub stand: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +63,10 @@ struct OfficialSource {
     name: String,
     file: String,
     url: String,
+    kind: Option<String>,
+    slot: Option<String>,
+    duration_s: Option<f64>,
+    command: Option<PolicyCommand>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -51,13 +80,25 @@ pub(crate) struct PolicyEntry {
     pub selected: bool,
     #[specta(type = specta_typescript::Number)]
     pub size: u64,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<f64>,
+    #[serde(default)]
+    pub command: Option<PolicyCommand>,
 }
 
 pub(crate) fn cache_root(config_dir: Option<&Path>) -> PathBuf {
     config_dir
         .and_then(Path::parent)
         .map(|root| root.join(CACHE_DIR))
-        .unwrap_or_else(|| std::env::temp_dir().join("microduck-vision").join(CACHE_DIR))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("microduck-vision")
+                .join(CACHE_DIR)
+        })
 }
 
 pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String> {
@@ -68,7 +109,9 @@ pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String
         .iter()
         .map(|source| {
             let path = root.join(&source.file);
-            let size = std::fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+            let size = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             PolicyEntry {
                 id: source.id.clone(),
                 name: source.name.clone(),
@@ -77,6 +120,10 @@ pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String
                 cached: path.is_file() && size > 0,
                 selected: selected.as_deref() == Some(&source.id),
                 size,
+                kind: source.kind.clone(),
+                slot: source.slot.clone(),
+                duration_s: source.duration_s,
+                command: source.command.clone(),
             }
         })
         .collect())
@@ -124,8 +171,10 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
                 .map_err(|error| format!("请求失败：{error}"))?
                 .error_for_status()
                 .map_err(|error| format!("服务器返回错误：{error}"))?;
-            let mut file = File::create(target).map_err(|error| format!("创建缓存文件失败：{error}"))?;
-            io::copy(&mut response, &mut file).map_err(|error| format!("写入缓存文件失败：{error}"))?;
+            let mut file =
+                File::create(target).map_err(|error| format!("创建缓存文件失败：{error}"))?;
+            io::copy(&mut response, &mut file)
+                .map_err(|error| format!("写入缓存文件失败：{error}"))?;
             Ok::<(), String>(())
         })();
 
@@ -141,7 +190,9 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
         }
     }
 
-    Err(format!("下载官方策略失败（尝试 {DOWNLOAD_ATTEMPTS} 次）：{last_error}"))
+    Err(format!(
+        "下载官方策略失败（尝试 {DOWNLOAD_ATTEMPTS} 次）：{last_error}"
+    ))
 }
 
 pub(crate) fn select(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry, String> {
@@ -199,6 +250,10 @@ fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
                     "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/{}",
                     file_name
                 ),
+                kind: policy.kind,
+                slot: policy.slot,
+                duration_s: policy.duration_s,
+                command: policy.command,
             })
         })
         .collect())
@@ -247,7 +302,7 @@ fn read_selected(root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_root, list, select, MANIFEST_FILE};
+    use super::{MANIFEST_FILE, cache_root, list, select};
     use std::path::{Path, PathBuf};
 
     fn write_manifest(config: &Path) {
@@ -257,7 +312,8 @@ mod tests {
             root.join(MANIFEST_FILE),
             r#"{"policies":[
                 {"file":"alpha_walking.onnx"},
-                {"file":"velstand.onnx","name":"Velstand"},
+                {"file":"velstand.onnx","name":"Velstand","kind":"perpetual","slot":"walk",
+                 "command":{"encoding":"constant","idle":[0,0,0]}},
                 {"file":"alpha_ground_pick.onnx"}
             ]}"#,
         )
@@ -282,10 +338,21 @@ mod tests {
         let entries = list(Some(&config)).unwrap();
         assert_eq!(entries.len(), 3);
         assert!(entries.iter().all(|entry| !entry.cached));
-        assert!(entries
-            .iter()
-            .all(|entry| entry.source_url.starts_with("https://huggingface.co/")));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.source_url.starts_with("https://huggingface.co/"))
+        );
         assert_eq!(entries[1].name, "Velstand");
+        assert_eq!(entries[1].kind.as_deref(), Some("perpetual"));
+        assert_eq!(entries[1].slot.as_deref(), Some("walk"));
+        assert_eq!(
+            entries[1]
+                .command
+                .as_ref()
+                .and_then(|c| c.encoding.as_deref()),
+            Some("constant")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

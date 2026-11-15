@@ -142,6 +142,33 @@ mod tests {
             .frame(&[0.0; duck_ipc_proto::JOINT_NAMES.len()])
             .unwrap();
         assert_eq!(frame.bodies.len(), scene.model().bodies.len());
-        assert_eq!(frame.markers.len(), scene.model().joints.len());
+        assert_eq!(frame.markers.len(), duck_ipc_proto::JOINT_NAMES.len());
+    }
+
+    #[test]
+    fn scene_markers_use_motor_axes_and_keep_calibrated_reference_slots() {
+        let scene = OfficialScene::load().expect("official display scene");
+        let frame = scene
+            .frame(&[0.0; duck_ipc_proto::JOINT_NAMES.len()])
+            .unwrap();
+        let body_pos = |index: usize| {
+            [
+                frame.bodies[index][0],
+                frame.bodies[index][1],
+                frame.bodies[index][2],
+            ]
+        };
+
+        // Slots 2, 6 and 7 are the visual calibration anchors confirmed in
+        // the desktop view and therefore remain at their link origins.
+        for index in [1, 5, 6] {
+            let body = scene.model().joints[index].body as usize;
+            assert_eq!(frame.markers[index], body_pos(body));
+        }
+
+        // The mouth has no independent kinematic joint.  Its marker must use
+        // the mouth motor mount rather than the head-roll body fallback.
+        let head_roll_body = scene.model().joints[8].body as usize;
+        assert_ne!(frame.markers[9], body_pos(head_roll_body));
     }
 }

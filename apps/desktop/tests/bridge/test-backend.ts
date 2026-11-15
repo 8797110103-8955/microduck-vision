@@ -4,6 +4,7 @@ import type {
   LoopAction,
   LoopStatus,
   PhysicalMachine,
+  PhysicalServoRegister,
   PolicyEntry,
   ReconnectHint,
   SceneFrame,
@@ -22,6 +23,13 @@ type Call = {
   payload?: InvokePayload;
 };
 
+type PreviewTestInput = {
+  twist: [number, number, number];
+  head: [number, number, number, number];
+  body: [number, number, number];
+  targetDistanceM: number | null;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
@@ -34,6 +42,9 @@ const stringValue = (value: unknown, field: string) => {
   if (typeof value !== "string") throw new Error(`expected ${field} to be a string`);
   return value;
 };
+
+const numberValue = (value: unknown) =>
+  typeof value === "number" && Number.isFinite(value) ? value : 0;
 
 const reconnectHint = (value: unknown): ReconnectHint | null => {
   if (!isRecord(value)) return null;
@@ -77,6 +88,12 @@ const cloneMachine = (machine: PhysicalMachine): PhysicalMachine => ({
   onlineServoIds: [...machine.onlineServoIds],
 });
 
+const cloneVirtual = (machine: VirtualMachine): VirtualMachine => ({
+  ...machine,
+  jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
+  referencedBy: [...machine.referencedBy],
+});
+
 const cloneStatus = (status: LoopStatus | null) =>
   status
     ? {
@@ -106,6 +123,7 @@ function simulationFor(catalog: ServoCatalogEntry[], model: ServoModelKey): Simu
     armature: profile.simArmature,
     kp: profile.simKp,
     forceRange: profile.simForceRange,
+    worldPosition: [0, 0, 0],
   };
 }
 
@@ -126,6 +144,12 @@ export class TestBackend {
   ];
   private status: LoopStatus | null = null;
   private previewStatus: LoopStatus | null = null;
+  private previewInput: PreviewTestInput = {
+    twist: [0, 0, 0],
+    head: [0, 0, 0, 0],
+    body: [0, 0, 0],
+    targetDistanceM: null,
+  };
   private autoReconnect = true;
   private policies: PolicyEntry[] = [
     {
@@ -134,6 +158,16 @@ export class TestBackend {
       file: "alpha_walking.onnx",
       sourceUrl:
         "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_walking.onnx",
+      cached: false,
+      selected: false,
+      size: 0,
+    },
+    {
+      id: "alpha-stand",
+      name: "Alpha Stand",
+      file: "alpha_stand.onnx",
+      sourceUrl:
+        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_stand.onnx",
       cached: false,
       selected: false,
       size: 0,
@@ -164,6 +198,42 @@ export class TestBackend {
       case "servo_catalog":
         if (this.failCatalog) throw new Error("模拟配置读取失败");
         return this.catalog.map((entry) => ({ ...entry, capabilities: [...entry.capabilities] }));
+      case "official_joint_slots":
+        return [
+          "left_hip_yaw",
+          "left_hip_roll",
+          "left_hip_pitch",
+          "left_knee",
+          "left_ankle",
+          "neck_pitch",
+          "head_pitch",
+          "head_yaw",
+          "head_roll",
+          "mouth",
+          "right_hip_yaw",
+          "right_hip_roll",
+          "right_hip_pitch",
+          "right_knee",
+          "right_ankle",
+        ];
+      case "official_joint_ranges":
+        return [
+          "left_hip_yaw",
+          "left_hip_roll",
+          "left_hip_pitch",
+          "left_knee",
+          "left_ankle",
+          "neck_pitch",
+          "head_pitch",
+          "head_yaw",
+          "head_roll",
+          "mouth",
+          "right_hip_yaw",
+          "right_hip_roll",
+          "right_hip_pitch",
+          "right_knee",
+          "right_ankle",
+        ].map((slotId) => ({ slotId, minRad: -Math.PI, maxRad: Math.PI }));
       case "official_scene_model":
         return this.sceneModel();
       case "official_scene_frame":
@@ -173,6 +243,8 @@ export class TestBackend {
           ...machine,
           referencedBy: [...machine.referencedBy],
         }));
+      case "virtual_machine_create":
+        return this.createVirtualMachine(payloadRecord(payload).input);
       case "physical_machines":
         return this.physical.map(cloneMachine);
       case "auto_reconnect_enabled":
@@ -202,12 +274,45 @@ export class TestBackend {
         return this.updateConnection(stringValue(payloadRecord(payload).id, "id"), true);
       case "physical_machine_scan":
         return this.scan(stringValue(payloadRecord(payload).id, "id"));
+      case "physical_machine_registers":
+        return this.registers(stringValue(payloadRecord(payload).id, "id"));
+      case "physical_machine_read_register": {
+        const input = payloadRecord(payload);
+        const machine = this.machine(stringValue(input.id, "id"));
+        const servoId = numberValue(input.servoId);
+        const row = this.registers(machine.id).find(
+          (entry) => entry.servoId === servoId && entry.name === stringValue(input.name, "name"),
+        );
+        if (!row) throw new Error("unknown register");
+        return row;
+      }
+      case "physical_machine_write_register": {
+        const input = payloadRecord(payloadRecord(payload).input);
+        const machine = this.machine(stringValue(input.physicalMachineId, "physicalMachineId"));
+        const servoId = numberValue(input.servoId);
+        if (stringValue(input.name, "name") !== "torque_enable")
+          throw new Error("register is read-only");
+        machine.torqueEnabled = numberValue(input.value) !== 0;
+        return {
+          servoId,
+          address: 40,
+          name: "torque_enable",
+          size: 1,
+          default: false,
+          writable: true,
+          value: numberValue(input.value),
+        };
+      }
       case "policy_list":
         return this.policies.map((policy) => ({ ...policy }));
       case "policy_download":
         return this.downloadPolicy(stringValue(payloadRecord(payload).id, "id"));
       case "policy_select":
         return this.selectPolicy(stringValue(payloadRecord(payload).id, "id"));
+      case "policy_open_folder":
+        return null;
+      case "open_logs":
+        return null;
       case "physical_machine_mount":
         return this.mount(payloadRecord(payload));
       case "physical_machine_delete":
@@ -217,12 +322,109 @@ export class TestBackend {
         return null;
       case "physical_machine_rename":
         return this.rename(payloadRecord(payload));
+      case "physical_machine_bind": {
+        const input = payloadRecord(payloadRecord(payload).input);
+        const machine = this.machine(stringValue(input.physicalMachineId, "physicalMachineId"));
+        const virtual = this.virtual.find(
+          (entry) => entry.id === (input.virtualMachineId ?? machine.virtualMachineId),
+        );
+        if (!virtual) throw new Error("physical machine is not associated with a virtual machine");
+        const bindings = (virtual.jointBindings ?? []).filter(
+          (binding) => binding.slotId !== input.slotId,
+        );
+        if (input.physicalId != null)
+          bindings.push({
+            slotId: String(input.slotId),
+            physicalId: Number(input.physicalId),
+            direction: 1,
+            zeroOffsetRad: 0,
+          });
+        virtual.jointBindings = bindings;
+        return cloneMachine(machine);
+      }
+      case "virtual_machine_bind": {
+        const input = payloadRecord(payloadRecord(payload).input);
+        const machine = this.virtual.find(
+          (entry) => entry.id === stringValue(input.virtualMachineId, "virtualMachineId"),
+        );
+        if (!machine) throw new Error("unknown virtual machine");
+        const bindings = (machine.jointBindings ?? []).filter(
+          (binding) => binding.slotId !== input.slotId,
+        );
+        if (input.physicalId != null)
+          bindings.push({
+            slotId: String(input.slotId),
+            physicalId: Number(input.physicalId),
+            direction: 1,
+            zeroOffsetRad: 0,
+          });
+        machine.jointBindings = bindings;
+        return cloneVirtual(machine);
+      }
+      case "virtual_machine_validate_bindings": {
+        const id = stringValue(payloadRecord(payload).id, "id");
+        const machine = this.virtual.find((entry) => entry.id === id);
+        if (!machine) throw new Error("unknown virtual machine");
+        const bindings = machine.jointBindings ?? [];
+        const conflictingIds = bindings
+          .filter((binding, index) =>
+            bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
+          )
+          .map((binding) => binding.physicalId);
+        machine.jointBindings = bindings.filter(
+          (binding) => !conflictingIds.includes(binding.physicalId),
+        );
+        return cloneVirtual(machine);
+      }
+      case "physical_machine_validate_bindings": {
+        const id = stringValue(payloadRecord(payload).id, "id");
+        const machine = this.machine(id);
+        const virtual = this.virtual.find((entry) => entry.id === machine.virtualMachineId);
+        const bindings = virtual?.jointBindings ?? [];
+        const conflictingIds = bindings
+          .filter((binding, index) =>
+            bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
+          )
+          .map((binding) => binding.physicalId);
+        const validBindings = bindings.filter(
+          (binding) => !conflictingIds.includes(binding.physicalId),
+        );
+        if (virtual) virtual.jointBindings = validBindings;
+        return cloneMachine(machine);
+      }
+      case "physical_machine_set_pose_zero": {
+        const machine = this.machine(stringValue(payloadRecord(payload).id, "id"));
+        const virtual = this.virtual.find((entry) => entry.id === machine.virtualMachineId);
+        if (!virtual) throw new Error("physical machine is not associated with a virtual machine");
+        virtual.jointBindings = (virtual.jointBindings ?? []).map((binding) => ({
+          ...binding,
+          zeroOffsetRad: 0,
+        }));
+        return cloneMachine(machine);
+      }
+      case "physical_machine_pose":
+        this.machine(stringValue(payloadRecord(payload).id, "id"));
+        return Array.from({ length: 15 }, () => 0);
+      case "physical_machine_set_torque": {
+        const id = stringValue(payloadRecord(payload).id, "id");
+        const machine = this.machine(id);
+        machine.torqueEnabled = payloadRecord(payload).enabled === true;
+        return cloneMachine(machine);
+      }
+      case "physical_machine_write_position": {
+        const input = payloadRecord(payload);
+        const machine = this.machine(stringValue(input.id, "id"));
+        if (!machine.connected) throw new Error("physical machine is not connected");
+        return cloneMachine(machine);
+      }
       case "actions":
         return this.actionsList.map((action) => ({ ...action }));
       case "loop_open":
         return this.openLoop(payloadRecord(payload).input);
       case "loop_command":
         return this.command(payloadRecord(payload).targets);
+      case "loop_policy_command":
+        return null;
       case "loop_action":
         return this.action(payloadRecord(payload).action);
       case "loop_tick":
@@ -238,6 +440,15 @@ export class TestBackend {
         );
       case "preview_loop_policy":
         return this.previewPolicy(stringValue(payloadRecord(payload).policyId, "policyId"));
+      case "preview_loop_command":
+        return this.previewCommand(payloadRecord(payload).input);
+      case "preview_loop_reset_world":
+        if (!this.previewStatus) throw new Error("preview loop is closed");
+        this.previewStatus = {
+          ...this.previewStatus,
+          world: { position: [0, 0], yaw: 0, distanceM: 0 },
+        };
+        return cloneStatus(this.previewStatus);
       case "preview_loop_tick":
         return this.previewTick();
       case "preview_loop_close":
@@ -324,6 +535,81 @@ export class TestBackend {
     return machine;
   }
 
+  private registers(id: string): PhysicalServoRegister[] {
+    const machine = this.machine(id);
+    return (machine.census ?? []).flatMap((servo) => [
+      {
+        servoId: servo.servoId,
+        address: 0,
+        name: "model_number",
+        size: 2,
+        default: false,
+        writable: false,
+        value: 0,
+      },
+      {
+        servoId: servo.servoId,
+        address: 40,
+        name: "torque_enable",
+        size: 1,
+        default: false,
+        writable: true,
+        value: machine.torqueEnabled ? 1 : 0,
+      },
+      {
+        servoId: servo.servoId,
+        address: 56,
+        name: "present_position",
+        size: 2,
+        default: false,
+        writable: false,
+        value: 0,
+      },
+    ]);
+  }
+
+  private createVirtualMachine(value: unknown): VirtualMachine {
+    const input = isRecord(value) ? value : {};
+    const machine: VirtualMachine = {
+      id: `virtual-${this.virtual.length + 1}`,
+      name: stringValue(input.name, "name"),
+      bodyId: stringValue(input.bodyId, "bodyId"),
+      servoModel: input.servoModel === "xl330" ? "xl330" : "hd1910",
+      simulation: {
+        damping: numberValue(
+          input.simulation && isRecord(input.simulation) ? input.simulation.damping : 0,
+        ),
+        frictionLoss: numberValue(
+          input.simulation && isRecord(input.simulation) ? input.simulation.frictionLoss : 0,
+        ),
+        armature: numberValue(
+          input.simulation && isRecord(input.simulation) ? input.simulation.armature : 0,
+        ),
+        kp: numberValue(input.simulation && isRecord(input.simulation) ? input.simulation.kp : 0),
+        forceRange: numberValue(
+          input.simulation && isRecord(input.simulation) ? input.simulation.forceRange : 0,
+        ),
+        worldPosition:
+          input.simulation &&
+          isRecord(input.simulation) &&
+          Array.isArray(input.simulation.worldPosition)
+            ? (() => {
+                const position = input.simulation.worldPosition.slice(0, 3).map(numberValue);
+                return [position[0] ?? 0, position[1] ?? 0, position[2] ?? 0] satisfies [
+                  number,
+                  number,
+                  number,
+                ];
+              })()
+            : [0, 0, 0],
+      },
+      startupSelected: false,
+      referencedBy: [],
+    };
+    this.virtual.push(machine);
+    return { ...machine, referencedBy: [] };
+  }
+
   private updateConnection(id: string, connected: boolean) {
     const machine = this.machine(id);
     machine.connected = connected;
@@ -385,6 +671,17 @@ export class TestBackend {
 
   private openLoop(value: unknown) {
     const input = isRecord(value) ? value : {};
+    const virtualMachine = this.virtual.find(
+      (entry) =>
+        entry.id === (typeof input.virtualMachineId === "string" ? input.virtualMachineId : ""),
+    );
+    const seen = new Set<number>();
+    const duplicate = virtualMachine?.jointBindings?.find((binding) => {
+      if (seen.has(binding.physicalId)) return true;
+      seen.add(binding.physicalId);
+      return false;
+    });
+    if (duplicate) throw new Error(`绑定冲突：舵机 ${duplicate.physicalId} 被重复绑定`);
     const ids = Array.isArray(input.servoIds)
       ? input.servoIds.filter((id): id is number => typeof id === "number")
       : [];
@@ -395,6 +692,7 @@ export class TestBackend {
       torque: false,
       positions: ids.map(() => 0),
       targets: ids.map(() => 0),
+      world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
     };
@@ -457,6 +755,7 @@ export class TestBackend {
       torque: false,
       positions: Array(15).fill(0),
       targets: Array(15).fill(0),
+      world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
     };
@@ -468,6 +767,28 @@ export class TestBackend {
     const policy = this.policies.find((entry) => entry.id === id);
     if (!policy?.cached) throw new Error("请先下载这个官方策略");
     this.previewStatus = { ...this.previewStatus, torque: true, lastError: null };
+    return cloneStatus(this.previewStatus);
+  }
+
+  private previewCommand(value: unknown) {
+    if (!this.previewStatus || !isRecord(value)) throw new Error("preview loop is closed");
+    const axis = (name: "twist" | "head" | "body", size: number) => {
+      const values = value[name];
+      if (!Array.isArray(values)) return Array.from({ length: size }, () => 0);
+      return Array.from({ length: size }, (_, index) => numberValue(values[index]));
+    };
+    const twistValues = axis("twist", 3);
+    const headValues = axis("head", 4);
+    const bodyValues = axis("body", 3);
+    const twist: [number, number, number] = [twistValues[0], twistValues[1], twistValues[2]];
+    const head: [number, number, number, number] = [
+      headValues[0],
+      headValues[1],
+      headValues[2],
+      headValues[3],
+    ];
+    const body: [number, number, number] = [bodyValues[0], bodyValues[1], bodyValues[2]];
+    this.previewInput = { twist, head, body, targetDistanceM: numberValue(value.targetDistanceM) };
     return cloneStatus(this.previewStatus);
   }
 
@@ -486,6 +807,18 @@ export class TestBackend {
       tick,
       targets: [...targets],
       positions: [...targets],
+      world: this.previewStatus.torque
+        ? {
+            position: [
+              (this.previewStatus.world.position[0] ?? 0) + this.previewInput.twist[0] * 0.02,
+              (this.previewStatus.world.position[1] ?? 0) + this.previewInput.twist[1] * 0.02,
+            ],
+            yaw: (this.previewStatus.world.yaw ?? 0) + this.previewInput.twist[2] * 0.02,
+            distanceM:
+              (this.previewStatus.world.distanceM ?? 0) +
+              Math.hypot(this.previewInput.twist[0], this.previewInput.twist[1]) * 0.02,
+          }
+        : this.previewStatus.world,
     };
     return cloneStatus(this.previewStatus);
   }

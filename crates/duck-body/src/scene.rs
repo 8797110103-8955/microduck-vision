@@ -69,6 +69,8 @@ pub struct SceneModel {
 #[serde(rename_all = "camelCase")]
 pub struct SceneFrame {
     pub bodies: Vec<[f64; 7]>,
+    /// Motor-axis markers in canonical [`JOINT_NAMES`] order, including the
+    /// mouth actuator which is not an articulated kinematic joint.
     pub markers: Vec<[f64; 3]>,
 }
 
@@ -77,6 +79,12 @@ pub struct OfficialScene {
     model: SceneModel,
     mesh_dir: PathBuf,
     angle_index: Vec<Option<usize>>,
+    /// The visual model places every XL330 at the servo's output axis.  Keep
+    /// the mount body and local point alongside the scene so marker positions
+    /// follow the same transforms as the meshes instead of approximating an
+    /// actuator with its child link origin.
+    marker_mounts: Vec<Option<(u32, [f64; 3])>>,
+    marker_bodies: Vec<Option<u32>>,
 }
 
 impl OfficialScene {
@@ -139,6 +147,7 @@ impl OfficialScene {
             .collect();
         let mut bodies = Vec::new();
         let mut joint_body = HashMap::new();
+        let mut motor_mounts: HashMap<String, Vec<[f64; 3]>> = HashMap::new();
         let mut head_camera = None;
         for (index, name) in kin.body_names().enumerate() {
             let mut geoms = Vec::new();
@@ -165,9 +174,13 @@ impl OfficialScene {
                     else {
                         continue;
                     };
+                    let pos = parse_vec(child.attribute("pos"), [0.0; 3]);
+                    if child.attribute("mesh") == Some("xl330") {
+                        motor_mounts.entry(name.to_owned()).or_default().push(pos);
+                    }
                     geoms.push(SceneGeom {
                         mesh: mesh.clone(),
-                        pos: parse_vec(child.attribute("pos"), [0.0; 3]),
+                        pos,
                         quat: parse_vec(child.attribute("quat"), [1.0, 0.0, 0.0, 0.0]),
                         rgba: child
                             .attribute("material")
@@ -191,6 +204,31 @@ impl OfficialScene {
                 })
             })
             .collect::<Vec<_>>();
+        let body_index = kin
+            .body_names()
+            .enumerate()
+            .map(|(index, name)| (name, index as u32))
+            .collect::<HashMap<_, _>>();
+        let marker_mounts = JOINT_NAMES
+            .iter()
+            .map(|name| {
+                // These three anchors are the visual calibration references:
+                // their link origins are already confirmed to sit on the
+                // rendered motor axes.  The remaining motors use the exact
+                // XL330 mount in the MJCF.
+                if matches!(*name, "left_hip_roll" | "neck_pitch" | "head_pitch") {
+                    return None;
+                }
+                let (body_name, ordinal) = motor_mount_for(name)?;
+                let body = *body_index.get(body_name)?;
+                let pos = *motor_mounts.get(body_name)?.get(ordinal)?;
+                Some((body, pos))
+            })
+            .collect();
+        let marker_bodies = JOINT_NAMES
+            .iter()
+            .map(|name| joint_body.get(*name).copied().map(|index| index as u32))
+            .collect();
         let angle_index = JOINT_NAMES
             .iter()
             .map(|name| kin.joint_index(name))
@@ -205,6 +243,8 @@ impl OfficialScene {
             mesh_dir,
             kin,
             angle_index,
+            marker_mounts,
+            marker_bodies,
         })
     }
 
@@ -246,13 +286,42 @@ impl OfficialScene {
             })
             .collect();
         let markers = self
-            .model
-            .joints
+            .marker_mounts
             .iter()
-            .map(|joint| poses[joint.body as usize].pos)
+            .zip(&self.marker_bodies)
+            .map(|(mount, body)| {
+                mount
+                    .map(|(body, pos)| poses[body as usize].transform_point(pos))
+                    .or_else(|| body.map(|body| poses[body as usize].pos))
+                    .unwrap_or([0.0; 3])
+            })
             .collect();
         Ok(SceneFrame { bodies, markers })
     }
+}
+
+/// Maps a canonical joint to the XL330 geom mounted at that motor's output
+/// axis.  A few bodies carry two motors, so the ordinal is within that body,
+/// not the global geom order.
+fn motor_mount_for(name: &str) -> Option<(&'static str, usize)> {
+    Some(match name {
+        "left_hip_yaw" => ("trunk_base", 0),
+        "right_hip_yaw" => ("trunk_base", 1),
+        "left_hip_roll" => ("yaw2roll", 0),
+        "left_hip_pitch" => ("upper_leg_left", 0),
+        "left_knee" => ("upper_leg_left", 1),
+        "left_ankle" => ("leg", 0),
+        "neck_pitch" => ("neck", 0),
+        "head_pitch" => ("neck", 1),
+        "head_yaw" => ("neck_pitch", 0),
+        "head_roll" => ("jaw_soft", 0),
+        "mouth" => ("jaw_soft", 1),
+        "right_hip_roll" => ("bearing_roll", 0),
+        "right_hip_pitch" => ("upper_leg_right", 0),
+        "right_knee" => ("upper_leg_right", 1),
+        "right_ankle" => ("leg_2", 0),
+        _ => return None,
+    })
 }
 
 fn parse_vec<const N: usize>(text: Option<&str>, default: [f64; N]) -> [f64; N] {

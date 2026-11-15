@@ -2,15 +2,18 @@ use serde::Deserialize;
 use specta_typescript::Typescript;
 use tauri::Manager;
 use tauri_specta::{Builder, collect_commands};
-pub mod physical;
-pub mod types;
 mod client;
 mod control;
+mod device_watcher;
 mod helpers;
+mod logging;
+mod motion;
+pub mod physical;
 mod policy;
 #[allow(dead_code)]
 mod simulation;
 mod state;
+pub mod types;
 
 use state::DesktopState;
 use types::{ReconnectHint, ServoIdentity, SimulationParameters};
@@ -81,11 +84,40 @@ pub struct LoopOpenInput {
     pub policy_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineBindingInput {
+    pub physical_machine_id: String,
+    #[serde(default)]
+    pub virtual_machine_id: Option<String>,
+    pub slot_id: String,
+    pub physical_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualMachineBindingInput {
+    pub virtual_machine_id: String,
+    pub slot_id: String,
+    pub physical_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineRegisterWriteInput {
+    pub physical_machine_id: String,
+    pub servo_id: u8,
+    pub name: String,
+    pub value: i32,
+}
+
 pub fn command_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .disable_serde_phases()
         .commands(collect_commands![
             client::servo_catalog,
+            client::official_joint_slots,
+            client::official_joint_ranges,
             client::official_scene_model,
             client::official_scene_frame,
             client::virtual_machines,
@@ -105,11 +137,23 @@ pub fn command_builder() -> Builder<tauri::Wry> {
             client::physical_machine_create,
             client::physical_machine_connect,
             client::physical_machine_scan,
+            client::physical_machine_registers,
+            client::physical_machine_read_register,
+            client::physical_machine_write_register,
             client::physical_machine_mount,
             client::physical_machine_delete,
             client::physical_machine_rename,
+            client::physical_machine_bind,
+            client::virtual_machine_bind,
+            client::virtual_machine_validate_bindings,
+            client::physical_machine_validate_bindings,
+            client::physical_machine_set_pose_zero,
+            client::physical_machine_pose,
+            client::physical_machine_set_torque,
+            client::physical_machine_write_position,
             client::virtual_machine_create,
             client::virtual_machine_set_startup,
+            client::virtual_machine_set_world_position,
             client::virtual_machine_delete,
             client::virtual_machine_rename,
             client::actions,
@@ -118,14 +162,19 @@ pub fn command_builder() -> Builder<tauri::Wry> {
             client::policy_list,
             client::policy_download,
             client::policy_select,
+            client::policy_open_folder,
+            client::open_logs,
             client::loop_open,
             client::loop_command,
+            client::loop_policy_command,
             client::loop_action,
             client::loop_tick,
             client::loop_status,
             client::loop_close,
             client::preview_loop_open,
             client::preview_loop_policy,
+            client::preview_loop_command,
+            client::preview_loop_reset_world,
             client::preview_loop_tick,
             client::preview_loop_close,
         ])
@@ -149,6 +198,7 @@ pub fn run() {
                 .app_config_dir()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(DesktopState::load(config_dir));
+            app.manage(device_watcher::DeviceWatcher::start(app.handle().clone()));
             Ok(())
         })
         .plugin(

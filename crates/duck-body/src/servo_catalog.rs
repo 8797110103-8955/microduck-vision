@@ -343,7 +343,11 @@ pub fn servo_profiles() -> Vec<ServoProfile> {
         common(
             ServoModel::Hd1910,
             7946,
-            servo::hd1910::registers().len() + 4,
+            // The FT HD1910 table adds four factory/current fields, splits
+            // 0x18/0x19 into two one-byte fields, and replaces the shared
+            // STS 0x53 meaning with Vk: five entries net over rustypot's
+            // shared STS table.
+            servo::hd1910::registers().len() + 5,
             false,
             Some(32),
             vec![

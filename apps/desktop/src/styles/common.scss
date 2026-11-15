@@ -9,11 +9,10 @@
 
 * {
   box-sizing: border-box;
+  user-select: none;
 }
 
 body {
-  min-width: 980px;
-  min-height: 100vh;
   margin: 0;
   background: $background;
   cursor: default;
@@ -51,16 +50,49 @@ button {
 input,
 select {
   min-height: 34px;
-  border: 1px solid $border;
-  border-radius: 7px;
-  padding: 5px 8px;
+  border: unset;
+  cursor: default;
   outline: none;
-  color: $text;
+  color: inherit;
   background: transparent;
 
+  font-size: inherit;
+  font-family: inherit;
+
+  &::placeholder {
+    font-size: inherit;
+    font-family: inherit;
+  }
   &:focus {
-    outline: 2px solid #ffe08a;
-    border-color: $accent;
+    outline: none;
+  }
+}
+
+select {
+  border-radius: 8px;
+  padding: 5px 8px;
+  border: 1px solid $border;
+}
+
+label:has(> select) {
+  position: relative;
+
+  > select {
+    appearance: none;
+    padding-right: 28px;
+  }
+
+  &::after {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    width: 6px;
+    height: 6px;
+    border-right: 1px solid $muted;
+    border-bottom: 1px solid $muted;
+    content: "";
+    pointer-events: none;
+    transform: rotate(45deg) translateY(-2px);
   }
 }
 

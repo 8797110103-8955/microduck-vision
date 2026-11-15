@@ -36,6 +36,153 @@ function setup(backend: MemoryBackend) {
 }
 
 describe("desktop to loop data flow", () => {
+  it("keeps virtual-machine bindings when no physical machine exists", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+    const app = setup(backend);
+
+    await load();
+    const updated = await backend.bindVirtualMachine({
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: 42,
+    });
+    app.state.virtualMachines[0] = updated;
+
+    expect(app.state.virtualMachines[0].jointBindings).toEqual([
+      expect.objectContaining({ slotId: "left_hip_yaw", physicalId: 42 }),
+    ]);
+    expect((await backend.virtualMachines())[0].jointBindings).toEqual(
+      app.state.virtualMachines[0].jointBindings,
+    );
+  });
+
+  it("persists each virtual machine's default world position", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+
+    const updated = await backend.setVirtualMachineWorldPosition(
+      "official-hd1910",
+      [1.25, -0.4, 2],
+    );
+
+    expect(updated.simulation.worldPosition).toEqual([1.25, -0.4, 2]);
+    await expect(backend.virtualMachines()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "official-hd1910",
+          simulation: expect.objectContaining({ worldPosition: [1.25, -0.4, 2] }),
+        }),
+      ]),
+    );
+  });
+
+  it("changes only the virtual binding when hardware is present", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+    const physical = await backend.savePhysicalMachine({
+      census: [{ servoId: 1, model: "hd1910" }],
+      reconnectHint: null,
+      name: "实机绑定隔离测试",
+    });
+    await backend.mountPhysicalMachine(physical.id, "official-hd1910");
+    await backend.bindPhysicalMachine({
+      physicalMachineId: physical.id,
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: 1,
+    });
+
+    await backend.bindVirtualMachine({
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: 20,
+    });
+
+    expect((await backend.virtualMachines())[0].jointBindings).toEqual([
+      expect.objectContaining({ slotId: "left_hip_yaw", physicalId: 20 }),
+    ]);
+    expect(await backend.physicalMachines()).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ jointBindings: expect.anything() })]),
+    );
+  });
+
+  it("keeps a binding conflict visible until the selected servo is cleared", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+    const machine = await backend.savePhysicalMachine({
+      census: [
+        { servoId: 1, model: "hd1910" },
+        { servoId: 2, model: "hd1910" },
+      ],
+      reconnectHint: null,
+      name: "冲突测试机",
+    });
+    await backend.mountPhysicalMachine(machine.id, "official-hd1910");
+
+    await backend.bindPhysicalMachine({
+      physicalMachineId: machine.id,
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: 1,
+    });
+    await backend.bindPhysicalMachine({
+      physicalMachineId: machine.id,
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_roll",
+      physicalId: 1,
+    });
+    expect((await backend.virtualMachines()).at(0)?.jointBindings).toHaveLength(2);
+
+    const cleared = await backend.validatePhysicalMachineBindings(machine.id);
+    expect(cleared).not.toHaveProperty("jointBindings");
+    expect((await backend.virtualMachines()).at(0)?.jointBindings).toEqual([]);
+  });
+
+  it("keeps virtual bindings when the physical machine is deleted", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+    const physical = await backend.savePhysicalMachine({
+      census: [{ servoId: 42, model: "hd1910" }],
+      reconnectHint: null,
+      name: "删除测试机",
+    });
+    await backend.mountPhysicalMachine(physical.id, "official-hd1910");
+    await backend.bindVirtualMachine({
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: 42,
+    });
+
+    await backend.deletePhysicalMachine(physical.id);
+
+    expect((await backend.virtualMachines())[0].jointBindings).toEqual([
+      expect.objectContaining({ slotId: "left_hip_yaw", physicalId: 42 }),
+    ]);
+  });
+
+  it("reads the complete physical register table and writes writable registers", async () => {
+    const backend = new MemoryBackend(memoryServoCatalog);
+    const machine = await backend.savePhysicalMachine({
+      census: [{ servoId: 1, model: "hd1910" }],
+      reconnectHint: null,
+      name: "寄存器测试机",
+    });
+
+    const rows = await backend.physicalMachineRegisters(machine.id);
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "model_number", writable: false }),
+        expect.objectContaining({ name: "torque_enable", writable: true }),
+      ]),
+    );
+    await expect(
+      backend.readPhysicalMachineRegister(machine.id, 1, "torque_enable"),
+    ).resolves.toMatchObject({ name: "torque_enable", address: 40 });
+    const updated = await backend.writePhysicalMachineRegister({
+      physicalMachineId: machine.id,
+      servoId: 1,
+      name: "torque_enable",
+      value: 1,
+    });
+    expect(updated).toMatchObject({ name: "torque_enable", value: 1, writable: true });
+  });
+
   it("runs the preview control loop in isolation from the hardware loop", async () => {
     const backend = new MemoryBackend(memoryServoCatalog);
     const app = setup(backend);

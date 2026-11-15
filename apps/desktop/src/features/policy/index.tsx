@@ -1,4 +1,5 @@
-import { defineComponent, onMounted, ref } from "vue";
+import { defineComponent, onMounted, ref, shallowRef } from "vue";
+import { useEventListener } from "@vueuse/core";
 import { desktopBackend, useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
@@ -6,6 +7,7 @@ export const PolicyPage = defineComponent(() => {
   const store = useDesktopStore();
   const busy = ref<string | null>(null);
   const error = ref<string | null>(null);
+  const refreshButton = shallowRef<HTMLButtonElement>();
 
   const refresh = async () => {
     try {
@@ -32,6 +34,21 @@ export const PolicyPage = defineComponent(() => {
   onMounted(() => {
     if (!store.state.policies.length && !store.state.loading) void refresh();
   });
+  useEventListener(refreshButton, "click", () => void refresh());
+  const PolicyDownloadButton = defineComponent({
+    props: {
+      policyId: { type: String, required: true },
+    },
+    setup(props) {
+      const button = shallowRef<HTMLButtonElement>();
+      useEventListener(button, "click", () => void download(props.policyId));
+      return () => (
+        <button ref={button} type="button" disabled={busy.value !== null} class={style.primary}>
+          {busy.value === props.policyId ? "下载中…" : "下载"}
+        </button>
+      );
+    },
+  });
 
   return () => (
     <div class={[style.page, style.policyPage]}>
@@ -40,7 +57,7 @@ export const PolicyPage = defineComponent(() => {
           <h1>策略</h1>
           <p>管理当前电脑缓存的官方 ONNX 文件。</p>
         </div>
-        <button type="button" onClick={() => void refresh()} disabled={busy.value !== null}>
+        <button ref={refreshButton} type="button" disabled={busy.value !== null}>
           刷新
         </button>
       </header>
@@ -69,14 +86,7 @@ export const PolicyPage = defineComponent(() => {
                 {policy.cached ? (
                   <span class={style.cachedLabel}>已缓存</span>
                 ) : (
-                  <button
-                    type="button"
-                    disabled={busy.value !== null}
-                    class={style.primary}
-                    onClick={() => void download(policy.id)}
-                  >
-                    {busy.value === policy.id ? "下载中…" : "下载"}
-                  </button>
+                  <PolicyDownloadButton policyId={policy.id} />
                 )}
               </div>
             </article>

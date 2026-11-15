@@ -10,15 +10,16 @@ const ORT_SHA256: &str = "abef733dacbe2f571547a7150b479b5cb9cc0df22f96c24983a42c
 const DOWNLOAD_ATTEMPTS: u8 = 3;
 
 fn main() {
-    let attrs = tauri_build::Attributes::new().windows_attributes(
-        tauri_build::WindowsAttributes::new_without_app_manifest(),
-    );
+    let attrs = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
     tauri_build::try_build(attrs).expect("tauri build");
 
     let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if windows && msvc {
-        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("assets");
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("assets");
         let manifest = assets.join("windows-app-manifest.xml");
         println!("cargo:rerun-if-changed={}", manifest.display());
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
@@ -58,17 +59,27 @@ fn deploy_onnxruntime() {
     }
 
     println!("cargo:rustc-env=DUCK_ORT_VERSION={ORT_VERSION}");
-    for target in [out.join("onnxruntime.dll"), profile.join("deps").join("onnxruntime.dll")] {
+    // Tauri launches the executable from the profile root. Keep a copy there in addition to
+    // the build-script and deps directories used by cargo test and direct crate binaries.
+    for target in [
+        out.join("onnxruntime.dll"),
+        profile.join("onnxruntime.dll"),
+        profile.join("deps").join("onnxruntime.dll"),
+    ] {
         let dir = target.parent().expect("target has a parent");
-        if !target.is_file()
-            || std::fs::metadata(&target).map(|metadata| metadata.len()).ok()
-                != std::fs::metadata(&dll).map(|metadata| metadata.len()).ok()
-        {
+        if !same_file(&dll, &target) {
             std::fs::create_dir_all(dir).expect("create ONNX Runtime output directory");
             std::fs::copy(&dll, &target)
                 .unwrap_or_else(|error| panic!("复制 {} 失败：{error}", target.display()));
         }
         println!("cargo:rerun-if-changed={}", target.display());
+    }
+}
+
+fn same_file(source: &Path, target: &Path) -> bool {
+    match (std::fs::read(source), std::fs::read(target)) {
+        (Ok(source), Ok(target)) => source == target,
+        _ => false,
     }
 }
 
@@ -94,7 +105,8 @@ fn fetch_onnxruntime(cache: &Path, dll: &Path) -> Result<(), String> {
         }
     };
 
-    let bytes = std::fs::read(&zip).map_err(|error| format!("读不到 {}：{error}", zip.display()))?;
+    let bytes =
+        std::fs::read(&zip).map_err(|error| format!("读不到 {}：{error}", zip.display()))?;
     let got = {
         use sha2::Digest;
         sha2::Sha256::digest(&bytes)
@@ -151,8 +163,10 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
                 .map_err(|error| format!("请求失败：{error}"))?
                 .error_for_status()
                 .map_err(|error| format!("服务器返回错误：{error}"))?;
-            let mut file = File::create(target).map_err(|error| format!("创建缓存文件失败：{error}"))?;
-            io::copy(&mut response, &mut file).map_err(|error| format!("写入缓存文件失败：{error}"))?;
+            let mut file =
+                File::create(target).map_err(|error| format!("创建缓存文件失败：{error}"))?;
+            io::copy(&mut response, &mut file)
+                .map_err(|error| format!("写入缓存文件失败：{error}"))?;
             Ok::<(), String>(())
         })();
 
@@ -168,5 +182,7 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
         }
     }
 
-    Err(format!("下载失败（尝试 {DOWNLOAD_ATTEMPTS} 次）：{last_error}"))
+    Err(format!(
+        "下载失败（尝试 {DOWNLOAD_ATTEMPTS} 次）：{last_error}"
+    ))
 }

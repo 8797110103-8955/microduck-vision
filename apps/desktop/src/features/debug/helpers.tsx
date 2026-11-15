@@ -1,11 +1,6 @@
 import { defineComponent } from "vue";
 import style from "./style.module.scss";
 
-export const valueOf = (event: Event) =>
-  event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement
-    ? event.target.value
-    : "";
-
 export const actionKind = (value: string) =>
   value === "sequence" || value === "policy" ? value : "pose";
 

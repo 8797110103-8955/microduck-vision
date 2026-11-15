@@ -33,6 +33,20 @@ pub trait ServoDriver: Send {
     fn ping(&mut self, id: u8) -> Result<bool, ServoError>;
 }
 
+/// Send one XL330 goal-position command through the protocol's sync-write
+/// path.  Keeping this at the driver boundary lets the desktop debug control
+/// use the same conversion and wire format as a running loop.
+pub fn write_position_target<B: RawBus>(
+    bus: &mut B,
+    id: u8,
+    position: f64,
+) -> Result<(), ServoError> {
+    let register = register("goal_position").expect("vendor XL330 register");
+    let raw = position_raw_from_rad(position)?;
+    let data = encode_register("goal_position", i64::from(raw))?;
+    bus.sync_write_raw(&[id], register.addr, &[data])
+}
+
 pub struct Xl330Driver<B> {
     bus: B,
     ids: Vec<u8>,

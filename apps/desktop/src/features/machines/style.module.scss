@@ -165,8 +165,12 @@
     border-right: 2px solid $muted;
     border-bottom: 2px solid $muted;
     transform: rotate(-45deg);
+  }
 
-    .expanded & {
+  .settingsChevron {
+    transition: transform 0.16s ease;
+
+    &.expanded {
       transform: rotate(45deg);
     }
   }
@@ -206,6 +210,89 @@
 
   .physicalCensusLine {
     flex-wrap: wrap;
+  }
+
+  .physicalRegisterPanel {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .physicalRegisterError {
+    color: $red;
+  }
+
+  .physicalRegisterGroup {
+    display: grid;
+    gap: 7px;
+
+    > strong {
+      color: $text;
+      font-size: 12px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid $border;
+      border-radius: 7px;
+      background: $surface;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      padding: 7px 9px;
+      border-bottom: 1px solid $border;
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      color: $muted;
+      background: $surface-2;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+  }
+
+  .physicalServoTabs {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow-x: auto;
+  }
+
+  .physicalServoTab {
+    padding: 5px 10px;
+    border: 1px solid $border;
+    border-radius: 6px;
+    color: $muted;
+    background: $surface;
+    font-size: 12px;
+
+    &:hover,
+    &.active {
+      border-color: rgba($accent, 0.55);
+      color: $text;
+      background: rgba($accent, 0.1);
+    }
+  }
+
+  .physicalRegisterInput {
+    width: min(150px, 100%);
+    min-height: 28px;
+    padding: 4px 7px;
+    font: inherit;
+  }
+
+  .physicalRegisterEmpty {
+    color: $muted;
   }
 
   .physicalDelete {

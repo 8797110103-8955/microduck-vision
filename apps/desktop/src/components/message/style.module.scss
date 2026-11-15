@@ -1,0 +1,66 @@
+@use "../../styles/tokens" as *;
+
+.messageHost {
+  position: fixed;
+  z-index: 1000;
+  top: 42px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(420px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.message {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 40px;
+  padding: 10px 10px 10px 14px;
+  border: 1px solid $border;
+  border-radius: 8px;
+  color: $text;
+  background: $surface;
+  box-shadow: 0 8px 24px rgba(36, 31, 18, 0.14);
+  pointer-events: auto;
+
+  > span {
+    flex: 1;
+    line-height: 20px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  &.success {
+    border-color: rgba($green, 0.5);
+  }
+
+  &.warning {
+    border-color: rgba($accent, 0.75);
+    background: #fffaf0;
+  }
+
+  &.error {
+    border-color: rgba($red, 0.55);
+    background: #fff7f5;
+  }
+}
+
+.close {
+  flex: 0 0 auto;
+  width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: $muted;
+  background: transparent;
+  font-size: 18px;
+  line-height: 20px;
+
+  &:hover:not(:disabled) {
+    color: $text;
+    background: rgba(0, 0, 0, 0.06);
+  }
+}

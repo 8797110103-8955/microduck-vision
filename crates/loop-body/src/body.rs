@@ -147,12 +147,7 @@ impl BodyLoop {
             self.driver.set_gain(self.config.gain)?;
             self.homing_ticks = 0;
         }
-        let ids: Vec<u8> = self
-            .calibration
-            .joints
-            .iter()
-            .map(|joint| joint.physical_id)
-            .collect();
+        let ids = self.calibration.physical_ids();
         let sample = match self.driver.read_positions(&ids) {
             Ok(sample) => sample,
             Err(error) => {
@@ -173,8 +168,8 @@ impl BodyLoop {
         }
         self.sensor_failures = 0;
         self.last_error = None;
-        let positions = self.to_body_positions(&sample.positions);
-        let velocities = self.to_body_positions(&sample.velocities);
+        let positions = self.calibration.to_body_positions(&sample.positions);
+        let velocities = self.calibration.to_body_positions(&sample.velocities);
         self.last_velocities = velocities.clone();
         self.body.apply_sensor_state(BodyState {
             positions: positions.clone(),
@@ -196,7 +191,7 @@ impl BodyLoop {
         self.body.write_targets(BodyTargets {
             positions: targets.clone(),
         })?;
-        let servo_targets = self.to_servo_positions(&targets);
+        let servo_targets = self.calibration.to_servo_positions(&targets);
         self.driver.write_positions(
             &ids,
             &ServoPositionTargets {
@@ -249,25 +244,5 @@ impl BodyLoop {
             }
         }
         Ok(())
-    }
-
-    fn to_servo_positions(&self, positions: &[f64]) -> Vec<f64> {
-        positions
-            .iter()
-            .zip(&self.calibration.joints)
-            .map(|(position, calibration)| {
-                (*position + calibration.zero_offset_rad) * f64::from(calibration.direction)
-            })
-            .collect()
-    }
-
-    fn to_body_positions(&self, positions: &[f64]) -> Vec<f64> {
-        positions
-            .iter()
-            .zip(&self.calibration.joints)
-            .map(|(position, calibration)| {
-                *position * f64::from(calibration.direction) - calibration.zero_offset_rad
-            })
-            .collect()
     }
 }

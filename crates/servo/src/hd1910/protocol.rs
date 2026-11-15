@@ -50,7 +50,12 @@ pub fn reset_instruction(model: ServoModel) -> Option<u8> {
 }
 
 pub fn motion_registers(model: ServoModel) -> &'static [&'static str] {
-    static STS: &[&str] = &["acceleration", "goal_position", "goal_time", "goal_speed"];
+    static STS: &[&str] = &[
+        "acceleration",
+        "goal_position",
+        "pwm_open_speed",
+        "goal_speed",
+    ];
     static SCS: &[&str] = &["goal_position", "goal_time", "goal_speed"];
     match model {
         ServoModel::Scs0009 => SCS,
@@ -118,7 +123,14 @@ pub fn registers() -> &'static [RegisterInfo] {
 pub fn register(name: &str) -> Option<FeetechRegister> {
     let custom = matches!(
         name,
-        "current_bias" | "v_fk" | "v_kgi" | "p_fk" | "e_fk" | "vk"
+        "pwm_open_speed"
+            | "current_bias"
+            | "integral_limit"
+            | "v_fk"
+            | "v_kgi"
+            | "p_fk"
+            | "e_fk"
+            | "vk"
     );
     (custom
         || sts3215::DEFINITION.register(name).is_some()
@@ -127,6 +139,17 @@ pub fn register(name: &str) -> Option<FeetechRegister> {
 }
 
 pub fn encode_register(name: &str, value: i64) -> Result<Vec<u8>, ServoError> {
+    if matches!(name, "model" | "model_number") {
+        return u8::try_from(value).map(|value| vec![value]).map_err(|_| {
+            ServoError::RegisterOutOfRange {
+                name: name.into(),
+                value,
+            }
+        });
+    }
+    if name == "pwm_open_speed" {
+        return encode_register("goal_time", value);
+    }
     if name == "present_load" {
         let magnitude = value.unsigned_abs();
         if magnitude > 0x7fff {
@@ -146,6 +169,18 @@ pub fn encode_register(name: &str, value: i64) -> Result<Vec<u8>, ServoError> {
                 name: name.into(),
                 value,
             });
+    }
+    // The FT STS/HD control table uses two independent one-byte parameters at
+    // 0x18 and 0x19.  The upstream rustypot STS3215 definition predates this
+    // correction and models minimum_startup_force as a u16 at 0x18, so keep
+    // the HD wire representation explicit here.
+    if matches!(name, "minimum_startup_force" | "integral_limit") {
+        return u8::try_from(value).map(|value| vec![value]).map_err(|_| {
+            ServoError::RegisterOutOfRange {
+                name: name.into(),
+                value,
+            }
+        });
     }
     if matches!(name, "v_fk" | "v_kgi" | "p_fk" | "e_fk" | "vk") {
         return u8::try_from(value).map(|value| vec![value]).map_err(|_| {
@@ -168,6 +203,27 @@ pub fn encode_register(name: &str, value: i64) -> Result<Vec<u8>, ServoError> {
 }
 
 pub fn decode_register(name: &str, bytes: &[u8]) -> Result<i64, ServoError> {
+    if matches!(name, "model" | "model_number") {
+        if bytes.len() != 1 {
+            return Err(ServoError::ShortRead {
+                what: "Feetech register",
+                expected: 1,
+                got: bytes.len(),
+            });
+        }
+        return bytes
+            .first()
+            .copied()
+            .map(i64::from)
+            .ok_or(ServoError::ShortRead {
+                what: "Feetech register",
+                expected: 1,
+                got: bytes.len(),
+            });
+    }
+    if name == "pwm_open_speed" {
+        return decode_register("goal_time", bytes);
+    }
     if name == "current_bias" {
         if bytes.len() != 2 {
             return Err(ServoError::ShortRead {
@@ -178,7 +234,32 @@ pub fn decode_register(name: &str, bytes: &[u8]) -> Result<i64, ServoError> {
         }
         return Ok(i64::from(u16::from_le_bytes([bytes[0], bytes[1]])));
     }
+    if matches!(name, "minimum_startup_force" | "integral_limit") {
+        if bytes.len() != 1 {
+            return Err(ServoError::ShortRead {
+                what: "Feetech register",
+                expected: 1,
+                got: bytes.len(),
+            });
+        }
+        return bytes
+            .first()
+            .copied()
+            .map(i64::from)
+            .ok_or(ServoError::ShortRead {
+                what: "Feetech register",
+                expected: 1,
+                got: bytes.len(),
+            });
+    }
     if matches!(name, "v_fk" | "v_kgi" | "p_fk" | "e_fk" | "vk") {
+        if bytes.len() != 1 {
+            return Err(ServoError::ShortRead {
+                what: "Feetech register",
+                expected: 1,
+                got: bytes.len(),
+            });
+        }
         return bytes
             .first()
             .copied()

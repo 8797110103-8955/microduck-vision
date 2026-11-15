@@ -1,4 +1,5 @@
-import { defineComponent, onMounted, ref, watch } from "vue";
+import { defineComponent, onMounted, ref, shallowRef, watch } from "vue";
+import { useEventListener } from "@vueuse/core";
 import { ScrollArea } from "../../components/scroll-area";
 import { useDesktopStore } from "../../store";
 import { PhysicalMachinesPage } from "../machines";
@@ -15,6 +16,14 @@ const tabs = [
 export const SettingsPage = defineComponent(() => {
   const store = useDesktopStore();
   const collapsed = ref(false);
+  const collapseButton = shallowRef<HTMLElement>();
+  const tabButtons = new Map<string, ReturnType<typeof shallowRef<HTMLButtonElement>>>();
+
+  for (const { view } of tabs) {
+    const button = shallowRef<HTMLButtonElement>();
+    tabButtons.set(view, button);
+    useEventListener(button, "click", () => (store.state.machineView = view));
+  }
 
   onMounted(() => {
     collapsed.value = globalThis.localStorage?.getItem("microduck.settings-collapsed") === "1";
@@ -22,23 +31,23 @@ export const SettingsPage = defineComponent(() => {
   watch(collapsed, (value) => {
     globalThis.localStorage?.setItem("microduck.settings-collapsed", value ? "1" : "0");
   });
-
+  useEventListener(collapseButton, "click", () => (collapsed.value = !collapsed.value));
+  useEventListener(collapseButton, "keydown", (event: KeyboardEvent) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      collapsed.value = !collapsed.value;
+    }
+  });
   return () => (
     <div class={[style.settingsPage, collapsed.value && style.collapsed]}>
       <aside class={style.settingsSidebar} aria-label="设置分类">
         <div
+          ref={collapseButton}
           class={style.settingsSidebarTopline}
           role="button"
           tabindex="0"
           aria-label={collapsed.value ? "展开设置导航" : "收起设置导航"}
           title={collapsed.value ? "展开设置导航" : "收起设置导航"}
-          onClick={() => (collapsed.value = !collapsed.value)}
-          onKeydown={(event: KeyboardEvent) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              collapsed.value = !collapsed.value;
-            }
-          }}
         >
           <span class={style.settingsCollapse} aria-hidden="true">
             <span
@@ -53,6 +62,10 @@ export const SettingsPage = defineComponent(() => {
         <nav class={style.settingsNav}>
           {tabs.map(({ label, view }) => (
             <button
+              ref={(element) => {
+                // oxlint-disable-next-line no-unsafe-type-assertion
+                tabButtons.get(view)!.value = element as HTMLButtonElement | undefined;
+              }}
               type="button"
               class={
                 (
@@ -65,7 +78,6 @@ export const SettingsPage = defineComponent(() => {
               }
               aria-label={label}
               title={collapsed.value ? label : undefined}
-              onClick={() => (store.state.machineView = view)}
             >
               {collapsed.value && label.slice(0, 1)}
               <span class={style.settingsNavLabel}>{label}</span>

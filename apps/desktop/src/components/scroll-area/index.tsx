@@ -1,4 +1,5 @@
-import { defineComponent, onMounted, onUnmounted, ref } from "vue";
+import { useEventListener, useResizeObserver } from "@vueuse/core";
+import { defineComponent, onMounted, shallowRef, ref } from "vue";
 import style from "./style.module.scss";
 
 export const ScrollArea = defineComponent({
@@ -8,12 +9,12 @@ export const ScrollArea = defineComponent({
     fill: { type: Boolean, default: false },
   },
   setup(props, { slots }) {
-    const viewport = ref<HTMLDivElement>();
-    const rail = ref<HTMLDivElement>();
+    const viewport = shallowRef<HTMLDivElement>();
+    const rail = shallowRef<HTMLDivElement>();
+    const thumb = shallowRef<HTMLDivElement>();
     const thumbSize = ref(100);
     const thumbOffset = ref(0);
     const scrollable = ref(false);
-    let resizeObserver: ResizeObserver | null = null;
     let dragging: { pointerId: number; startY: number; startScrollTop: number } | null = null;
 
     const sync = () => {
@@ -49,8 +50,7 @@ export const ScrollArea = defineComponent({
         startY: event.clientY,
         startScrollTop: viewport.value.scrollTop,
       };
-      if (event.currentTarget instanceof HTMLElement)
-        event.currentTarget.setPointerCapture(event.pointerId);
+      thumb.value?.setPointerCapture(event.pointerId);
     };
 
     const onThumbPointerMove = (event: PointerEvent) => {
@@ -69,7 +69,7 @@ export const ScrollArea = defineComponent({
     };
 
     const onRailPointerDown = (event: PointerEvent) => {
-      if (event.target === rail.value) scrollToRailPosition(event.clientY);
+      scrollToRailPosition(event.clientY);
     };
 
     const onThumbKeydown = (event: KeyboardEvent) => {
@@ -86,23 +86,18 @@ export const ScrollArea = defineComponent({
       }
     };
 
-    onMounted(() => {
-      const element = viewport.value;
-      if (!element) return;
-      element.addEventListener("scroll", sync, { passive: true });
-      window.addEventListener("resize", sync);
-      if (typeof ResizeObserver !== "undefined") {
-        resizeObserver = new ResizeObserver(sync);
-        resizeObserver.observe(element);
-      }
-      sync();
-    });
+    useEventListener(viewport, "scroll", sync, { passive: true });
+    useEventListener(window, "resize", sync);
+    useResizeObserver(viewport, sync);
+    useEventListener(rail, "pointerdown", onRailPointerDown);
+    useEventListener(thumb, "pointerdown", onThumbPointerDown);
+    useEventListener(thumb, "pointermove", onThumbPointerMove);
+    useEventListener(thumb, "pointerup", onThumbPointerUp);
+    useEventListener(thumb, "pointercancel", onThumbPointerUp);
+    useEventListener(thumb, "keydown", onThumbKeydown);
 
-    onUnmounted(() => {
-      viewport.value?.removeEventListener("scroll", sync);
-      window.removeEventListener("resize", sync);
-      resizeObserver?.disconnect();
-      resizeObserver = null;
+    onMounted(() => {
+      sync();
     });
 
     return () => (
@@ -113,12 +108,12 @@ export const ScrollArea = defineComponent({
         <div
           class={[style.rail, scrollable.value && style.visible]}
           ref={rail}
-          onPointerdown={onRailPointerDown}
           aria-hidden={!scrollable.value}
         >
           {scrollable.value && (
             <div
               class={style.thumb}
+              ref={thumb}
               role="scrollbar"
               tabindex="0"
               aria-valuemin="0"
@@ -127,11 +122,6 @@ export const ScrollArea = defineComponent({
                 (thumbOffset.value / Math.max(1, 100 - thumbSize.value)) * 100,
               )}
               style={{ height: `${thumbSize.value}%`, top: `${thumbOffset.value}%` }}
-              onPointerdown={onThumbPointerDown}
-              onPointermove={onThumbPointerMove}
-              onPointerup={onThumbPointerUp}
-              onPointercancel={onThumbPointerUp}
-              onKeydown={onThumbKeydown}
             />
           )}
         </div>

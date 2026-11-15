@@ -1,4 +1,5 @@
-import { computed, defineComponent } from "vue";
+import { computed, defineComponent, shallowRef, type PropType } from "vue";
+import { useEventListener } from "@vueuse/core";
 import type { ServoModelKey } from "../../bridge/types";
 import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
@@ -9,6 +10,27 @@ const valueText = (value: number | string | null | undefined, unit = "") =>
   value == null ? "—" : `${typeof value === "number" ? numberText(value) : value}${unit}`;
 const rangeText = (value: [number | null, number | null] | null | undefined, unit = "") =>
   value == null ? "—" : `${valueText(value[0])} – ${valueText(value[1])}${unit}`;
+
+const ServoModelTab = defineComponent({
+  props: {
+    model: {
+      // oxlint-disable-next-line no-unsafe-type-assertion
+      type: String as PropType<ServoModelKey>,
+      required: true,
+    },
+    label: { type: String, required: true },
+    active: { type: Boolean, default: false },
+  },
+  setup(props) {
+    const button = shallowRef<HTMLButtonElement>();
+    useEventListener(button, "click", () => selectServo(props.model));
+    return () => (
+      <button ref={button} class={props.active ? style.active : undefined}>
+        {props.label}
+      </button>
+    );
+  },
+});
 
 export const ServoLibraryPage = defineComponent(() => {
   const store = useDesktopStore();
@@ -86,12 +108,11 @@ export const ServoLibraryPage = defineComponent(() => {
     <div class={[style.page, style.servoLibraryPage]}>
       <div class={[style.modelTabs, style.largeTabs]}>
         {store.state.catalog.map((entry) => (
-          <button
-            class={store.state.selectedServo === entry.key ? style.active : undefined}
-            onClick={() => selectServo(entry.key)}
-          >
-            {entry.label}
-          </button>
+          <ServoModelTab
+            model={entry.key}
+            label={entry.label}
+            active={store.state.selectedServo === entry.key}
+          />
         ))}
       </div>
       {selected.value && (

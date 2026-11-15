@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { PhysicalMachine, VirtualMachine } from "../../src/bridge/types";
-import { debugPhysicalMachineFor, defaultDebugVirtualMachineId } from "../../src/features/debug";
+import {
+  bindingConflictsFor,
+  debugBindingFor,
+  debugPhysicalMachineFor,
+  defaultDebugVirtualMachineId,
+} from "../../src/features/debug";
 
 const virtualMachine = (id: string, name: string): VirtualMachine => ({
   id,
@@ -13,6 +18,7 @@ const virtualMachine = (id: string, name: string): VirtualMachine => ({
     armature: 0,
     kp: 0,
     forceRange: 0,
+    worldPosition: [0, 0, 0],
   },
   startupSelected: id === "machine-0",
   referencedBy: [],
@@ -54,5 +60,24 @@ describe("debug physical pairing", () => {
       "physical-1",
     );
     expect(physicalMachines[1].virtualMachineId).toBeNull();
+  });
+
+  it("uses the virtual mapping consistently for debug IDs and scene IDs", () => {
+    const virtual = virtualMachine("machine-0", "机器 0");
+    virtual.jointBindings = [
+      { slotId: "left_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
+    ];
+    expect(debugBindingFor(virtual, "left_hip_yaw")?.physicalId).toBe(42);
+    expect(debugBindingFor(virtual, "right_hip_yaw")).toBeUndefined();
+  });
+
+  it("reports duplicate virtual IDs without needing a physical machine", () => {
+    const virtual = virtualMachine("machine-0", "机器 0");
+    virtual.jointBindings = [
+      { slotId: "left_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
+      { slotId: "right_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
+    ];
+
+    expect(bindingConflictsFor(virtual)).toEqual(["42:left_hip_yaw,right_hip_yaw"]);
   });
 });

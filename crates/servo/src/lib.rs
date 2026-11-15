@@ -7,6 +7,8 @@ pub mod error;
 pub mod hd1910;
 pub mod xl330;
 
+pub use rustypot::servo::{RegisterAccess, RegisterInfo};
+
 pub use error::ServoError;
 pub use hd1910::{FeetechProtocol, HD1910, STS3215};
 pub use xl330::{

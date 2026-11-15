@@ -1,0 +1,73 @@
+@use "../../styles/tokens" as *;
+
+.track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid $border;
+  border-radius: 6px;
+  color: $text;
+  background: rgba($surface, 0.85);
+  cursor: ew-resize;
+
+  &:focus-within {
+    cursor: text;
+    border-color: $accent;
+    outline: 2px solid rgba($accent, 0.2);
+    outline-offset: 0;
+  }
+}
+
+.dragging,
+.dragging * {
+  cursor: none !important;
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.input {
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  border: unset;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  outline: 0;
+  cursor: inherit;
+}
+
+.hiddenInput {
+  position: relative;
+  z-index: -1;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+}
+
+.suffix {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  margin-left: 6px;
+  color: $muted;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.disabled {
+  opacity: 0.55;
+  cursor: default;
+  pointer-events: none;
+}

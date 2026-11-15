@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::ConnectedBus;
 use crate::helpers::default_simulation;
+use crate::motion::MotionTracker;
 use crate::physical;
 use crate::simulation::PreviewPolicyLoop;
 use crate::types::{
@@ -135,6 +136,7 @@ impl From<PersistedPhysicalMachine> for PhysicalMachine {
             online_servo_ids: Vec::new(),
             connected: false,
             last_seen: None,
+            torque_enabled: false,
         }
     }
 }
@@ -146,6 +148,7 @@ pub(crate) struct DesktopState {
     pub(crate) virtual_machines: Mutex<Vec<VirtualMachine>>,
     pub(crate) physical_machines: Mutex<Vec<PhysicalMachine>>,
     pub(crate) loop_state: Mutex<Option<PolicyLoop>>,
+    pub(crate) motion: Mutex<MotionTracker>,
     /// The preview loop is always virtual and never owns a connected servo bus.
     pub(crate) preview_loop: Mutex<Option<PreviewPolicyLoop>>,
     pub(crate) connected_buses: Mutex<HashMap<String, ConnectedBus>>,
@@ -182,6 +185,7 @@ impl DesktopState {
                     simulation: default_simulation(ServoModelKey::Hd1910),
                     startup_selected: true,
                     referenced_by: Vec::new(),
+                    joint_bindings: Vec::new(),
                 }]
             });
         let auto_mount_enabled = persisted_machines
@@ -201,14 +205,11 @@ impl DesktopState {
             }
         }
         let physical_machines: Vec<PhysicalMachine> = persisted_robots
-            .map(|config| {
-                config
-                    .physical_machines
-                    .into_iter()
-                    .map(Into::into)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map(|config| config.physical_machines)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
         Self::rebuild_references(&mut virtual_machines, &physical_machines);
         Self {
             config_dir,
@@ -217,6 +218,7 @@ impl DesktopState {
             virtual_machines: Mutex::new(virtual_machines),
             physical_machines: Mutex::new(physical_machines),
             loop_state: Mutex::new(None),
+            motion: Mutex::new(MotionTracker::default()),
             preview_loop: Mutex::new(None),
             connected_buses: Mutex::new(HashMap::new()),
             actions: Mutex::new(vec![
@@ -317,11 +319,10 @@ mod tests {
 
     #[test]
     fn system_config_round_trips_physical_weak_reference() {
-        let config_dir =
-            std::env::temp_dir().join(format!(
-                "microduck-vision-system-config-{}",
-                std::process::id()
-            ));
+        let config_dir = std::env::temp_dir().join(format!(
+            "microduck-vision-system-config-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&config_dir);
         let state = DesktopState::new(Some(config_dir.clone()));
         state
@@ -345,7 +346,9 @@ mod tests {
                 online_servo_ids: vec![1],
                 connected: true,
                 last_seen: Some("刚刚".into()),
+                torque_enabled: false,
             });
+        state.virtual_machines.lock().unwrap()[0].simulation.world_position = [1.25, -0.4, 2.0];
         state.persist().unwrap();
 
         let loaded = DesktopState::new(Some(config_dir.clone()));
@@ -368,12 +371,19 @@ mod tests {
             loaded.virtual_machines.lock().unwrap()[0].referenced_by,
             vec!["physical-1"]
         );
+        assert_eq!(
+            loaded.virtual_machines.lock().unwrap()[0]
+                .simulation
+                .world_position,
+            [1.25, -0.4, 2.0]
+        );
         assert!(config_dir.join("machines.toml").is_file());
         let machines_text = std::fs::read_to_string(config_dir.join("machines.toml")).unwrap();
         assert!(machines_text.contains("auto_mount = true"));
         assert!(machines_text.contains("auto_reconnect = true"));
         let robots_text = std::fs::read_to_string(config_dir.join("robots.toml")).unwrap();
         assert!(robots_text.contains("reconnect_hint"));
+        assert!(!robots_text.contains("joint_bindings"));
         assert!(!robots_text.contains("machine_code"));
         assert!(!robots_text.contains("connected"));
         let _ = std::fs::remove_dir_all(config_dir);

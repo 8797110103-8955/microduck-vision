@@ -4,12 +4,15 @@
   "version": "0.1.0",
   "identifier": "microduck-vision",
   "build": {
-    "beforeDevCommand": "cargo run --manifest-path src-tauri/Cargo.toml --bin generate-types && pnpm exec vite",
-    "beforeBuildCommand": "cargo run --manifest-path src-tauri/Cargo.toml --bin generate-types && pnpm exec vite build",
+    "beforeDevCommand": "pnpm run generate-types && pnpm exec vite",
+    "beforeBuildCommand": "pnpm run generate-types && pnpm exec vite build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
   "app": {
+    "appDirectoriesOverride": {
+      "localData": "$DATA/microduck-vision"
+    },
     "windows": [
       {
         "title": "microduck-vision",

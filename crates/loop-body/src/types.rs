@@ -131,6 +131,8 @@ pub struct JointCalibration {
     pub physical_id: u8,
     pub direction: i8,
     pub zero_offset_rad: f64,
+    pub min_rad: Option<f64>,
+    pub max_rad: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +141,38 @@ pub struct Calibration {
 }
 
 impl Calibration {
+    /// The driver order is always the body actuator order.  This is the boundary
+    /// between canonical simulation/ONNX slots and machine-specific servo IDs.
+    pub fn physical_ids(&self) -> Vec<u8> {
+        self.joints.iter().map(|joint| joint.physical_id).collect()
+    }
+
+    pub fn to_servo_positions(&self, positions: &[f64]) -> Vec<f64> {
+        positions
+            .iter()
+            .zip(&self.joints)
+            .map(|(position, calibration)| {
+                let bounded = match (calibration.min_rad, calibration.max_rad) {
+                    (Some(min), Some(max)) => position.clamp(min, max),
+                    (Some(min), None) => position.max(min),
+                    (None, Some(max)) => position.min(max),
+                    (None, None) => *position,
+                };
+                (bounded + calibration.zero_offset_rad) * f64::from(calibration.direction)
+            })
+            .collect()
+    }
+
+    pub fn to_body_positions(&self, positions: &[f64]) -> Vec<f64> {
+        positions
+            .iter()
+            .zip(&self.joints)
+            .map(|(position, calibration)| {
+                *position * f64::from(calibration.direction) - calibration.zero_offset_rad
+            })
+            .collect()
+    }
+
     pub(crate) fn validate(&self, template: &BodyTemplate) -> Result<(), LoopError> {
         let expected: Vec<_> = template
             .actuators
@@ -165,8 +199,67 @@ impl Calibration {
                     slot: joint.slot_id.clone(),
                 });
             }
+            if joint.min_rad.is_some_and(|value| !value.is_finite())
+                || joint.max_rad.is_some_and(|value| !value.is_finite())
+                || matches!((joint.min_rad, joint.max_rad), (Some(min), Some(max)) if min > max)
+            {
+                return Err(LoopError::NonFiniteOffset {
+                    slot: joint.slot_id.clone(),
+                });
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::{Calibration, JointCalibration};
+
+    #[test]
+    fn canonical_slots_translate_to_bound_machine_ids() {
+        let calibration = Calibration {
+            joints: vec![
+                JointCalibration {
+                    slot_id: "left_hip_yaw".into(),
+                    physical_id: 42,
+                    direction: -1,
+                    zero_offset_rad: 0.2,
+                    min_rad: None,
+                    max_rad: None,
+                },
+                JointCalibration {
+                    slot_id: "left_hip_roll".into(),
+                    physical_id: 43,
+                    direction: 1,
+                    zero_offset_rad: -0.1,
+                    min_rad: None,
+                    max_rad: None,
+                },
+            ],
+        };
+        assert_eq!(calibration.physical_ids(), vec![42, 43]);
+        let servo = calibration.to_servo_positions(&[0.5, 0.25]);
+        assert!((servo[0] + 0.7).abs() < 1e-9);
+        assert!((servo[1] - 0.15).abs() < 1e-9);
+        let body = calibration.to_body_positions(&servo);
+        assert!((body[0] - 0.5).abs() < 1e-9);
+        assert!((body[1] - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn installation_range_clamps_servo_targets() {
+        let calibration = Calibration {
+            joints: vec![JointCalibration {
+                slot_id: "left_hip_yaw".into(),
+                physical_id: 42,
+                direction: 1,
+                zero_offset_rad: 0.1,
+                min_rad: Some(-0.5),
+                max_rad: Some(0.5),
+            }],
+        };
+        assert_eq!(calibration.to_servo_positions(&[1.0]), vec![0.6]);
     }
 }
 

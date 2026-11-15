@@ -13,6 +13,7 @@ use servo::{
     Gain, ServoCommand, ServoError, ServoIdentity, ServoLoopDriver, ServoModel,
     ServoPositionTargets, ServoTelemetry,
 };
+use std::collections::VecDeque;
 
 const SCS_IDENTITY: [u8; 2] = [5, 4];
 const STS_IDENTITY: [u8; 2] = [9, 3];
@@ -21,19 +22,34 @@ const HD1910_IDENTITY: [u8; 2] = [10, 31];
 #[derive(Default)]
 struct DriverBus {
     goal: Vec<u8>,
+    goal_addr: Option<u8>,
     torque: Vec<u8>,
     gain: Vec<u8>,
+    reads: Vec<(u8, u8, u8)>,
+    writes: Vec<(u8, u8, Vec<u8>)>,
+    reboots: Vec<u8>,
+    responding_ids: Vec<u8>,
+    read_answers: VecDeque<Vec<u8>>,
 }
 
 impl FeetechRawBus for DriverBus {
-    fn read_raw(&mut self, _id: u8, _addr: u8, _len: u8) -> Result<Vec<u8>, ServoError> {
-        Ok(vec![0, 8, 0, 0])
+    fn read_raw(&mut self, id: u8, addr: u8, len: u8) -> Result<Vec<u8>, ServoError> {
+        self.reads.push((id, addr, len));
+        Ok(self
+            .read_answers
+            .pop_front()
+            .unwrap_or_else(|| vec![0, 8, 0, 0]))
     }
 
-    fn write_raw(&mut self, _id: u8, addr: u8, data: &[u8]) -> Result<(), ServoError> {
+    fn write_raw(&mut self, id: u8, addr: u8, data: &[u8]) -> Result<(), ServoError> {
+        self.writes.push((id, addr, data.to_vec()));
         match addr {
             40 => self.torque = data.to_vec(),
             21 => self.gain = data.to_vec(),
+            41 => {
+                self.goal_addr = Some(addr);
+                self.goal = data.to_vec();
+            }
             _ => {}
         }
         Ok(())
@@ -51,18 +67,20 @@ impl FeetechRawBus for DriverBus {
     fn sync_write_raw(
         &mut self,
         _ids: &[u8],
-        _addr: u8,
+        addr: u8,
         data: &[Vec<u8>],
     ) -> Result<(), ServoError> {
+        self.goal_addr = Some(addr);
         self.goal = data.first().cloned().unwrap_or_default();
         Ok(())
     }
 
-    fn ping(&mut self, _id: u8) -> Result<bool, ServoError> {
-        Ok(true)
+    fn ping(&mut self, id: u8) -> Result<bool, ServoError> {
+        Ok(self.responding_ids.is_empty() || self.responding_ids.contains(&id))
     }
 
-    fn reboot(&mut self, _id: u8) -> Result<(), ServoError> {
+    fn reboot(&mut self, id: u8) -> Result<(), ServoError> {
+        self.reboots.push(id);
         Ok(())
     }
 }
@@ -83,12 +101,135 @@ fn hd1910_driver_uses_feetech_motion_registers_for_loop_io() {
     ServoLoopDriver::set_torque(&mut driver, true).unwrap();
     ServoLoopDriver::set_gain(&mut driver, 200).unwrap();
     let bus = driver.into_inner();
-    assert_eq!(bus.goal, vec![0, 8]);
+    assert_eq!(bus.goal_addr, Some(41));
+    assert_eq!(bus.goal, vec![0, 0, 8, 0, 0, 232, 3]);
     assert_eq!(bus.torque, vec![1]);
     assert_eq!(bus.gain, vec![200]);
 }
 
+#[test]
+fn hd1910_reads_each_position_and_velocity_block_in_id_order() {
+    let bus = DriverBus {
+        read_answers: VecDeque::from([vec![0, 8, 100, 0], vec![0, 8, 100, 0x80]]),
+        ..DriverBus::default()
+    };
+    let mut driver = Hd1910Driver::new(bus).with_ids([3, 4]);
+    let sample = ServoLoopDriver::read_positions(&mut driver, &[3, 4]).unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(bus.reads, [(3, 56, 4), (4, 56, 4)]);
+    assert_eq!(sample.positions, [0.0, 0.0]);
+    assert!(sample.velocities[0] > 0.0);
+    assert!(sample.velocities[1] < 0.0);
+}
+
+#[test]
+fn hd1910_short_motion_block_is_rejected_before_any_target_write() {
+    let bus = DriverBus {
+        read_answers: VecDeque::from([vec![0, 8, 0]]),
+        ..DriverBus::default()
+    };
+    let mut driver = Hd1910Driver::new(bus).with_ids([1]);
+    let error = ServoLoopDriver::read_positions(&mut driver, &[1]).unwrap_err();
+    let bus = driver.into_inner();
+    assert_eq!(
+        error,
+        ServoError::ShortRead {
+            what: "HD1910 motion block",
+            expected: 4,
+            got: 3,
+        }
+    );
+    assert!(bus.writes.is_empty());
+}
+
+#[test]
+fn hd1910_writes_one_complete_motion_block_per_servo_id() {
+    let bus = DriverBus::default();
+    let mut driver = Hd1910Driver::new(bus).with_ids([7, 8]);
+    ServoLoopDriver::write_positions(
+        &mut driver,
+        &[7, 8],
+        &ServoPositionTargets {
+            positions: vec![0.0, std::f64::consts::FRAC_PI_2],
+        },
+    )
+    .unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(
+        bus.writes,
+        [
+            (7, 41, vec![0, 0, 8, 0, 0, 232, 3]),
+            (8, 41, vec![0, 0, 12, 0, 0, 232, 3]),
+        ]
+    );
+}
+
+#[test]
+fn hd1910_rejects_invalid_target_shapes_without_writing() {
+    let bus = DriverBus::default();
+    let mut driver = Hd1910Driver::new(bus).with_ids([1, 2]);
+    let mismatch = ServoLoopDriver::write_positions(
+        &mut driver,
+        &[1, 2],
+        &ServoPositionTargets {
+            positions: vec![0.0],
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(mismatch, ServoError::CountMismatch { .. }));
+    let nonfinite = ServoLoopDriver::write_positions(
+        &mut driver,
+        &[1],
+        &ServoPositionTargets {
+            positions: vec![f64::NAN],
+        },
+    )
+    .unwrap_err();
+    let bus = driver.into_inner();
+    assert!(matches!(
+        nonfinite,
+        ServoError::NonFinitePosition(value) if value.is_nan()
+    ));
+    assert!(bus.writes.is_empty());
+}
+
+#[test]
+fn hd1910_torque_gain_and_reboot_apply_to_all_configured_ids() {
+    let bus = DriverBus::default();
+    let mut driver = Hd1910Driver::new(bus).with_ids([4, 9]);
+    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
+    ServoLoopDriver::set_gain(&mut driver, 400).unwrap();
+    ServoLoopDriver::reboot(&mut driver, 9).unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(
+        bus.writes,
+        [
+            (4, 40, vec![1]),
+            (9, 40, vec![1]),
+            (4, 21, vec![255]),
+            (9, 21, vec![255]),
+        ]
+    );
+    assert_eq!(bus.reboots, [9]);
+}
+
+#[test]
+fn hd1910_scan_reports_only_responding_ids() {
+    let bus = DriverBus {
+        responding_ids: vec![0, 17, 253],
+        ..DriverBus::default()
+    };
+    let mut driver = Hd1910Driver::new(bus);
+    let found = FeetechDriver::scan(&mut driver).unwrap();
+    assert_eq!(found.len(), 3);
+}
+
 const HD1910_REGISTER_FACTS: &[(&str, u8, u8, &str, bool)] = &[
+    ("minimum_startup_force", 24, 1, "eeprom", true),
+    ("integral_limit", 25, 1, "eeprom", true),
     ("lock", 55, 1, "sram", true),
     ("torque_enable", 40, 1, "sram", true),
     ("acceleration", 41, 1, "sram", true),
@@ -172,6 +313,34 @@ fn feetech_baud_codes_match_the_mapping_record() {
     for &(baud, code) in &expected {
         assert_eq!(baud_code(ServoModel::Hd1910, baud), Some(code));
     }
+    assert_eq!(baud_code(ServoModel::Hd1910, 9_600), None);
+}
+
+#[test]
+fn feetech_model_specific_reset_and_position_boundaries_are_explicit() {
+    assert!(protocol_for_model(ServoModel::Xl330M288).is_none());
+    assert_eq!(reset_instruction(ServoModel::Scs0009), Some(0x0A));
+    assert_eq!(reset_instruction(ServoModel::Xl330M288), None);
+    assert_eq!(
+        position_steps_from_rad(ServoModel::Hd1910, -std::f64::consts::PI),
+        Ok(0)
+    );
+    assert_eq!(
+        position_steps_from_rad(ServoModel::Hd1910, std::f64::consts::PI),
+        Ok(4096)
+    );
+    assert!(matches!(
+        position_steps_from_rad(ServoModel::Hd1910, std::f64::consts::PI + 0.001),
+        Err(ServoError::RegisterOutOfRange { .. })
+    ));
+    assert!(matches!(
+        position_steps_from_rad(ServoModel::Hd1910, f64::INFINITY),
+        Err(ServoError::NonFinitePosition(value)) if value.is_infinite()
+    ));
+    assert!(matches!(
+        position_steps_from_rad(ServoModel::Xl330M288, 0.0),
+        Err(ServoError::UnknownRegister(_))
+    ));
 }
 
 #[test]
@@ -180,7 +349,12 @@ fn feetech_restore_and_motion_blocks_are_model_specific() {
     assert_eq!(reset_instruction(ServoModel::Sts3215), Some(0x06));
     assert_eq!(
         motion_registers(ServoModel::Hd1910),
-        ["acceleration", "goal_position", "goal_time", "goal_speed",]
+        [
+            "acceleration",
+            "goal_position",
+            "pwm_open_speed",
+            "goal_speed",
+        ]
     );
     assert_eq!(
         motion_registers(ServoModel::Scs0009),
@@ -205,11 +379,66 @@ fn feetech_protocol_one_frame_vectors_match_the_web_tool() -> Result<(), ServoEr
 }
 
 #[test]
+fn feetech_frame_decoder_rejects_header_length_and_checksum_errors() {
+    assert!(matches!(
+        decode_frame(&[0, 0, 1, 2, 0, 0]),
+        Err(ServoError::InvalidRegister { name }) if name == "frame"
+    ));
+    assert!(matches!(
+        decode_frame(&[0xFF, 0xFF, 1, 3, 0, 0]),
+        Err(ServoError::ShortRead { .. })
+    ));
+    let mut frame = encode_frame(1, 2, &[3]).unwrap();
+    let last = frame.len() - 1;
+    frame[last] ^= 1;
+    assert!(matches!(
+        decode_frame(&frame),
+        Err(ServoError::InvalidRegister { name }) if name == "checksum"
+    ));
+    assert!(matches!(
+        decode_frame(&[0xFF, 0xFF, 1, 1, 0]),
+        Err(ServoError::InvalidRegister { name }) if name == "frame"
+    ));
+}
+
+#[test]
+fn feetech_frame_encoder_rejects_lengths_that_do_not_fit_protocol_one() {
+    let error = encode_frame(1, 2, &[0; 254]).unwrap_err();
+    assert!(matches!(error, ServoError::RegisterOutOfRange { .. }));
+}
+
+#[test]
 fn feetech_register_encoding_preserves_model_byte_order() -> Result<(), ServoError> {
     let little_endian = encode_register("goal_position", 0x1234)?;
     assert_eq!(little_endian, vec![0x34, 0x12]);
     let decoded = decode_register("goal_position", &little_endian)?;
     assert_eq!(decoded, 0x1234);
+    Ok(())
+}
+
+#[test]
+fn hd1910_splits_startup_force_and_integral_limit_into_one_byte_registers() -> Result<(), ServoError>
+{
+    assert_eq!(encode_register("minimum_startup_force", 0x12)?, vec![0x12]);
+    assert_eq!(encode_register("integral_limit", 0x34)?, vec![0x34]);
+    assert_eq!(decode_register("minimum_startup_force", &[0x12])?, 0x12);
+    assert_eq!(decode_register("integral_limit", &[0x34])?, 0x34);
+    assert!(encode_register("minimum_startup_force", 0x100).is_err());
+    assert!(decode_register("integral_limit", &[]).is_err());
+    Ok(())
+}
+
+#[test]
+fn hd1910_uses_ft_version_and_pwm_open_speed_register_layout() -> Result<(), ServoError> {
+    assert_eq!(encode_register("model", 0x0a)?, vec![0x0a]);
+    assert_eq!(decode_register("model", &[0x0a])?, 0x0a);
+    assert_eq!(decode_register("model_number", &[0x1f])?, 0x1f);
+    assert_eq!(encode_register("pwm_open_speed", 0x1234)?, vec![0x34, 0x12]);
+    assert_eq!(decode_register("pwm_open_speed", &[0x34, 0x12])?, 0x1234);
+    assert!(encode_register("model", 0x100).is_err());
+    assert!(decode_register("model_number", &[]).is_err());
+    assert!(decode_register("pwm_open_speed", &[0x34]).is_err());
+    assert!(decode_register("v_fk", &[0x01, 0x02]).is_err());
     Ok(())
 }
 

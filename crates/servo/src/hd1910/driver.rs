@@ -13,6 +13,28 @@ use crate::{
     ServoPositionTargets, ServoTelemetry,
 };
 
+const DEFAULT_MOVE_SPEED: i64 = 1_000;
+
+/// Send one position command using the same seven-byte motion block as the
+/// FT web controller.  This is intentionally an ordinary WRITE (rather than
+/// SYNC_WRITE): HD1910 firmware used by the desktop app can acknowledge a
+/// sync write without moving the servo.
+pub fn write_position_target<B: FeetechRawBus>(
+    bus: &mut B,
+    id: u8,
+    position: f64,
+) -> Result<(), ServoError> {
+    let steps = position_steps_from_rad(crate::ServoModel::Hd1910, position)?;
+    let position = super::encode_register("goal_position", i64::from(steps))?;
+    let speed = super::encode_register("goal_speed", DEFAULT_MOVE_SPEED)?;
+    let mut block = Vec::with_capacity(7);
+    block.push(0); // acceleration: 0 means the servo's maximum
+    block.extend_from_slice(&position);
+    block.extend_from_slice(&[0, 0]); // PWM open speed: use speed mode
+    block.extend_from_slice(&speed);
+    bus.write_raw(id, 41, &block)
+}
+
 pub trait FeetechRawBus {
     fn read_raw(&mut self, id: u8, addr: u8, len: u8) -> Result<Vec<u8>, ServoError>;
     fn write_raw(&mut self, id: u8, addr: u8, data: &[u8]) -> Result<(), ServoError>;
@@ -249,15 +271,17 @@ impl<B: FeetechRawBus + Send> Hd1910Driver<B> {
                 got: targets.positions.len(),
             });
         }
-        let data = targets
-            .positions
-            .iter()
-            .map(|position| {
-                position_steps_from_rad(crate::ServoModel::Hd1910, *position)
-                    .and_then(|steps| super::encode_register("goal_position", i64::from(steps)))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.bus.sync_write_raw(ids, 42, &data)
+        // Feetech STS/HD1910 uses the same motion block as the official web
+        // controller: write from acceleration (41) through goal speed (46) in
+        // one ordinary WRITE transaction per servo.  The web controller does
+        // not use SYNC_WRITE here; some HD1910 firmware accepts the latter
+        // without moving, so keep the wire operation identical to the known
+        // working implementation.  Writing only goal_position (42) also leaves
+        // speed and acceleration from a previous command active on the servo.
+        for (&id, position) in ids.iter().zip(&targets.positions) {
+            write_position_target(&mut self.bus, id, *position)?;
+        }
+        Ok(())
     }
 }
 

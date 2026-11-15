@@ -1,4 +1,5 @@
-import { defineComponent, onMounted, onUnmounted, ref } from "vue";
+import { defineComponent, onMounted, onUnmounted, ref, shallowRef } from "vue";
+import { useEventListener } from "@vueuse/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import style from "./style.module.scss";
 
@@ -11,6 +12,9 @@ export const Titlebar = defineComponent({
   },
   setup(props, { slots }) {
     const maximized = ref(false);
+    const minButton = shallowRef<HTMLButtonElement>();
+    const maxButton = shallowRef<HTMLButtonElement>();
+    const closeButton = shallowRef<HTMLButtonElement>();
     let unlistenResize: (() => void) | null = null;
 
     const refreshMaximized = async () => {
@@ -43,6 +47,19 @@ export const Titlebar = defineComponent({
       unlistenResize = null;
     });
 
+    useEventListener(minButton, "click", (event: MouseEvent) => {
+      event.stopPropagation();
+      void getCurrentWindow().minimize();
+    });
+    useEventListener(maxButton, "click", (event: MouseEvent) => {
+      event.stopPropagation();
+      void (maximized.value ? getCurrentWindow().unmaximize() : getCurrentWindow().maximize());
+    });
+    useEventListener(closeButton, "click", (event: MouseEvent) => {
+      event.stopPropagation();
+      void getCurrentWindow().close();
+    });
+
     return () => (
       <header class={style.titlebar}>
         <div class={style.leading} data-tauri-drag-region="deep">
@@ -52,15 +69,7 @@ export const Titlebar = defineComponent({
         <div class={style.actions}>
           {slots.actions?.()}
           {props.min && (
-            <button
-              class={style.control}
-              aria-label="最小化"
-              title="最小化"
-              onClick={(event: MouseEvent) => {
-                event.stopPropagation();
-                void getCurrentWindow().minimize();
-              }}
-            >
+            <button ref={minButton} class={style.control} aria-label="最小化" title="最小化">
               <span class={style.controlIcon} aria-hidden="true">
                 {"\uE921"}
               </span>
@@ -68,16 +77,11 @@ export const Titlebar = defineComponent({
           )}
           {props.max && (
             <button
+              ref={maxButton}
               id="snap-btn"
               class={style.control}
               aria-label="最大化或还原"
               title="最大化或还原"
-              onClick={(event: MouseEvent) => {
-                event.stopPropagation();
-                void (maximized.value
-                  ? getCurrentWindow().unmaximize()
-                  : getCurrentWindow().maximize());
-              }}
             >
               <span class={style.controlIcon} aria-hidden="true">
                 {maximized.value ? "\uE923" : "\uE922"}
@@ -86,13 +90,10 @@ export const Titlebar = defineComponent({
           )}
           {props.close && (
             <button
+              ref={closeButton}
               class={[style.control, style.close]}
               aria-label="关闭"
               title="关闭"
-              onClick={(event: MouseEvent) => {
-                event.stopPropagation();
-                void getCurrentWindow().close();
-              }}
             >
               <span class={style.controlIcon} aria-hidden="true">
                 {"\uE8BB"}

@@ -2,10 +2,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "generate-types": "node scripts/generate-types.mjs"
+  },
   "dependencies": {
     "@tauri-apps/api": "~2.12.4",
     "@tauri-apps/plugin-dialog": "~2.8.4",
     "@tauri-apps/plugin-notification": "~2.8.0",
+    "@vueuse/core": "^15.0.0",
     "pinia": "^4.1.0",
     "three": "^0.187.0",
     "vue": "^3.5.45"

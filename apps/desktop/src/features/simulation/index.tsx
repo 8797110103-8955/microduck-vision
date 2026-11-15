@@ -1,7 +1,9 @@
-import { computed, defineComponent, onMounted, onUnmounted, ref } from "vue";
+import { computed, defineComponent, ref, shallowRef } from "vue";
+import { useEventListener } from "@vueuse/core";
 import type { ServoCatalogEntry, ServoModelKey, SimulationParameters } from "../../bridge/types";
+import { Slider } from "../../components/slider";
 import { desktopBackend, useDesktopStore } from "../../store";
-import { servoModel, valueOf } from "../debug/helpers";
+import { servoModel } from "../debug/helpers";
 import style from "./style.module.scss";
 
 const randomFactor = (spread: number) => 1 - spread + Math.random() * spread * 2;
@@ -13,13 +15,17 @@ export const SimulationPage = defineComponent(() => {
   const draft = ref("");
   const editingWasExpanded = ref(false);
   const createOpen = ref(false);
+  const createPanel = shallowRef<HTMLElement>();
+  const createButton = shallowRef<HTMLElement>();
+  const newNameInput = shallowRef<HTMLInputElement>();
+  const newServoSelect = shallowRef<HTMLSelectElement>();
+  const editingNameInput = shallowRef<HTMLInputElement>();
   const newName = ref("");
   const newServo = ref<ServoModelKey>(store.state.selectedServo);
   const newSimulation = ref<SimulationParameters>(simulationFor(newServo.value));
 
-  const simulationFields: Array<
-    [keyof SimulationParameters, string, string, keyof ServoCatalogEntry]
-  > = [
+  type SimulationFieldKey = Exclude<keyof SimulationParameters, "worldPosition">;
+  const simulationFields: Array<[SimulationFieldKey, string, string, keyof ServoCatalogEntry]> = [
     ["damping", "damping", "阻尼", "simDamping"],
     ["frictionLoss", "frictionloss", "摩擦损失", "simFrictionLoss"],
     ["armature", "armature", "转子惯量", "simArmature"],
@@ -36,6 +42,7 @@ export const SimulationPage = defineComponent(() => {
       armature: profile.simArmature,
       kp: profile.simKp,
       forceRange: profile.simForceRange,
+      worldPosition: [0, 0, 0] as [number, number, number],
     };
   }
 
@@ -60,6 +67,7 @@ export const SimulationPage = defineComponent(() => {
         armature: Number(((base.armature ?? 0) * randomFactor(0.1)).toFixed(6)),
         kp: Number(((base.kp ?? 0) * randomFactor(0.15)).toFixed(6)),
         forceRange: Number(((base.forceRange ?? 0) * randomFactor(0.1)).toFixed(6)),
+        worldPosition: [...(base.worldPosition ?? [0, 0, 0])] as [number, number, number],
       };
       if (!used.has(simulationKey(candidate))) return candidate;
     }
@@ -113,36 +121,22 @@ export const SimulationPage = defineComponent(() => {
     createOpen.value = false;
   };
 
-  const onDocumentPointerDown = (event: PointerEvent) => {
-    if (!(event.target instanceof Element)) return;
-    if (
-      event.target.closest(".simulation-create-panel") ||
-      event.target.closest(".simulation-add")
-    ) {
-      return;
-    }
-    closeCreatePanel();
-  };
+  const onDocumentPointerDown = () => closeCreatePanel();
 
-  onMounted(() => {
-    document.addEventListener("pointerdown", onDocumentPointerDown);
-    window.addEventListener("blur", closeCreatePanel);
-  });
-
-  onUnmounted(() => {
-    document.removeEventListener("pointerdown", onDocumentPointerDown);
-    window.removeEventListener("blur", closeCreatePanel);
-  });
+  useEventListener(document, "pointerdown", onDocumentPointerDown);
+  useEventListener(window, "blur", closeCreatePanel);
 
   return () => (
     <div class={[style.page, style.simulationPage]}>
       <div class={style.simulationToolbar}>
         <span class={style.muted}>所有模拟机将显示在首页</span>
         <button
+          ref={createButton}
           class={style.simulationAdd}
           type="button"
           aria-label="新建模拟机"
           title="新建模拟机"
+          onPointerdown={(event: PointerEvent) => event.stopPropagation()}
           onClick={() => {
             newServo.value = store.state.selectedServo;
             newSimulation.value = randomSimulation(newServo.value);
@@ -152,14 +146,19 @@ export const SimulationPage = defineComponent(() => {
           <span aria-hidden="true">+</span>
         </button>
         {createOpen.value && (
-          <div class={style.simulationCreatePanel}>
+          <div
+            ref={createPanel}
+            class={style.simulationCreatePanel}
+            onPointerdown={(event: PointerEvent) => event.stopPropagation()}
+          >
             <label>
               名称
               <input
+                ref={newNameInput}
                 autofocus
                 placeholder="模拟机名称"
                 value={newName.value}
-                onInput={(event: Event) => (newName.value = valueOf(event))}
+                onInput={() => (newName.value = newNameInput.value?.value ?? "")}
                 onKeydown={(event: KeyboardEvent) => {
                   if (event.key === "Enter") void create();
                   if (event.key === "Escape") closeCreatePanel();
@@ -169,9 +168,10 @@ export const SimulationPage = defineComponent(() => {
             <label>
               舵机
               <select
+                ref={newServoSelect}
                 value={newServo.value}
-                onChange={(event: Event) => {
-                  newServo.value = servoModel(valueOf(event));
+                onChange={() => {
+                  newServo.value = servoModel(newServoSelect.value?.value ?? "");
                   newSimulation.value = randomSimulation(newServo.value);
                 }}
               >
@@ -183,23 +183,22 @@ export const SimulationPage = defineComponent(() => {
             <div class={style.simulationCreateParameters}>
               <strong>仿真参数</strong>
               {fieldsFor(newServo.value).map(([key, label, description]) => (
-                <label class={style.simulationParameterInput}>
+                <div class={style.simulationParameterInput}>
                   <span>
                     {label}
                     <small>{description}</small>
                   </span>
-                  <input
-                    type="number"
-                    step="any"
-                    value={newSimulation.value[key] ?? ""}
-                    onInput={(event: Event) => {
-                      newSimulation.value = {
-                        ...newSimulation.value,
-                        [key]: Number(valueOf(event)),
-                      };
+                  <Slider
+                    value={newSimulation.value[key] ?? 0}
+                    min={-1_000_000}
+                    max={1_000_000}
+                    step={0.000001}
+                    ariaLabel={label}
+                    onInput={(event) => {
+                      newSimulation.value = { ...newSimulation.value, [key]: event.value };
                     }}
                   />
-                </label>
+                </div>
               ))}
             </div>
             <div class={style.simulationCreateActions}>
@@ -225,12 +224,7 @@ export const SimulationPage = defineComponent(() => {
                     ? [style.simulationRow, style.selected]
                     : style.simulationRow
                 }
-                onClick={(event: MouseEvent) => {
-                  if (
-                    event.target instanceof Element &&
-                    event.target.closest("button, input, select")
-                  )
-                    return;
+                onClick={() => {
                   store.state.selectedVirtualMachine = machine.id;
                   store.state.selectedVirtualMachineManual = true;
                   toggle(machine.id);
@@ -245,6 +239,7 @@ export const SimulationPage = defineComponent(() => {
 
                 {editing.value === machine.id ? (
                   <input
+                    ref={editingNameInput}
                     class={style.simulationNameInput}
                     autofocus
                     value={draft.value}
@@ -253,7 +248,7 @@ export const SimulationPage = defineComponent(() => {
                       if (event.key === "Enter") void finishEdit(machine.id, true);
                       if (event.key === "Escape") void finishEdit(machine.id, false);
                     }}
-                    onInput={(event: Event) => (draft.value = valueOf(event))}
+                    onInput={() => (draft.value = editingNameInput.value?.value ?? "")}
                     onBlur={() => void finishEdit(machine.id, true)}
                   />
                 ) : (
@@ -291,14 +286,20 @@ export const SimulationPage = defineComponent(() => {
                         machine.startupSelected ? [style.startup, style.active] : style.startup
                       }
                       type="button"
-                      onClick={() => void setStartupVirtualMachine(machine.id)}
+                      onClick={(event: MouseEvent) => {
+                        event.stopPropagation();
+                        void setStartupVirtualMachine(machine.id);
+                      }}
                     >
                       {machine.startupSelected ? "启动时选中" : "设为启动项"}
                     </button>
                     <button
                       class={[style.smallButton, style.danger]}
                       type="button"
-                      onClick={() => void deleteVirtualMachine(machine.id)}
+                      onClick={(event: MouseEvent) => {
+                        event.stopPropagation();
+                        void deleteVirtualMachine(machine.id);
+                      }}
                       disabled={machine.startupSelected || machine.referencedBy.length > 0}
                     >
                       删除实例
@@ -341,6 +342,7 @@ export async function createVirtualMachine(
     armature: profile.simArmature,
     kp: profile.simKp,
     forceRange: profile.simForceRange,
+    worldPosition: [0, 0, 0],
   };
   const machine = await desktopBackend().createVirtualMachine({
     name,

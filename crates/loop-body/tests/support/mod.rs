@@ -80,6 +80,8 @@ pub fn binding(model: ServoModel, count: usize) -> LoopBinding {
                     physical_id,
                     direction: 1,
                     zero_offset_rad: 0.0,
+                    min_rad: None,
+                    max_rad: None,
                 })
                 .collect(),
         },

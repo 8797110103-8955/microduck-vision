@@ -15,6 +15,7 @@ use servo::{
 };
 
 use crate::support::ScriptedPort;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 #[test]
@@ -34,14 +35,23 @@ struct DriverBus {
     goal: Vec<u8>,
     torque: Vec<u8>,
     gain: Vec<u8>,
+    reads: Vec<(u8, u8, u8)>,
+    writes: Vec<(u8, u8, Vec<u8>)>,
+    sync_reads: Vec<(Vec<u8>, u8, u8)>,
+    sync_writes: Vec<(Vec<u8>, u8, Vec<Vec<u8>>)>,
+    reboots: Vec<u8>,
+    pings: Vec<u8>,
+    sync_read_answers: VecDeque<Vec<Vec<u8>>>,
 }
 
 impl RawBus for DriverBus {
-    fn read_raw(&mut self, _id: u8, _addr: u8, _len: u8) -> Result<Vec<u8>, ServoError> {
+    fn read_raw(&mut self, id: u8, addr: u8, len: u8) -> Result<Vec<u8>, ServoError> {
+        self.reads.push((id, addr, len));
         Ok(Vec::new())
     }
 
-    fn write_raw(&mut self, _id: u8, addr: u8, data: &[u8]) -> Result<(), ServoError> {
+    fn write_raw(&mut self, id: u8, addr: u8, data: &[u8]) -> Result<(), ServoError> {
+        self.writes.push((id, addr, data.to_vec()));
         match addr {
             64 => self.torque = data.to_vec(),
             84 => self.gain = data.to_vec(),
@@ -50,33 +60,28 @@ impl RawBus for DriverBus {
         Ok(())
     }
 
-    fn sync_read_raw(
-        &mut self,
-        ids: &[u8],
-        _addr: u8,
-        _len: u8,
-    ) -> Result<Vec<Vec<u8>>, ServoError> {
-        Ok(ids
-            .iter()
-            .map(|_| [0, 0, 0, 0, 0, 8, 0, 0].to_vec())
-            .collect())
+    fn sync_read_raw(&mut self, ids: &[u8], addr: u8, len: u8) -> Result<Vec<Vec<u8>>, ServoError> {
+        self.sync_reads.push((ids.to_vec(), addr, len));
+        Ok(self.sync_read_answers.pop_front().unwrap_or_else(|| {
+            ids.iter()
+                .map(|_| [0, 0, 0, 0, 0, 8, 0, 0].to_vec())
+                .collect()
+        }))
     }
 
-    fn sync_write_raw(
-        &mut self,
-        _ids: &[u8],
-        _addr: u8,
-        data: &[Vec<u8>],
-    ) -> Result<(), ServoError> {
+    fn sync_write_raw(&mut self, ids: &[u8], addr: u8, data: &[Vec<u8>]) -> Result<(), ServoError> {
+        self.sync_writes.push((ids.to_vec(), addr, data.to_vec()));
         self.goal = data.first().cloned().unwrap_or_default();
         Ok(())
     }
 
-    fn ping(&mut self, _id: u8) -> Result<bool, ServoError> {
+    fn ping(&mut self, id: u8) -> Result<bool, ServoError> {
+        self.pings.push(id);
         Ok(true)
     }
 
-    fn reboot(&mut self, _id: u8) -> Result<(), ServoError> {
+    fn reboot(&mut self, id: u8) -> Result<(), ServoError> {
+        self.reboots.push(id);
         Ok(())
     }
 }
@@ -104,6 +109,116 @@ fn xl330_driver_uses_vendor_register_layout_for_loop_io() {
 }
 
 #[test]
+fn xl330_reads_all_requested_ids_with_the_contiguous_motion_window() {
+    let bus = DriverBus {
+        sync_read_answers: VecDeque::from([vec![
+            vec![0, 0, 0, 0, 0, 8, 0, 0],
+            vec![0, 0, 0, 0, 0, 12, 0, 0],
+        ]]),
+        ..DriverBus::default()
+    };
+    let mut driver = Xl330Driver::new(bus);
+    let sample = ServoLoopDriver::read_positions(&mut driver, &[2, 3]).unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(bus.sync_reads, [(vec![2, 3], 128, 8)]);
+    assert_eq!(sample.positions.len(), 2);
+    assert_eq!(sample.positions[0], 0.0);
+    assert!(sample.positions[1] > 0.0);
+}
+
+#[test]
+fn xl330_rejects_sync_read_count_and_short_blocks() {
+    let count_bus = DriverBus {
+        sync_read_answers: VecDeque::from([vec![vec![0; 8]]]),
+        ..DriverBus::default()
+    };
+    let mut count_driver = Xl330Driver::new(count_bus);
+    let count_error = ServoLoopDriver::read_positions(&mut count_driver, &[1, 2]).unwrap_err();
+    assert!(matches!(count_error, ServoError::CountMismatch { .. }));
+    let _count_bus = count_driver.into_inner();
+
+    let short_bus = DriverBus {
+        sync_read_answers: VecDeque::from([vec![vec![0; 7]]]),
+        ..DriverBus::default()
+    };
+    let mut short_driver = Xl330Driver::new(short_bus);
+    let short_error = ServoLoopDriver::read_positions(&mut short_driver, &[1]).unwrap_err();
+    assert_eq!(
+        short_error,
+        ServoError::ShortRead {
+            what: "XL330 motion block",
+            expected: 8,
+            got: 7,
+        }
+    );
+}
+
+#[test]
+fn xl330_writes_a_single_sync_packet_for_all_targets() {
+    let bus = DriverBus::default();
+    let mut driver = Xl330Driver::new(bus);
+    ServoLoopDriver::write_positions(
+        &mut driver,
+        &[4, 5],
+        &ServoPositionTargets {
+            positions: vec![0.0, std::f64::consts::FRAC_PI_2],
+        },
+    )
+    .unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(bus.sync_writes.len(), 1);
+    assert_eq!(bus.sync_writes[0].0, [4, 5]);
+    assert_eq!(bus.sync_writes[0].1, 116);
+    assert_eq!(bus.sync_writes[0].2, [vec![0, 8, 0, 0], vec![0, 12, 0, 0]]);
+}
+
+#[test]
+fn xl330_rejects_invalid_targets_without_emitting_a_sync_packet() {
+    let bus = DriverBus::default();
+    let mut driver = Xl330Driver::new(bus);
+    let mismatch = ServoLoopDriver::write_positions(
+        &mut driver,
+        &[1, 2],
+        &ServoPositionTargets {
+            positions: vec![0.0],
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(mismatch, ServoError::CountMismatch { .. }));
+    let out_of_range = ServoLoopDriver::write_positions(
+        &mut driver,
+        &[1],
+        &ServoPositionTargets {
+            positions: vec![std::f64::consts::PI + 0.01],
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        out_of_range,
+        ServoError::RegisterOutOfRange { .. }
+    ));
+    let bus = driver.into_inner();
+    assert!(bus.sync_writes.is_empty());
+}
+
+#[test]
+fn xl330_torque_gain_ping_and_reboot_use_the_requested_id() {
+    let bus = DriverBus::default();
+    let mut driver = Xl330Driver::new(bus);
+    ServoDriver::set_torque(&mut driver, 8, true).unwrap();
+    ServoDriver::set_gain(&mut driver, 8, 300).unwrap();
+    assert!(ServoDriver::ping(&mut driver, 8).unwrap());
+    ServoDriver::reboot(&mut driver, 8).unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(bus.writes, [(8, 64, vec![1]), (8, 84, vec![44, 1])]);
+    assert_eq!(bus.pings, [8]);
+    assert_eq!(bus.reboots, [8]);
+}
+
+#[test]
 fn xl330_memory_bus_round_trips_vendor_registers_and_presence() {
     let mut bus = MemoryXl330Bus::with_servos(&[1]);
     assert!(bus.ping(1).unwrap());
@@ -113,6 +228,38 @@ fn xl330_memory_bus_round_trips_vendor_registers_and_presence() {
     assert_eq!(bus.register(1, "present_position"), 2500);
     assert_eq!(bus.read_raw(1, 132, 4).unwrap(), vec![196, 9, 0, 0]);
     assert_eq!(bus.read_raw(2, 132, 4), Err(ServoError::MissingServo(2)));
+}
+
+#[test]
+fn xl330_driver_and_memory_bus_preserve_the_complete_loop_contract() {
+    let mut driver = Xl330Driver::new(MemoryXl330Bus::with_servos(&[1, 2])).with_ids([1, 2]);
+    let initial = ServoLoopDriver::read_positions(&mut driver, &[1, 2]).unwrap();
+    assert_eq!(initial.positions, [0.0, 0.0]);
+
+    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
+    ServoLoopDriver::set_gain(&mut driver, 180).unwrap();
+    ServoLoopDriver::write_positions(
+        &mut driver,
+        &[1, 2],
+        &ServoPositionTargets {
+            positions: vec![0.25, -0.25],
+        },
+    )
+    .unwrap();
+    let bus = driver.into_inner();
+
+    assert_eq!(bus.register(1, "torque_enable"), 1);
+    assert_eq!(bus.register(2, "torque_enable"), 1);
+    assert_eq!(bus.register(1, "position_p_gain"), 180);
+    assert_eq!(bus.register(2, "position_p_gain"), 180);
+    assert_eq!(
+        bus.register(1, "goal_position"),
+        position_raw_from_rad(0.25).unwrap() as i64
+    );
+    assert_eq!(
+        bus.register(2, "goal_position"),
+        position_raw_from_rad(-0.25).unwrap() as i64
+    );
 }
 
 #[test]
@@ -147,6 +294,40 @@ fn vendor_xl330_definition_and_conversions_are_the_protocol_baseline() {
     let _ = position_rad_from_raw(2048);
     let _ = position_raw_from_rad(0.0);
     let _ = velocity_rad_s_from_raw(1);
+}
+
+#[test]
+fn xl330_protocol_round_trips_signed_and_little_endian_registers() {
+    assert_eq!(
+        encode_register("goal_position", 0x1234).unwrap(),
+        [0x34, 0x12, 0, 0]
+    );
+    assert_eq!(
+        decode_register("goal_position", &[0x34, 0x12, 0, 0]).unwrap(),
+        0x1234
+    );
+    assert_eq!(encode_register("torque_enable", 1).unwrap(), [1]);
+    assert_eq!(decode_register("torque_enable", &[1]).unwrap(), 1);
+    assert!(decode_register("torque_enable", &[1, 0]).is_err());
+    assert!(matches!(
+        encode_register("missing", 1),
+        Err(ServoError::UnknownRegister(name)) if name == "missing"
+    ));
+}
+
+#[test]
+fn xl330_position_conversion_rejects_nonfinite_and_out_of_range_values() {
+    assert_eq!(position_raw_from_rad(0.0), Ok(2048));
+    assert_eq!(position_raw_from_rad(-std::f64::consts::PI), Ok(0));
+    assert_eq!(position_raw_from_rad(std::f64::consts::PI), Ok(4096));
+    assert!(matches!(
+        position_raw_from_rad(f64::NAN),
+        Err(ServoError::NonFinitePosition(value)) if value.is_nan()
+    ));
+    assert!(matches!(
+        position_raw_from_rad(std::f64::consts::PI + 0.001),
+        Err(ServoError::RegisterOutOfRange { name, .. }) if name == "goal_position"
+    ));
 }
 
 #[test]
@@ -287,6 +468,21 @@ fn official_xl330_bus_rejects_invalid_group_values_before_writing() {
         Some(RegisterError::OutOfRange { .. })
     ));
     assert!(written.lock().unwrap().is_empty());
+}
+
+#[test]
+fn xl330_memory_bus_rejects_unknown_devices_and_mismatched_sync_data() {
+    let mut bus = MemoryXl330Bus::with_servos(&[1, 2]);
+    assert_eq!(bus.write_raw(9, 64, &[1]), Err(ServoError::MissingServo(9)));
+    assert_eq!(bus.reboot(9), Err(ServoError::MissingServo(9)));
+    assert_eq!(
+        bus.sync_write_raw(&[1, 2], 116, &[vec![0, 8, 0, 0]]),
+        Err(ServoError::CountMismatch {
+            what: "XL330 fake sync write",
+            expected: 2,
+            got: 1,
+        })
+    );
 }
 
 #[test]

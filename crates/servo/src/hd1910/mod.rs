@@ -4,7 +4,9 @@
 mod driver;
 mod protocol;
 
-pub use driver::{FeetechDriver, FeetechRawBus, Hd1910Driver, RustypotFeetechBus};
+pub use driver::{
+    FeetechDriver, FeetechRawBus, Hd1910Driver, RustypotFeetechBus, write_position_target,
+};
 pub use protocol::{
     FeetechProtocol, FeetechRegister, FeetechRegisterArea, HD1910, STS3215, XdatImage, baud_code,
     current_ma_from_raw, decode_frame, decode_register, decode_xdat, encode_frame, encode_register,

@@ -19,6 +19,12 @@ vi.mock("../../src/features/home/viewer", () => ({
     }
     setFrame() {}
     setGhosts() {}
+    setWorldPose() {}
+    pickDuck() {
+      return 1;
+    }
+    focusCurrentDuck() {}
+    restorePreviousView() {}
   },
 }));
 
@@ -59,7 +65,7 @@ describe("desktop frontend flow", () => {
     expect(store.state.catalog.map((entry) => entry.key)).toEqual(["hd1910", "xl330"]);
     expect(store.state.selectedVirtualMachine).toBe("official-hd1910");
     expect(backend.calls.filter((call) => call.name === "servo_catalog")).toHaveLength(1);
-    expect(wrapper.text()).toContain("预览");
+    expect(wrapper.text()).toContain("VLA预览");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     expect(wrapper.text()).toContain("策略");
@@ -111,18 +117,40 @@ describe("desktop frontend flow", () => {
     expect(wrapper.text()).toContain("机器 0");
     expect(wrapper.text()).not.toContain("参数沿用旧版舵机调试面板");
     expect(wrapper.text()).not.toContain("舵机参数");
+    await buttonByText(wrapper, "聚焦").trigger("click");
+    await buttonByText(wrapper, "回到聚焦前位置").trigger("click");
     await openLoop([1, 2]);
     await wrapper.vm.$nextTick();
+    const targetInput = wrapper.get("[data-slider] input");
+    await targetInput.setValue("0.5");
+    await targetInput.trigger("blur");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("loop_action");
+    expect(backend.calls.filter((call) => call.name === "loop_tick")).toHaveLength(6);
+    expect(store.state.loop?.phase).toBe("driving");
+    expect(store.state.loop?.positions[0]).toBe(0.5);
     await buttonByText(wrapper, "发送微调目标").trigger("click");
     await flushPromises();
-    expect(store.state.loop?.targets).toEqual([0.01, 0.01]);
+    expect(store.state.loop?.targets).toEqual([0.51, 0.01]);
 
     await buttonByText(wrapper, "推进一拍").trigger("click");
     await flushPromises();
-    expect(store.state.loop?.positions).toEqual([0.01, 0.01]);
+    expect(store.state.loop?.positions).toEqual([0.51, 0.01]);
     await buttonByText(wrapper, "停止控制环").trigger("click");
     await flushPromises();
     expect(store.state.loop).toBeNull();
+
+    // Debug controls must continue to work after the loop is closed.  The
+    // direct path enables the selected servo before sending its position
+    // command instead of silently dispatching to the closed loop state.
+    await targetInput.setValue("0.25");
+    await buttonByText(wrapper, "移动").trigger("click");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_set_torque");
+    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_write_position");
+    await buttonByText(wrapper, "力矩关").trigger("click");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_set_torque");
 
     wrapper.unmount();
     host.remove();
@@ -132,7 +160,7 @@ describe("desktop frontend flow", () => {
     const backend = new TestBackend(memoryServoCatalog);
     const { host, wrapper, store } = await mountApp(backend);
 
-    await buttonByText(wrapper, "预览").trigger("click");
+    await buttonByText(wrapper, "VLA预览").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("当前电脑还没有已缓存的 ONNX");
@@ -140,6 +168,20 @@ describe("desktop frontend flow", () => {
     await flushPromises();
     expect(store.state.previewLoop).toMatchObject({ phase: "ready", torque: false });
     expect(backend.calls.map((call) => call.name)).toContain("preview_loop_open");
+    await buttonByText(wrapper, "打开日志").trigger("click");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("open_logs");
+    const resetWorldButton = buttonByText(wrapper, "归零");
+    expect((resetWorldButton.element as HTMLButtonElement).disabled).toBe(true);
+    store.state.previewLoop = {
+      ...store.state.previewLoop!,
+      world: { position: [1, 0], yaw: 0, distanceM: 1 },
+    };
+    await wrapper.vm.$nextTick();
+    expect((resetWorldButton.element as HTMLButtonElement).disabled).toBe(false);
+    await resetWorldButton.trigger("click");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_reset_world");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     await buttonByText(wrapper, "策略").trigger("click");
@@ -148,7 +190,7 @@ describe("desktop frontend flow", () => {
     expect(wrapper.text()).toContain("已缓存");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
-    await buttonByText(wrapper, "预览").trigger("click");
+    await buttonByText(wrapper, "VLA预览").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("Alpha Walking");
@@ -158,9 +200,68 @@ describe("desktop frontend flow", () => {
     expect(backend.calls.map((call) => call.name)).toContain("policy_select");
     expect(store.state.previewLoop?.torque).toBe(true);
     expect(backend.calls.map((call) => call.name)).toContain("preview_loop_policy");
+    const speed = wrapper.find("[data-slider] input");
+    await speed.setValue("0.2");
+    await speed.trigger("blur");
+    await flushPromises();
+    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_command");
+    expect(store.state.previewLoop?.world.distanceM).toBeGreaterThanOrEqual(0);
+    await backend.invoke("policy_download", { id: "alpha-stand" });
+    await backend.invoke("policy_select", { id: "alpha-stand" });
+    const switched = await backend.invoke("preview_loop_policy", { policyId: "alpha-stand" });
+    expect(switched).toMatchObject({ torque: true });
+    expect(backend.calls.map((call) => call.name)).not.toContain("preview_loop_close");
     await buttonByText(wrapper, "停止控制环").trigger("click");
     await flushPromises();
     expect(store.state.previewLoop).toBeNull();
+
+    wrapper.unmount();
+    host.remove();
+  });
+
+  it("creates a virtual machine from the simulation panel", async () => {
+    const backend = new TestBackend(memoryServoCatalog);
+    const { host, wrapper, store } = await mountApp(backend);
+
+    await wrapper.get('button[aria-label="设置"]').trigger("click");
+    await buttonByText(wrapper, "模拟机").trigger("click");
+    await flushPromises();
+    await wrapper.get('button[aria-label="新建模拟机"]').trigger("click");
+    const name = wrapper.get('input[placeholder="模拟机名称"]');
+    await name.setValue("测试模拟机");
+    await buttonByText(wrapper, "创建").trigger("click");
+    await flushPromises();
+
+    expect(backend.calls.map((call) => call.name)).toContain("virtual_machine_create");
+    expect(store.state.virtualMachines.some((machine) => machine.name === "测试模拟机")).toBe(true);
+
+    wrapper.unmount();
+    host.remove();
+  });
+
+  it("selects the clicked 3D duck for preview and debug", async () => {
+    const backend = new TestBackend(memoryServoCatalog);
+    const { host, wrapper, store } = await mountApp(backend);
+    const startupMachine = store.state.virtualMachines[0];
+    store.state.virtualMachines.push({
+      ...startupMachine,
+      id: "virtual-2",
+      name: "机器 1",
+      startupSelected: false,
+      referencedBy: [],
+    });
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[data-testid="duck-viewport"]').trigger("click", {
+      clientX: 100,
+      clientY: 100,
+    });
+    expect(store.state.selectedVirtualMachine).toBe("virtual-2");
+    expect(store.state.selectedVirtualMachineManual).toBe(true);
+
+    await buttonByText(wrapper, "调试").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("机器 1");
 
     wrapper.unmount();
     host.remove();
@@ -179,7 +280,7 @@ describe("desktop frontend flow", () => {
 
     expect(store.state.error).toBeNull();
     expect(store.state.catalog).toHaveLength(2);
-    expect(wrapper.text()).toContain("预览");
+    expect(wrapper.text()).toContain("VLA预览");
 
     wrapper.unmount();
     host.remove();

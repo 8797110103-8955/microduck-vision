@@ -1,14 +1,17 @@
 import type {
   ActionRecord,
   LoopAction,
+  LoopCommandInput,
   LoopStatus,
   PhysicalMachine,
   PolicyEntry,
+  PreviewInput,
   PhysicalMachineDetectInput,
   PhysicalMachineProbeInput,
   PhysicalMachineReconnectInput,
   PhysicalMachineSaveInput,
   PhysicalMachineInput,
+  PhysicalServoRegister,
   SceneInfo,
   SceneFrame,
   ServoCatalogEntry,
@@ -26,6 +29,7 @@ function simulationFor(catalog: ServoCatalogEntry[], model: ServoModelKey) {
     armature: entry.simArmature,
     kp: entry.simKp,
     forceRange: entry.simForceRange,
+    worldPosition: [0, 0, 0] as [number, number, number],
   };
 }
 
@@ -202,6 +206,13 @@ export class MemoryBackend implements DesktopBackend {
   ];
   private status: LoopStatus | null = null;
   private previewStatus: LoopStatus | null = null;
+  private previewInput: PreviewInput = {
+    twist: [0, 0, 0],
+    head: [0, 0, 0, 0],
+    body: [0, 0, 0],
+    targetDistanceM: null,
+  };
+  private previewCommandEncoding: string | null = null;
   private policies: PolicyEntry[] = [
     {
       id: "alpha-walking",
@@ -212,6 +223,8 @@ export class MemoryBackend implements DesktopBackend {
       cached: false,
       selected: false,
       size: 0,
+      kind: "perpetual",
+      slot: "walk",
     },
     {
       id: "velstand",
@@ -222,6 +235,8 @@ export class MemoryBackend implements DesktopBackend {
       cached: false,
       selected: false,
       size: 0,
+      kind: "perpetual",
+      slot: "walk",
     },
     {
       id: "alpha-stand",
@@ -232,6 +247,8 @@ export class MemoryBackend implements DesktopBackend {
       cached: false,
       selected: false,
       size: 0,
+      kind: "perpetual",
+      slot: "stand",
     },
     {
       id: "roller",
@@ -252,6 +269,19 @@ export class MemoryBackend implements DesktopBackend {
       cached: false,
       selected: false,
       size: 0,
+      kind: "scripted",
+      command: {
+        slot: null,
+        encoding: "posture_flag",
+        idle: [0, 0, 0],
+        twist: null,
+        head: null,
+        body: null,
+        periodS: null,
+        endPhase: null,
+        sit: 1,
+        stand: 0,
+      },
     },
     {
       id: "alpha-ground-pick",
@@ -262,6 +292,20 @@ export class MemoryBackend implements DesktopBackend {
       cached: false,
       selected: false,
       size: 0,
+      kind: "episodic",
+      durationS: 2.8,
+      command: {
+        slot: null,
+        encoding: "phase",
+        idle: [0, 0, 0],
+        twist: null,
+        head: null,
+        body: null,
+        periodS: 4,
+        endPhase: 0.7,
+        sit: null,
+        stand: null,
+      },
     },
     {
       id: "roller-crouch",
@@ -345,10 +389,45 @@ export class MemoryBackend implements DesktopBackend {
     return this.catalog.map((entry) => ({ ...entry, capabilities: [...entry.capabilities] }));
   }
 
+  async officialJointSlots() {
+    this.calls.push({ name: "officialJointSlots" });
+    return [
+      "left_hip_yaw",
+      "left_hip_roll",
+      "left_hip_pitch",
+      "left_knee",
+      "left_ankle",
+      "neck_pitch",
+      "head_pitch",
+      "head_yaw",
+      "head_roll",
+      "mouth",
+      "right_hip_yaw",
+      "right_hip_roll",
+      "right_hip_pitch",
+      "right_knee",
+      "right_ankle",
+    ];
+  }
+
+  async officialJointRanges() {
+    this.calls.push({ name: "officialJointRanges" });
+    return (await this.officialJointSlots()).map((slotId) => ({
+      slotId,
+      minRad: -Math.PI,
+      maxRad: Math.PI,
+    }));
+  }
+
+  async openLogs() {
+    this.calls.push({ name: "openLogs" });
+  }
+
   async virtualMachines() {
     this.calls.push({ name: "virtualMachines" });
     return this.machines.map((machine) => ({
       ...machine,
+      jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
       referencedBy: [...machine.referencedBy],
     }));
   }
@@ -548,6 +627,139 @@ export class MemoryBackend implements DesktopBackend {
     return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
   }
 
+  async bindPhysicalMachine(input: {
+    physicalMachineId: string;
+    virtualMachineId?: string | null;
+    slotId: string;
+    physicalId: number | null;
+  }) {
+    this.calls.push({ name: "bindPhysicalMachine", value: input });
+    const machine = this.physical.find((entry) => entry.id === input.physicalMachineId);
+    if (!machine) throw new Error(`unknown physical machine: ${input.physicalMachineId}`);
+    const virtualMachine = this.machines.find(
+      (entry) => entry.id === (input.virtualMachineId ?? machine.virtualMachineId),
+    );
+    if (!virtualMachine)
+      throw new Error("physical machine is not associated with a virtual machine");
+    const bindings = [...(virtualMachine.jointBindings ?? [])].filter(
+      (binding) => binding.slotId !== input.slotId,
+    );
+    if (input.physicalId !== null) {
+      if (!(machine.census ?? []).some((servo) => servo.servoId === input.physicalId))
+        throw new Error(`servo ${input.physicalId} is not in the machine census`);
+      bindings.push({
+        slotId: input.slotId,
+        physicalId: input.physicalId,
+        direction: 1,
+        zeroOffsetRad: 0,
+      });
+    }
+    virtualMachine.jointBindings = bindings;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async bindVirtualMachine(input: {
+    virtualMachineId: string;
+    slotId: string;
+    physicalId: number | null;
+  }) {
+    this.calls.push({ name: "bindVirtualMachine", value: input });
+    const machine = this.machines.find((entry) => entry.id === input.virtualMachineId);
+    if (!machine) throw new Error(`unknown virtual machine: ${input.virtualMachineId}`);
+    const bindings = (machine.jointBindings ?? []).filter(
+      (binding) => binding.slotId !== input.slotId,
+    );
+    if (input.physicalId !== null) {
+      bindings.push({
+        slotId: input.slotId,
+        physicalId: input.physicalId,
+        direction: 1,
+        zeroOffsetRad: 0,
+      });
+    }
+    machine.jointBindings = bindings;
+    return { ...machine, jointBindings: bindings.map((binding) => ({ ...binding })) };
+  }
+
+  async validateVirtualMachineBindings(id: string) {
+    this.calls.push({ name: "validateVirtualMachineBindings", value: id });
+    const machine = this.machines.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown virtual machine: ${id}`);
+    const bindings = machine.jointBindings ?? [];
+    const conflictingIds = bindings
+      .filter((binding, index) =>
+        bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
+      )
+      .map((binding) => binding.physicalId);
+    machine.jointBindings = bindings.filter(
+      (binding) => !conflictingIds.includes(binding.physicalId),
+    );
+    return {
+      ...machine,
+      jointBindings: machine.jointBindings.map((binding) => ({ ...binding })),
+    };
+  }
+
+  async validatePhysicalMachineBindings(id: string) {
+    this.calls.push({ name: "validatePhysicalMachineBindings", value: id });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    const virtualMachine = this.machines.find((entry) => entry.id === machine.virtualMachineId);
+    const bindings = virtualMachine?.jointBindings ?? [];
+    const conflictingIds = bindings
+      .filter((binding, index) =>
+        bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
+      )
+      .map((binding) => binding.physicalId);
+    const validBindings = bindings.filter(
+      (binding) => !conflictingIds.includes(binding.physicalId),
+    );
+    if (virtualMachine) virtualMachine.jointBindings = validBindings;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async setPhysicalMachinePoseZero(id: string, virtualMachineId?: string | null) {
+    this.calls.push({ name: "setPhysicalMachinePoseZero", value: id });
+    const machine = this.physical.find((item) => item.id === id);
+    if (!machine) throw new Error("unknown physical machine");
+    const virtualMachine = this.machines.find(
+      (item) => item.id === (virtualMachineId ?? machine.virtualMachineId),
+    );
+    if (!virtualMachine)
+      throw new Error("physical machine is not associated with a virtual machine");
+    virtualMachine.jointBindings = (virtualMachine.jointBindings ?? []).map((binding) => ({
+      ...binding,
+      zeroOffsetRad: 0,
+    }));
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async physicalMachinePose(id: string, _virtualMachineId?: string | null) {
+    this.calls.push({ name: "physicalMachinePose", value: id });
+    if (!this.physical.some((machine) => machine.id === id))
+      throw new Error("unknown physical machine");
+    return Array.from({ length: 15 }, () => 0);
+  }
+
+  async setPhysicalMachineTorque(id: string, enabled: boolean, _virtualMachineId?: string | null) {
+    this.calls.push({ name: "setPhysicalMachineTorque", value: { id, enabled } });
+    const machine = this.physical.find((item) => item.id === id);
+    if (!machine) throw new Error("unknown physical machine");
+    machine.torqueEnabled = enabled;
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async writePhysicalMachinePosition(input: {
+    physicalMachineId: string;
+    servoId: number;
+    positionRad: number;
+  }) {
+    this.calls.push({ name: "writePhysicalMachinePosition", value: input });
+    const machine = this.physical.find((item) => item.id === input.physicalMachineId);
+    if (!machine) throw new Error("unknown physical machine");
+    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
   async scanPhysicalMachine(id: string) {
     this.calls.push({ name: "scanPhysicalMachine", value: id });
     const machine = this.physical.find((entry) => entry.id === id);
@@ -556,6 +768,74 @@ export class MemoryBackend implements DesktopBackend {
       ? machine.census.map((servo) => servo.servoId)
       : [1, 2];
     return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+  }
+
+  async physicalMachineRegisters(id: string): Promise<PhysicalServoRegister[]> {
+    this.calls.push({ name: "physicalMachineRegisters", value: id });
+    const machine = this.physical.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown physical machine: ${id}`);
+    return (machine.census ?? []).flatMap((servo) => [
+      {
+        servoId: servo.servoId,
+        address: 0,
+        name: "model_number",
+        size: 2,
+        default: false,
+        writable: false,
+        value: 0,
+      },
+      {
+        servoId: servo.servoId,
+        address: 40,
+        name: "torque_enable",
+        size: 1,
+        default: false,
+        writable: true,
+        value: machine.torqueEnabled ? 1 : 0,
+      },
+      {
+        servoId: servo.servoId,
+        address: 56,
+        name: "present_position",
+        size: 2,
+        default: false,
+        writable: false,
+        value: 0,
+      },
+    ]);
+  }
+
+  async readPhysicalMachineRegister(id: string, servoId: number, name: string) {
+    this.calls.push({ name: "readPhysicalMachineRegister", value: { id, servoId, name } });
+    const machine = this.physical.find((item) => item.id === id);
+    if (!machine) throw new Error("unknown physical machine");
+    const row = (await this.physicalMachineRegisters(id)).find(
+      (entry) => entry.servoId === servoId && entry.name === name,
+    );
+    if (!row) throw new Error(`unknown register: ${name}`);
+    return row;
+  }
+
+  async writePhysicalMachineRegister(input: {
+    physicalMachineId: string;
+    servoId: number;
+    name: string;
+    value: number;
+  }): Promise<PhysicalServoRegister> {
+    this.calls.push({ name: "writePhysicalMachineRegister", value: input });
+    const machine = this.physical.find((entry) => entry.id === input.physicalMachineId);
+    if (!machine) throw new Error(`unknown physical machine: ${input.physicalMachineId}`);
+    if (input.name !== "torque_enable") throw new Error("register is read-only");
+    machine.torqueEnabled = input.value !== 0;
+    return {
+      servoId: input.servoId,
+      address: 40,
+      name: input.name,
+      size: 1,
+      default: false,
+      writable: true,
+      value: input.value,
+    };
   }
 
   async policyList() {
@@ -582,6 +862,10 @@ export class MemoryBackend implements DesktopBackend {
     return { ...policy, selected: true };
   }
 
+  async policyOpenFolder() {
+    this.calls.push({ name: "policyOpenFolder" });
+  }
+
   async createVirtualMachine(
     input: Pick<VirtualMachine, "name" | "bodyId" | "servoModel" | "simulation">,
   ) {
@@ -603,6 +887,14 @@ export class MemoryBackend implements DesktopBackend {
       ...machine,
       startupSelected: machine.id === id,
     }));
+  }
+
+  async setVirtualMachineWorldPosition(id: string, position: [number, number, number]) {
+    this.calls.push({ name: "setVirtualMachineWorldPosition", value: { id, position } });
+    const machine = this.machines.find((entry) => entry.id === id);
+    if (!machine) throw new Error(`unknown virtual machine: ${id}`);
+    machine.simulation.worldPosition = [...position] as [number, number, number];
+    return { ...machine, referencedBy: [...machine.referencedBy] };
   }
 
   async deleteVirtualMachine(id: string) {
@@ -649,6 +941,14 @@ export class MemoryBackend implements DesktopBackend {
     policyId?: string;
   }) {
     this.calls.push({ name: "loopOpen", value: input });
+    const machine = this.machines.find((entry) => entry.id === input.virtualMachineId);
+    const seen = new Set<number>();
+    const duplicate = machine?.jointBindings?.find((binding) => {
+      if (seen.has(binding.physicalId)) return true;
+      seen.add(binding.physicalId);
+      return false;
+    });
+    if (duplicate) throw new Error(`绑定冲突：舵机 ${duplicate.physicalId} 被重复绑定`);
     const count = input.servoIds.length;
     this.status = {
       phase: "limp",
@@ -657,6 +957,7 @@ export class MemoryBackend implements DesktopBackend {
       torque: false,
       positions: Array(count).fill(0),
       targets: Array(count).fill(0),
+      world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
     };
@@ -667,6 +968,10 @@ export class MemoryBackend implements DesktopBackend {
     this.calls.push({ name: "loopCommand", value: targets });
     if (!this.status) throw new Error("loop is closed");
     this.status = { ...this.status, targets: [...targets] };
+  }
+
+  async loopPolicyCommand(input: LoopCommandInput) {
+    this.calls.push({ name: "loopPolicyCommand", value: input });
   }
 
   async loopAction(action: LoopAction) {
@@ -732,9 +1037,11 @@ export class MemoryBackend implements DesktopBackend {
       torque: false,
       positions: Array(15).fill(0),
       targets: Array(15).fill(0),
+      world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
     };
+    this.previewCommandEncoding = null;
     return {
       ...this.previewStatus,
       positions: [...this.previewStatus.positions],
@@ -747,12 +1054,30 @@ export class MemoryBackend implements DesktopBackend {
     if (!this.previewStatus) throw new Error("preview loop is closed");
     const policy = this.policies.find((entry) => entry.id === id);
     if (!policy?.cached) throw new Error("请先下载这个官方策略");
+    this.previewCommandEncoding = policy.command?.encoding ?? null;
     this.previewStatus = { ...this.previewStatus, torque: true, lastError: null };
     return {
       ...this.previewStatus,
       positions: [...this.previewStatus.positions],
       targets: [...this.previewStatus.targets],
     };
+  }
+
+  async previewLoopCommand(input: PreviewInput) {
+    this.calls.push({ name: "previewLoopCommand", value: input });
+    if (!this.previewStatus) throw new Error("preview loop is closed");
+    this.previewInput = input;
+    return { ...this.previewStatus };
+  }
+
+  async previewLoopResetWorld() {
+    this.calls.push({ name: "previewLoopResetWorld" });
+    if (!this.previewStatus) throw new Error("preview loop is closed");
+    this.previewStatus = {
+      ...this.previewStatus,
+      world: { position: [0, 0], yaw: 0, distanceM: 0 },
+    };
+    return { ...this.previewStatus };
   }
 
   async previewLoopTick() {
@@ -762,6 +1087,7 @@ export class MemoryBackend implements DesktopBackend {
     const targets = this.previewStatus.torque
       ? Array.from({ length: 15 }, (_, index) => Math.sin(tick / 12 + index * 0.18) * 0.08)
       : this.previewStatus.targets;
+    const movesWorld = !["phase", "posture_flag"].includes(this.previewCommandEncoding ?? "");
     this.previewStatus = {
       ...this.previewStatus,
       phase:
@@ -771,6 +1097,21 @@ export class MemoryBackend implements DesktopBackend {
       tick,
       targets: [...targets],
       positions: [...targets],
+      world:
+        this.previewStatus.torque && movesWorld
+          ? {
+              position: [
+                (this.previewStatus.world.position[0] ?? 0) +
+                  (this.previewInput.twist[0] ?? 0) * 0.02,
+                (this.previewStatus.world.position[1] ?? 0) +
+                  (this.previewInput.twist[1] ?? 0) * 0.02,
+              ],
+              yaw: (this.previewStatus.world.yaw ?? 0) + (this.previewInput.twist[2] ?? 0) * 0.02,
+              distanceM:
+                (this.previewStatus.world.distanceM ?? 0) +
+                Math.hypot(this.previewInput.twist[0] ?? 0, this.previewInput.twist[1] ?? 0) * 0.02,
+            }
+          : this.previewStatus.world,
     };
     return {
       ...this.previewStatus,

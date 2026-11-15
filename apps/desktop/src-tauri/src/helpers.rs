@@ -5,6 +5,7 @@ use servo::ServoModel;
 
 use crate::types::{
     LoopPhase as FrontendLoopPhase, LoopStatus as FrontendLoopStatus, SimulationParameters,
+    WorldState as FrontendWorldState,
 };
 
 pub(crate) fn model(key: &ServoModelKey) -> ServoModel {
@@ -34,6 +35,7 @@ pub(crate) fn default_simulation(key: ServoModelKey) -> SimulationParameters {
         armature: profile.sim_armature,
         kp: profile.sim_kp,
         force_range: profile.sim_force_range,
+        world_position: [0.0; 3],
     }
 }
 
@@ -55,6 +57,11 @@ impl From<loop_body::LoopStatus> for FrontendLoopStatus {
             torque: status.torque,
             positions: status.positions,
             targets: status.targets,
+            world: FrontendWorldState {
+                position: [0.0, 0.0],
+                yaw: 0.0,
+                distance_m: 0.0,
+            },
             sensor_failures: status.sensor_failures,
             last_error: status.last_error,
         }

@@ -157,6 +157,15 @@ pub fn reconnect_candidates<'a>(
     hint: &ReconnectHint,
     ports: &'a [ReconnectHint],
 ) -> Vec<&'a ReconnectHint> {
+    // Machines created before USB metadata was available may only have a port
+    // name.  Prefer that exact name instead of treating every metadata-less
+    // serial port as interchangeable.
+    if hint.vid.is_none() && hint.pid.is_none() {
+        return ports
+            .iter()
+            .filter(|port| port.port_name == hint.port_name)
+            .collect();
+    }
     if let Some(serial) = hint.adapter_serial.as_deref() {
         return ports
             .iter()
@@ -281,6 +290,26 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_without_usb_metadata_uses_the_saved_port_name() {
+        let hint = ReconnectHint {
+            port_name: "COM3".into(),
+            vid: None,
+            pid: None,
+            adapter_serial: None,
+            product: None,
+        };
+        let same = ReconnectHint {
+            port_name: "COM3".into(),
+            ..hint.clone()
+        };
+        let other = ReconnectHint {
+            port_name: "COM4".into(),
+            ..hint.clone()
+        };
+        assert_eq!(reconnect_candidates(&hint, &[same, other]).len(), 1);
+    }
+
+    #[test]
     fn auto_mount_requires_saved_unique_match_and_strategy() {
         let machine = PhysicalMachine {
             id: "physical-1".into(),
@@ -293,6 +322,7 @@ mod tests {
             online_servo_ids: vec![1],
             connected: true,
             last_seen: None,
+            torque_enabled: false,
         };
         let detected = DetectedPhysicalMachine {
             census: machine.census.clone(),

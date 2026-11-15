@@ -1,16 +1,32 @@
-import { computed, defineComponent, onUnmounted, ref } from "vue";
+import { computed, defineComponent, onMounted, onUnmounted, ref, shallowRef } from "vue";
+import { useEventListener } from "@vueuse/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../../../assets/icons/icon.ico";
+import { Message } from "../../components/message";
 import { Titlebar } from "../../components/titlebar";
 import { useDesktopStore } from "../../store";
 import { load } from "../debug";
 import { HomePage } from "../home";
+import { refreshPhysicalMachines, refreshPhysicalPorts } from "../machines";
 import { SettingsPage } from "../settings";
 import style from "./style.module.scss";
 
 const DesktopTitlebar = defineComponent(() => {
   const store = useDesktopStore();
   const servoDragOccurred = ref(false);
+  const servoStatusButton = shallowRef<HTMLElement>();
+  const appIcon = shallowRef<HTMLElement>();
+  const settingsButton = shallowRef<HTMLButtonElement>();
+  const machineTabButtons = new Map<string, ReturnType<typeof shallowRef<HTMLButtonElement>>>();
+  for (const view of ["simulation", "servo", "physical"] as const) {
+    const button = shallowRef<HTMLButtonElement>();
+    machineTabButtons.set(view, button);
+    useEventListener(button, "click", (event: MouseEvent) => {
+      event.stopPropagation();
+      store.state.machineView = view;
+    });
+  }
   let servoPointer: { id: number; x: number; y: number; active: boolean } | null = null;
   const onlineServos = computed(() =>
     store.state.physicalMachines.reduce(
@@ -41,9 +57,7 @@ const DesktopTitlebar = defineComponent(() => {
     if (event.button !== 0) return;
     servoDragOccurred.value = false;
     servoPointer = { id: event.pointerId, x: event.clientX, y: event.clientY, active: true };
-    if (event.currentTarget instanceof HTMLElement) {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
+    servoStatusButton.value?.setPointerCapture(event.pointerId);
   };
 
   const onServoPointerMove = (event: PointerEvent) => {
@@ -62,7 +76,16 @@ const DesktopTitlebar = defineComponent(() => {
   onUnmounted(() => {
     servoPointer = null;
   });
-
+  useEventListener(appIcon, "click", () => (store.state.tab = "home"));
+  useEventListener(servoStatusButton, "click", openServoStatus);
+  useEventListener(servoStatusButton, "pointerdown", onServoPointerDown);
+  useEventListener(servoStatusButton, "pointermove", onServoPointerMove);
+  useEventListener(servoStatusButton, "pointerup", onServoPointerEnd);
+  useEventListener(servoStatusButton, "pointercancel", onServoPointerEnd);
+  useEventListener(settingsButton, "click", (event: MouseEvent) => {
+    event.stopPropagation();
+    store.state.tab = store.state.tab === "settings" ? "home" : "settings";
+  });
   return () => (
     <Titlebar
       min
@@ -72,56 +95,55 @@ const DesktopTitlebar = defineComponent(() => {
         default: () => (
           <>
             <img
+              ref={appIcon}
               class={style.titlebarAppIcon}
-              onClick={() => (store.state.tab = "home")}
               src={appIconUrl}
               alt="microduck-vision"
             />
             {store.state.tab === "settings" ? (
               <div class={style.titlebarMachineTabs} role="tablist" aria-label="设置分类">
                 <button
+                  ref={(element) => {
+                    // oxlint-disable-next-line no-unsafe-type-assertion
+                    machineTabButtons.get("simulation")!.value = element as
+                      | HTMLButtonElement
+                      | undefined;
+                  }}
                   class={store.state.machineView === "simulation" ? style.active : undefined}
                   role="tab"
                   aria-selected={store.state.machineView === "simulation"}
-                  onClick={(event: MouseEvent) => {
-                    event.stopPropagation();
-                    store.state.machineView = "simulation";
-                  }}
                 >
                   模拟机
                 </button>
                 <button
+                  ref={(element) => {
+                    // oxlint-disable-next-line no-unsafe-type-assertion
+                    machineTabButtons.get("servo")!.value = element as
+                      | HTMLButtonElement
+                      | undefined;
+                  }}
                   class={store.state.machineView === "servo" ? style.active : undefined}
                   role="tab"
                   aria-selected={store.state.machineView === "servo"}
-                  onClick={(event: MouseEvent) => {
-                    event.stopPropagation();
-                    store.state.machineView = "servo";
-                  }}
                 >
                   舵机
                 </button>
                 <button
+                  ref={(element) => {
+                    // oxlint-disable-next-line no-unsafe-type-assertion
+                    machineTabButtons.get("physical")!.value = element as
+                      | HTMLButtonElement
+                      | undefined;
+                  }}
                   class={store.state.machineView === "physical" ? style.active : undefined}
                   role="tab"
                   aria-selected={store.state.machineView === "physical"}
-                  onClick={(event: MouseEvent) => {
-                    event.stopPropagation();
-                    store.state.machineView = "physical";
-                  }}
                 >
                   实机
                 </button>
               </div>
             ) : (
-              <button
-                class={style.titlebarServoStatus}
-                onClick={openServoStatus}
-                onPointerdown={onServoPointerDown}
-                onPointermove={onServoPointerMove}
-                onPointerup={onServoPointerEnd}
-                onPointercancel={onServoPointerEnd}
-              >
+              <button ref={servoStatusButton} class={style.titlebarServoStatus}>
                 <i class={[style.titlebarStatusDot, onlineServos.value ? style.ok : style.off]} />
                 舵机 · {onlineServos.value} 在线
                 {onlineMachines.value > 1 && ` · ${onlineMachines.value} 台实机`}
@@ -131,6 +153,7 @@ const DesktopTitlebar = defineComponent(() => {
         ),
         actions: () => (
           <button
+            ref={settingsButton}
             class={
               store.state.tab === "settings"
                 ? [style.titlebarSettingsButton, style.active]
@@ -138,10 +161,6 @@ const DesktopTitlebar = defineComponent(() => {
             }
             aria-label="设置"
             title="设置"
-            onClick={(event: MouseEvent) => {
-              event.stopPropagation();
-              store.state.tab = store.state.tab === "settings" ? "home" : "settings";
-            }}
           >
             <span class={style.titlebarSettingsIcon} aria-hidden="true">
               {"\uE713"}
@@ -155,6 +174,30 @@ const DesktopTitlebar = defineComponent(() => {
 
 export const App = defineComponent(() => {
   const store = useDesktopStore();
+  const reloadButton = shallowRef<HTMLButtonElement>();
+  const appShell = shallowRef<HTMLDivElement>();
+  let stopPhysicalMachineEvents: (() => void) | undefined;
+  let eventListenerDisposed = false;
+
+  onMounted(() => {
+    const hasTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
+    if (!hasTauriRuntime) return;
+    void listen("physical-machines-changed", () => {
+      void Promise.all([refreshPhysicalMachines(), refreshPhysicalPorts()]).catch((error) => {
+        if (!eventListenerDisposed) console.error("failed to refresh physical machines", error);
+      });
+    }).then((unlisten) => {
+      if (eventListenerDisposed) unlisten();
+      else stopPhysicalMachineEvents = unlisten;
+    });
+  });
+
+  onUnmounted(() => {
+    eventListenerDisposed = true;
+    stopPhysicalMachineEvents?.();
+  });
+  useEventListener(reloadButton, "click", () => void load());
+  useEventListener(appShell, "contextmenu", (event: MouseEvent) => event.preventDefault());
 
   const page = () => {
     if (store.state.error) {
@@ -162,7 +205,7 @@ export const App = defineComponent(() => {
         <div class={[style.statusPage, style.statusError]}>
           <h1>读取失败</h1>
           <p>{store.state.error}</p>
-          <button onClick={() => void load()}>重新加载</button>
+          <button ref={reloadButton}>重新加载</button>
         </div>
       );
     }
@@ -178,7 +221,8 @@ export const App = defineComponent(() => {
   };
 
   return () => (
-    <div class={style.appShell} onContextmenu={(event: MouseEvent) => event.preventDefault()}>
+    <div ref={appShell} class={style.appShell}>
+      <Message />
       <DesktopTitlebar />
       <main class={store.state.tab === "settings" ? style.settingsMain : style.homeMain}>
         <HomePage />

@@ -5,13 +5,24 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { SceneFrame, SceneInfo } from "../../bridge/types";
 
 const n = (v: number | null | undefined) => v ?? 0;
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+const finiteVector = (value: unknown): value is [number, number, number] =>
+  Array.isArray(value) &&
+  value.length === 3 &&
+  value.every((entry) => typeof entry === "number" && Number.isFinite(entry));
 
 type DuckMesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
+type ViewState = {
+  camera: THREE.Vector3;
+  target: THREE.Vector3;
+};
 
 export class DuckViewer {
+  private static readonly viewStorageKey = "microduck-vision.viewer.view";
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
-  private camera = new THREE.PerspectiveCamera(35, 1, 0.01, 10);
+  private camera = new THREE.PerspectiveCamera(35, 1, 0.01, 1000);
   private controls: OrbitControls;
   private root = new THREE.Group();
   private bodies: THREE.Group[] = [];
@@ -30,6 +41,12 @@ export class DuckViewer {
   private duckOf = new Map<THREE.Object3D, number>();
   /** Each ghost mesh and the main-duck mesh whose geometry it borrows. */
   private ghostSources = new Map<DuckMesh, DuckMesh>();
+  private worldPose: [number, number, number] = [0, 0, 0];
+  private configuredWorldPositions: [number, number, number][] = [];
+  private readonly baseHeight: number;
+  private viewRestored = false;
+  private defaultFocused = false;
+  private previousFocusedView: ViewState | null = null;
 
   onRender: (() => void) | null = null;
 
@@ -37,6 +54,7 @@ export class DuckViewer {
     private host: HTMLElement,
     private info: SceneInfo,
   ) {
+    this.baseHeight = n(info.model.trunkHeight);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     host.appendChild(this.renderer.domElement);
@@ -45,16 +63,27 @@ export class DuckViewer {
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 0.11, 0);
     this.controls.enableDamping = true;
+    this.controls.enableZoom = true;
+    this.controls.enablePan = true;
+    this.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+    this.renderer.domElement.style.touchAction = "none";
+    this.renderer.domElement.addEventListener("contextmenu", this.preventContextMenu);
+    this.viewRestored = this.restoreView();
+    this.controls.addEventListener("end", this.saveView);
 
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8577, 2.2));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(1, 2, 1.5);
     this.scene.add(sun);
-    this.grid = new THREE.GridHelper(1, 20, 0xc9c4b5, 0xe4e0d4);
+    this.grid = new THREE.GridHelper(1000, 1000, 0xc9c4b5, 0xe4e0d4);
     this.scene.add(this.grid);
 
     this.root.rotation.x = -Math.PI / 2;
-    this.root.position.y = n(info.model.trunkHeight);
+    this.root.position.y = this.baseHeight;
     this.scene.add(this.root);
     this.build();
 
@@ -68,6 +97,7 @@ export class DuckViewer {
     const loader = new STLLoader();
     const sep = this.info.meshDir.includes("\\") ? "\\" : "/";
     const cache = new Map<string, Promise<THREE.BufferGeometry>>();
+    const pending: Promise<unknown>[] = [];
     const geometry = (file: string) => {
       if (!cache.has(file))
         cache.set(file, loader.loadAsync(convertFileSrc(this.info.meshDir + sep + file)));
@@ -91,10 +121,15 @@ export class DuckViewer {
         mesh.quaternion.set(n(g.quat[1]), n(g.quat[2]), n(g.quat[3]), n(g.quat[0]));
         group.add(mesh);
         this.meshesByBody[i].push(mesh);
-        geometry(g.mesh)
-          .then((geo) => (mesh.geometry = geo))
-          .catch((e) => console.warn("加载网格失败", g.mesh, e));
+        pending.push(
+          geometry(g.mesh)
+            .then((geo) => (mesh.geometry = geo))
+            .catch((e) => console.warn("加载网格失败", g.mesh, e)),
+        );
       }
+    });
+    void Promise.allSettled(pending).then(() => {
+      if (!this.viewRestored) this.focusDuck(true);
     });
   }
 
@@ -105,6 +140,86 @@ export class DuckViewer {
       this.restFrame = frame;
       this.ghostBodies.forEach((b) => this.pose(b, frame));
     }
+    if (!this.viewRestored && !this.defaultFocused) this.focusDuck(true);
+  }
+
+  focusCurrentDuck() {
+    if (!this.previousFocusedView) {
+      this.previousFocusedView = {
+        camera: this.camera.position.clone(),
+        target: this.controls.target.clone(),
+      };
+    }
+    this.focusDuck(true, true);
+  }
+
+  restorePreviousView() {
+    if (!this.previousFocusedView) return;
+    this.camera.position.copy(this.previousFocusedView.camera);
+    this.controls.target.copy(this.previousFocusedView.target);
+    this.controls.update();
+    this.previousFocusedView = null;
+    this.saveView();
+  }
+
+  private focusDuck(adjustDistance: boolean, alignLeftHalf = false) {
+    this.root.updateMatrixWorld(true);
+    const bounds = new THREE.Box3().setFromObject(this.root);
+    if (bounds.isEmpty()) return;
+    const center = bounds.getCenter(new THREE.Vector3());
+    const direction = this.camera.position.clone().sub(this.controls.target);
+    if (direction.lengthSq() < 1e-8) direction.set(1, 0.55, 1);
+    direction.normalize();
+    if (adjustDistance) {
+      const size = bounds.getSize(new THREE.Vector3());
+      const halfFov = THREE.MathUtils.degToRad(this.camera.fov / 2);
+      const verticalDistance = size.y / (2 * Math.tan(halfFov));
+      const horizontalDistance =
+        size.x / (2 * Math.tan(Math.atan(Math.tan(halfFov) * this.camera.aspect)));
+      const distance = Math.max(verticalDistance, horizontalDistance, size.z / 2) * 1.7;
+      this.camera.position.copy(center).add(direction.multiplyScalar(Math.max(distance, 0.2)));
+    }
+    this.controls.target.copy(center);
+    if (alignLeftHalf) {
+      this.camera.lookAt(center);
+      this.camera.updateMatrixWorld();
+      const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 0).normalize();
+      const distance = this.camera.position.distanceTo(center);
+      const halfHeight = distance * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2));
+      const halfWidth = halfHeight * this.camera.aspect;
+      const shift = right.multiplyScalar(halfWidth * 0.5);
+      this.camera.position.add(shift);
+      this.controls.target.add(shift);
+    }
+    this.controls.update();
+    this.defaultFocused = true;
+    this.saveView();
+  }
+
+  setWorldPose(position: [number | null, number | null], yaw: number | null) {
+    const x = n(position[0]);
+    const z = n(position[1]);
+    const angle = n(yaw);
+    this.worldPose = [x, z, angle];
+    this.applyMainWorldPosition();
+    this.root.rotation.y = angle;
+  }
+
+  private applyMainWorldPosition() {
+    const [x, y, z] = this.configuredWorldPositions[0] ?? [0, 0, 0];
+    this.root.position.set(x + this.worldPose[0], this.baseHeight + y, z + this.worldPose[1]);
+  }
+
+  setMachineWorldPositions(positions: [number, number, number][]) {
+    this.configuredWorldPositions = positions.map(
+      (position) => [...position] as [number, number, number],
+    );
+    this.applyMainWorldPosition();
+    this.ghosts.forEach((root, index) => {
+      const [x, y, z] = this.configuredWorldPositions[index + 1] ?? [0, 0, 0];
+      root.position.set(x, this.baseHeight + y, z);
+      root.rotation.y = 0;
+    });
   }
 
   /** The first frame is the default posture the ghosts keep. */
@@ -120,20 +235,27 @@ export class DuckViewer {
   }
 
   /** `count` more ducks to the right of the main one, `spacing` metres apart; the row stays centred. */
-  setGhosts(count: number, spacing = 0.25) {
-    if (count === this.ghosts.length) return;
+  setGhosts(count: number, _spacing = 0.25, positions: [number, number, number][] = []) {
+    if (count === this.ghosts.length) {
+      this.setMachineWorldPositions(positions);
+      return;
+    }
     this.ghosts.forEach((g) => this.scene.remove(g));
     this.ghosts = [];
     this.ghostBodies = [];
     this.duckOf.clear();
     this.ghostSources.clear();
-    this.root.position.x = (-spacing * count) / 2;
+    this.configuredWorldPositions = positions.map(
+      (position) => [...position] as [number, number, number],
+    );
+    this.applyMainWorldPosition();
     this.root.updateMatrixWorld();
     for (let k = 1; k <= count; k++) {
       const root = new THREE.Group();
       root.rotation.copy(this.root.rotation);
-      root.position.copy(this.root.position);
-      root.position.x += spacing * k;
+      const [x, y, z] = this.configuredWorldPositions[k] ?? [0, 0, 0];
+      root.position.set(x, this.baseHeight + y, z);
+      root.rotation.y = 0;
       const bodies = this.bodies.map((_, i) => {
         const g = new THREE.Group();
         for (const m of this.meshesByBody[i]) {
@@ -222,9 +344,21 @@ export class DuckViewer {
   markerScreen(i: number): { x: number; y: number } | null {
     const m = this.frame?.markers[i];
     if (!m) return null;
-    const v = new THREE.Vector3(n(m[0]), n(m[1]), n(m[2]))
-      .applyMatrix4(this.root.matrixWorld)
-      .project(this.camera);
+    return this.projectScreenPoint(
+      new THREE.Vector3(n(m[0]), n(m[1]), n(m[2])).applyMatrix4(this.root.matrixWorld),
+    );
+  }
+
+  /** Project a fixed point in a body frame for UI-only anchors such as mouth. */
+  markerScreenAt(body: number, point: [number, number, number]) {
+    const group = this.bodies[body];
+    if (!group) return null;
+    this.root.updateMatrixWorld(true);
+    return this.projectScreenPoint(group.localToWorld(new THREE.Vector3(...point)));
+  }
+
+  private projectScreenPoint(point: THREE.Vector3): { x: number; y: number } | null {
+    const v = point.project(this.camera);
     if (v.z > 1) return null;
     const el = this.renderer.domElement;
     return { x: ((v.x + 1) / 2) * el.clientWidth, y: ((1 - v.y) / 2) * el.clientHeight };
@@ -264,6 +398,46 @@ export class DuckViewer {
     this.camera.updateProjectionMatrix();
   }
 
+  private restoreView = () => {
+    let restored = false;
+    try {
+      const raw = window.localStorage.getItem(DuckViewer.viewStorageKey);
+      if (!raw) return false;
+      const saved: unknown = JSON.parse(raw);
+      if (!isRecord(saved)) return false;
+      if (finiteVector(saved.camera)) {
+        this.camera.position.fromArray(saved.camera);
+        restored = true;
+      }
+      if (finiteVector(saved.target)) {
+        this.controls.target.fromArray(saved.target);
+        restored = true;
+      }
+      this.controls.update();
+    } catch {
+      // A stale or unavailable browser cache should not prevent the viewport from loading.
+    }
+    return restored;
+  };
+
+  private saveView = () => {
+    try {
+      window.localStorage.setItem(
+        DuckViewer.viewStorageKey,
+        JSON.stringify({
+          camera: this.camera.position.toArray(),
+          target: this.controls.target.toArray(),
+        }),
+      );
+    } catch {
+      // Browser storage is optional in embedded webviews.
+    }
+  };
+
+  private preventContextMenu = (event: MouseEvent) => {
+    event.preventDefault();
+  };
+
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
     // Meshes load asynchronously; ghosts pick up the main duck's geometry once it arrives.
@@ -275,9 +449,12 @@ export class DuckViewer {
   };
 
   dispose() {
+    this.saveView();
     cancelAnimationFrame(this.raf);
     this.resize.disconnect();
+    this.controls.removeEventListener("end", this.saveView);
     this.controls.dispose();
+    this.renderer.domElement.removeEventListener("contextmenu", this.preventContextMenu);
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }
