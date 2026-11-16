@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "microduck-vision",
   "build": {
-    "beforeDevCommand": "pnpm run generate-types && pnpm exec vite",
-    "beforeBuildCommand": "pnpm run generate-types && pnpm exec vite build",
+    "beforeDevCommand": "cargo run --manifest-path generate/Cargo.toml && pnpm exec vite",
+    "beforeBuildCommand": "cargo run --manifest-path generate/Cargo.toml && pnpm exec vite build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },

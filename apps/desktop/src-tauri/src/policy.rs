@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+use crate::types::{PolicyCommand, PolicyEntry};
 
 const CACHE_DIR: &str = "library/policies/official";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -40,23 +42,6 @@ struct ManifestPolicy {
     command: Option<PolicyCommand>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PolicyCommand {
-    pub slot: Option<String>,
-    pub encoding: Option<String>,
-    pub idle: Option<[f64; 3]>,
-    pub twist: Option<String>,
-    pub head: Option<String>,
-    pub body: Option<String>,
-    #[serde(alias = "period_s")]
-    pub period_s: Option<f64>,
-    #[serde(alias = "end_phase")]
-    pub end_phase: Option<f64>,
-    pub sit: Option<f64>,
-    pub stand: Option<f64>,
-}
-
 #[derive(Debug, Clone)]
 struct OfficialSource {
     id: String,
@@ -67,27 +52,6 @@ struct OfficialSource {
     slot: Option<String>,
     duration_s: Option<f64>,
     command: Option<PolicyCommand>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PolicyEntry {
-    pub id: String,
-    pub name: String,
-    pub file: String,
-    pub source_url: String,
-    pub cached: bool,
-    pub selected: bool,
-    #[specta(type = specta_typescript::Number)]
-    pub size: u64,
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub slot: Option<String>,
-    #[serde(default)]
-    pub duration_s: Option<f64>,
-    #[serde(default)]
-    pub command: Option<PolicyCommand>,
 }
 
 pub(crate) fn cache_root(config_dir: Option<&Path>) -> PathBuf {

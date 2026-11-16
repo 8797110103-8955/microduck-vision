@@ -20,4 +20,3 @@ servo = { path = "../servo" }
 [[test]]
 name = "duck_body"
 path = "tests/duck_body.rs"
-

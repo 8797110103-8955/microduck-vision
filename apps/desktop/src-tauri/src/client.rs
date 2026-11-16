@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command as ProcessCommand;
 use std::sync::OnceLock;
 
-use duck_body::{BodyTemplate, ServoCatalogEntry, ServoModelKey};
+use duck_body::{BodyTemplate, ServoModelKey};
 use duck_control::obs::Command;
 use loop_body::{
     BodyRuntimeView, Calibration, JointCalibration, LoopAction as BodyLoopAction, LoopBinding,
@@ -26,24 +26,21 @@ use crate::logging::{
     LoggedServoDriver, append_control_event, append_policy_trace, begin_control_loop,
 };
 use crate::physical;
-use crate::policy::{self, PolicyEntry};
+use crate::policy;
 use crate::simulation::PreviewPolicyLoop;
 use crate::state::DesktopState;
 use crate::types::{
-    ActionKind, ActionRecord, ActionSource, DetectedPhysicalMachine, DiagnosticCode, JointRange,
-    LoopAction as FrontendLoopAction, LoopCommandInput, LoopStatus as FrontendLoopStatus,
-    MatchResult, PhysicalMachine, PhysicalServoRegister, PreviewInput, ReconnectHint,
+    ActionInput, ActionKind, ActionRecord, ActionSource, DetectedPhysicalMachine, DiagnosticCode,
+    JointRange, LoopAction as FrontendLoopAction, LoopCommandInput, LoopOpenInput,
+    LoopStatus as FrontendLoopStatus, MatchResult, PhysicalMachine, PhysicalMachineBindingInput,
+    PhysicalMachineDetectInput, PhysicalMachineInput, PhysicalMachineProbeInput,
+    PhysicalMachineReconnectInput, PhysicalMachineRegisterWriteInput, PhysicalMachineSaveInput,
+    PhysicalServoRegister, PolicyEntry, PreviewInput, ReconnectHint,
     SceneBody as FrontendSceneBody, SceneFrame as FrontendSceneFrame,
     SceneGeom as FrontendSceneGeom, SceneInfo as FrontendSceneInfo,
     SceneJoint as FrontendSceneJoint, SceneModel as FrontendSceneModel,
-    SceneSite as FrontendSceneSite, SerialPortCandidate, ServoIdentity, ServoJointBinding,
-    VirtualMachine,
-};
-use crate::{
-    ActionInput, LoopOpenInput, PhysicalMachineBindingInput, PhysicalMachineDetectInput,
-    PhysicalMachineInput, PhysicalMachineProbeInput, PhysicalMachineReconnectInput,
-    PhysicalMachineRegisterWriteInput, PhysicalMachineSaveInput, VirtualMachineBindingInput,
-    VirtualMachineInput,
+    SceneSite as FrontendSceneSite, SerialPortCandidate, ServoCatalogEntry, ServoIdentity,
+    ServoJointBinding, VirtualMachine, VirtualMachineBindingInput, VirtualMachineInput,
 };
 
 fn register_table(model: servo::ServoModel) -> Vec<RegisterDescriptor> {
@@ -213,6 +210,24 @@ fn binding_conflict_error(bindings: &[ServoJointBinding]) -> Option<String> {
     conflicts.sort_unstable();
     (!conflicts.is_empty()).then(|| format!("绑定冲突：{}", conflicts.join("；")))
 }
+
+fn official_servo_bindings(census: &[ServoIdentity]) -> Vec<ServoJointBinding> {
+    duck_control::model::JOINT_NAMES
+        .iter()
+        .copied()
+        .zip(duck_control::model::JOINT_IDS)
+        .filter(|(_, id)| census.iter().any(|servo| servo.servo_id == *id))
+        .map(|(slot_id, physical_id)| ServoJointBinding {
+            slot_id: slot_id.to_owned(),
+            physical_id,
+            direction: 1,
+            zero_offset_rad: 0.0,
+            min_rad: None,
+            max_rad: None,
+        })
+        .collect()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub(crate) fn servo_catalog() -> Vec<ServoCatalogEntry> {
@@ -1546,7 +1561,7 @@ pub(crate) fn physical_machine_set_pose_zero(
             .cloned()
             .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
         let bindings = if virtual_machine.joint_bindings.is_empty() {
-            ServoJointBinding::official(&machine.census)
+            official_servo_bindings(&machine.census)
         } else {
             virtual_machine.joint_bindings
         };
@@ -1638,7 +1653,7 @@ pub(crate) fn physical_machine_pose(
         let bindings = if !virtual_bindings.is_empty() {
             virtual_bindings
         } else {
-            ServoJointBinding::official(&machine.census)
+            official_servo_bindings(&machine.census)
         };
         (model, bindings)
     };
@@ -2099,7 +2114,7 @@ pub(crate) fn loop_open(
         let bindings = if !machine.joint_bindings.is_empty() {
             machine.joint_bindings.clone()
         } else {
-            ServoJointBinding::official(&physical.census)
+            official_servo_bindings(&physical.census)
         };
         let mut ids = Vec::with_capacity(template.actuators.len());
         for slot in &template.actuators {
@@ -2139,7 +2154,7 @@ pub(crate) fn loop_open(
     let saved_bindings = if !machine.joint_bindings.is_empty() {
         machine.joint_bindings.clone()
     } else if let Some(physical_machine) = physical.as_ref() {
-        ServoJointBinding::official(&physical_machine.census)
+        official_servo_bindings(&physical_machine.census)
     } else {
         Vec::new()
     };
@@ -2617,6 +2632,44 @@ mod register_table_tests {
         assert_eq!(
             binding_conflict_error(&bindings).as_deref(),
             Some("绑定冲突：42 → left_hip_yaw,right_hip_yaw")
+        );
+    }
+}
+
+#[cfg(test)]
+mod joint_binding_tests {
+    use super::{ServoIdentity, official_servo_bindings};
+
+    #[test]
+    fn official_census_is_ordered_by_body_slots() {
+        let census = [
+            ServoIdentity {
+                servo_id: 14,
+                model: "hd1910".into(),
+            },
+            ServoIdentity {
+                servo_id: 20,
+                model: "hd1910".into(),
+            },
+            ServoIdentity {
+                servo_id: 10,
+                model: "hd1910".into(),
+            },
+        ];
+        let bindings = official_servo_bindings(&census);
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.slot_id.as_str())
+                .collect::<Vec<_>>(),
+            ["left_hip_yaw", "right_hip_yaw", "right_ankle",]
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .map(|binding| binding.physical_id)
+                .collect::<Vec<_>>(),
+            [20, 10, 14]
         );
     }
 }

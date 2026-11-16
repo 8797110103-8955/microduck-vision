@@ -1,5 +1,6 @@
 {
   "options": { "typeAware": true, "typeCheck": true },
   "env": { "browser": true, "builtin": true },
-  "categories": { "correctness": "error", "suspicious": "warn" }
+  "categories": { "correctness": "error", "suspicious": "warn" },
+  "ignorePatterns": ["dist/**", "generated/**", "src-tauri/**", "vendor/**"]
 }

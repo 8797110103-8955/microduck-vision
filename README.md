@@ -1,20 +1,20 @@
-# 小鸭子
+# Microduck-vision
 
-> *A tiny biped robot that moves using reinforcement learning policies.*
+> _A tiny biped robot that moves using reinforcement learning policies._
 > —— [Microduck](https://github.com/pollen-robotics/microduck)
 
 ## 快速开始
 
-需要 Rust 1.90 以上、Node.js 和 pnpm。
+安装 rust node
 
 ```bash
-cd apps/desktop
 pnpm install
 pnpm dev
 ```
 
 - 检查：`pnpm lint`、`pnpm test`；打包：`pnpm release`。
-- 运行官方策略：在策略页面按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 中的官方 ONNX 到 `%APPDATA%\microduck-vision\library\policies\official\`；仿真还需要按 `vendor/microduck_rl` 的说明启动 `duck-body`。
+- 运行官方策略：在策略页面按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 官方 ONNX。
+- 运行官方策略：VLA预览中开启控制环
 
 ## 和官方的关系
 
@@ -23,9 +23,14 @@ pnpm dev
 ### 复用了哪些部分
 
 - `microduck_rl` 的 MJCF 和网格：直接读取，3D 视图和仿真都用它。
-- 
+- `duck-control` 的核心控制逻辑
 
+### 自定义哪些部分
+
+- 
 
 ---
 
-约定见 [.rules](.rules)。每个 crate 是什么，看它 `Cargo.toml` 的 `description`；它和其他 crate 的边界写在下面的注释里。
+核心开发约定见 [.rules](.rules)  
+
+每个 crate 的作用自行查看`Cargo.toml`~`description`

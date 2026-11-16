@@ -1,8 +1,6 @@
-use serde::Deserialize;
-use specta_typescript::Typescript;
 use tauri::Manager;
-use tauri_specta::{Builder, collect_commands};
 mod client;
+mod commands;
 mod control;
 mod device_watcher;
 mod helpers;
@@ -16,181 +14,15 @@ mod state;
 pub mod types;
 
 use state::DesktopState;
-use types::{ReconnectHint, ServoIdentity, SimulationParameters};
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct ActionInput {
-    pub name: String,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct VirtualMachineInput {
-    pub name: String,
-    pub body_id: String,
-    pub servo_model: String,
-    pub simulation: SimulationParameters,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineInput {
-    pub name: String,
-    pub usb_port: String,
-    pub machine_code: String,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineDetectInput {
-    pub census: Vec<ServoIdentity>,
-    pub reconnect_hint: Option<ReconnectHint>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineSaveInput {
-    pub census: Vec<ServoIdentity>,
-    pub reconnect_hint: Option<ReconnectHint>,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineProbeInput {
-    pub port_name: String,
-    pub baud: u32,
-    pub reconnect_hint: Option<ReconnectHint>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineReconnectInput {
-    pub id: String,
-    pub census: Vec<ServoIdentity>,
-    pub reconnect_hint: Option<ReconnectHint>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct LoopOpenInput {
-    pub virtual_machine_id: String,
-    pub servo_ids: Vec<u8>,
-    #[serde(default)]
-    pub physical_machine_id: Option<String>,
-    #[serde(default)]
-    pub policy_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineBindingInput {
-    pub physical_machine_id: String,
-    #[serde(default)]
-    pub virtual_machine_id: Option<String>,
-    pub slot_id: String,
-    pub physical_id: Option<u8>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct VirtualMachineBindingInput {
-    pub virtual_machine_id: String,
-    pub slot_id: String,
-    pub physical_id: Option<u8>,
-}
-
-#[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct PhysicalMachineRegisterWriteInput {
-    pub physical_machine_id: String,
-    pub servo_id: u8,
-    pub name: String,
-    pub value: i32,
-}
-
-pub fn command_builder() -> Builder<tauri::Wry> {
-    Builder::<tauri::Wry>::new()
-        .disable_serde_phases()
-        .commands(collect_commands![
-            client::servo_catalog,
-            client::official_joint_slots,
-            client::official_joint_ranges,
-            client::official_scene_model,
-            client::official_scene_frame,
-            client::virtual_machines,
-            client::physical_machines,
-            client::auto_mount_enabled,
-            client::set_auto_mount_enabled,
-            client::auto_reconnect_enabled,
-            client::set_auto_reconnect_enabled,
-            client::physical_ports,
-            client::physical_baud_choices,
-            client::physical_machine_probe,
-            client::physical_machine_detect,
-            client::physical_machine_save,
-            client::physical_machine_disconnect,
-            client::physical_machine_reconnect,
-            client::physical_machine_auto_reconnect,
-            client::physical_machine_create,
-            client::physical_machine_connect,
-            client::physical_machine_scan,
-            client::physical_machine_registers,
-            client::physical_machine_read_register,
-            client::physical_machine_write_register,
-            client::physical_machine_mount,
-            client::physical_machine_delete,
-            client::physical_machine_rename,
-            client::physical_machine_bind,
-            client::virtual_machine_bind,
-            client::virtual_machine_validate_bindings,
-            client::physical_machine_validate_bindings,
-            client::physical_machine_set_pose_zero,
-            client::physical_machine_pose,
-            client::physical_machine_set_torque,
-            client::physical_machine_write_position,
-            client::virtual_machine_create,
-            client::virtual_machine_set_startup,
-            client::virtual_machine_set_world_position,
-            client::virtual_machine_delete,
-            client::virtual_machine_rename,
-            client::actions,
-            client::action_create,
-            client::action_delete,
-            client::policy_list,
-            client::policy_download,
-            client::policy_select,
-            client::policy_open_folder,
-            client::open_logs,
-            client::loop_open,
-            client::loop_command,
-            client::loop_policy_command,
-            client::loop_action,
-            client::loop_tick,
-            client::loop_status,
-            client::loop_close,
-            client::preview_loop_open,
-            client::preview_loop_policy,
-            client::preview_loop_command,
-            client::preview_loop_reset_world,
-            client::preview_loop_tick,
-            client::preview_loop_close,
-        ])
-}
-
-pub fn export_command_bindings() {
-    let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("generated/types.ts");
-    command_builder()
-        .export(Typescript::default(), output)
-        .expect("failed to export Tauri command bindings");
-}
+pub use types::{
+    ActionInput, LoopOpenInput, PhysicalMachineBindingInput, PhysicalMachineDetectInput,
+    PhysicalMachineInput, PhysicalMachineProbeInput, PhysicalMachineReconnectInput,
+    PhysicalMachineRegisterWriteInput, PhysicalMachineSaveInput, ReconnectHint, ServoIdentity,
+    SimulationParameters, VirtualMachineBindingInput, VirtualMachineInput,
+};
 
 pub fn run() {
-    let builder = command_builder();
+    let builder = commands::command_builder::<tauri::Wry>();
     tauri::Builder::default()
         .setup(|app| {
             let config_dir = app

@@ -1,5 +1,98 @@
-pub use duck_body::ServoModelKey;
+pub use duck_body::{ServoCatalogEntry, ServoModelKey};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionInput {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualMachineInput {
+    pub name: String,
+    pub body_id: String,
+    pub servo_model: String,
+    pub simulation: SimulationParameters,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineInput {
+    pub name: String,
+    pub usb_port: String,
+    pub machine_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineDetectInput {
+    pub census: Vec<ServoIdentity>,
+    pub reconnect_hint: Option<ReconnectHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineSaveInput {
+    pub census: Vec<ServoIdentity>,
+    pub reconnect_hint: Option<ReconnectHint>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineProbeInput {
+    pub port_name: String,
+    pub baud: u32,
+    pub reconnect_hint: Option<ReconnectHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineReconnectInput {
+    pub id: String,
+    pub census: Vec<ServoIdentity>,
+    pub reconnect_hint: Option<ReconnectHint>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopOpenInput {
+    pub virtual_machine_id: String,
+    pub servo_ids: Vec<u8>,
+    #[serde(default)]
+    pub physical_machine_id: Option<String>,
+    #[serde(default)]
+    pub policy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineBindingInput {
+    pub physical_machine_id: String,
+    #[serde(default)]
+    pub virtual_machine_id: Option<String>,
+    pub slot_id: String,
+    pub physical_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualMachineBindingInput {
+    pub virtual_machine_id: String,
+    pub slot_id: String,
+    pub physical_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PhysicalMachineRegisterWriteInput {
+    pub physical_machine_id: String,
+    pub servo_id: u8,
+    pub name: String,
+    pub value: i32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
@@ -166,63 +259,6 @@ pub struct ServoJointBinding {
     pub max_rad: Option<f64>,
 }
 
-impl ServoJointBinding {
-    pub fn official(census: &[ServoIdentity]) -> Vec<Self> {
-        duck_control::model::JOINT_NAMES
-            .iter()
-            .copied()
-            .zip(duck_control::model::JOINT_IDS)
-            .filter(|(_, id)| census.iter().any(|servo| servo.servo_id == *id))
-            .map(|(slot_id, physical_id)| Self {
-                slot_id: slot_id.to_owned(),
-                physical_id,
-                direction: 1,
-                zero_offset_rad: 0.0,
-                min_rad: None,
-                max_rad: None,
-            })
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod joint_binding_tests {
-    use super::{ServoIdentity, ServoJointBinding};
-
-    #[test]
-    fn official_census_is_ordered_by_body_slots() {
-        let census = [
-            ServoIdentity {
-                servo_id: 14,
-                model: "hd1910".into(),
-            },
-            ServoIdentity {
-                servo_id: 20,
-                model: "hd1910".into(),
-            },
-            ServoIdentity {
-                servo_id: 10,
-                model: "hd1910".into(),
-            },
-        ];
-        let bindings = ServoJointBinding::official(&census);
-        assert_eq!(
-            bindings
-                .iter()
-                .map(|binding| binding.slot_id.as_str())
-                .collect::<Vec<_>>(),
-            ["left_hip_yaw", "right_hip_yaw", "right_ankle",]
-        );
-        assert_eq!(
-            bindings
-                .iter()
-                .map(|binding| binding.physical_id)
-                .collect::<Vec<_>>(),
-            [20, 10, 14]
-        );
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ServoIdentity {
@@ -350,4 +386,42 @@ pub enum LoopAction {
         #[specta(type = specta_typescript::Number)]
         session: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyCommand {
+    pub slot: Option<String>,
+    pub encoding: Option<String>,
+    pub idle: Option<[f64; 3]>,
+    pub twist: Option<String>,
+    pub head: Option<String>,
+    pub body: Option<String>,
+    #[serde(alias = "period_s")]
+    pub period_s: Option<f64>,
+    #[serde(alias = "end_phase")]
+    pub end_phase: Option<f64>,
+    pub sit: Option<f64>,
+    pub stand: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyEntry {
+    pub id: String,
+    pub name: String,
+    pub file: String,
+    pub source_url: String,
+    pub cached: bool,
+    pub selected: bool,
+    #[specta(type = specta_typescript::Number)]
+    pub size: u64,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<f64>,
+    #[serde(default)]
+    pub command: Option<PolicyCommand>,
 }

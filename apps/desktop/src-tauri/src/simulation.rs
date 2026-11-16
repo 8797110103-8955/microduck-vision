@@ -19,7 +19,7 @@ use crate::logging::{
     LoggedServoDriver, append_control_event, append_policy_trace, begin_control_loop,
 };
 use crate::types::{LoopPhase, LoopStatus, WorldState};
-use crate::{policy::PolicyCommand, types::PreviewInput};
+use crate::types::{PolicyCommand, PreviewInput};
 
 const PERIOD: Duration = Duration::from_millis(20);
 

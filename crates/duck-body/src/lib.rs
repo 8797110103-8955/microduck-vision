@@ -10,6 +10,7 @@ mod model;
 pub mod scene;
 mod servo_binding;
 mod servo_catalog;
+pub mod types;
 
 pub use dynamics::{
     BodyFeedback, BodyState, BodyTargets, DeterministicDynamics, DynamicsBackend, DynamicsInput,
@@ -24,9 +25,8 @@ pub use scene::{
     OfficialScene, SceneBody, SceneError, SceneFrame, SceneGeom, SceneJoint, SceneModel, SceneSite,
 };
 pub use servo_binding::{ServoParameterSet, ServoParameters};
-pub use servo_catalog::{
-    ServoCatalogEntry, ServoModelKey, ServoProfile, servo_catalog, servo_profiles,
-};
+pub use servo_catalog::{ServoProfile, servo_catalog, servo_profiles};
+pub use types::{ServoCatalogEntry, ServoModelKey};
 
 pub const OFFICIAL_BODY_ID: &str = "official";
 pub const OFFICIAL_BODY_NAME: &str = "Microduck official";
