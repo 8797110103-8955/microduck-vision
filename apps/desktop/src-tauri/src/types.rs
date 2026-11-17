@@ -10,6 +10,74 @@ pub struct ActionInput {
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
+pub struct TrainingStartInput {
+    /// Executable to run without going through a shell (for example `uv`).
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_dir: String,
+    pub virtual_machine_id: String,
+    pub policy_id: Option<String>,
+    pub experiment_id: Option<String>,
+    pub recipe: String,
+    pub teacher_motion_provenance: String,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPolicyLayout {
+    #[specta(type = specta_typescript::Number)]
+    pub obs_len: usize,
+    #[specta(type = specta_typescript::Number)]
+    pub action_len: usize,
+    pub control_hz: u32,
+    pub command_encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingRunMetadata {
+    pub experiment_id: String,
+    pub body_template_id: String,
+    pub body_version: u32,
+    pub body_source_hash: String,
+    pub policy_id: Option<String>,
+    pub policy_layout: TrainingPolicyLayout,
+    pub servo_profile: ServoModelKey,
+    pub recipe: String,
+    pub teacher_motion_provenance: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum TrainingPhase {
+    Starting,
+    Running,
+    Finished,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingProgress {
+    pub run_id: String,
+    pub result_dir: String,
+    pub metadata: TrainingRunMetadata,
+    pub phase: TrainingPhase,
+    #[specta(type = Option<specta_typescript::Number>)]
+    pub step: Option<u64>,
+    #[specta(type = Option<specta_typescript::Number>)]
+    pub total_steps: Option<u64>,
+    pub percent: Option<f64>,
+    pub reward: Option<f64>,
+    pub loss: Option<f64>,
+    pub message: String,
+    pub line: String,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct VirtualMachineInput {
     pub name: String,
     pub body_id: String,
@@ -75,6 +143,8 @@ pub struct PhysicalMachineBindingInput {
     pub virtual_machine_id: Option<String>,
     pub slot_id: String,
     pub physical_id: Option<u8>,
+    #[serde(default)]
+    pub direction: Option<i8>,
 }
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
@@ -222,6 +292,10 @@ pub struct PhysicalMachine {
     pub last_seen: Option<String>,
     #[serde(default)]
     pub torque_enabled: bool,
+    /// Per-real-machine joint direction overrides.  These belong to the robot
+    /// installation and are persisted with the physical-machine cache.
+    #[serde(default)]
+    pub joint_directions: Vec<ServoJointDirection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -257,6 +331,14 @@ pub struct ServoJointBinding {
     pub min_rad: Option<f64>,
     #[serde(default)]
     pub max_rad: Option<f64>,
+}
+
+/// Direction override for a physical robot installation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ServoJointDirection {
+    pub slot_id: String,
+    pub direction: i8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -330,6 +412,17 @@ pub struct ActionRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
+pub struct JointRangeState {
+    pub slot_id: String,
+    pub target_rad: f64,
+    pub min_rad: f64,
+    pub max_rad: f64,
+    pub below_min: bool,
+    pub above_max: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct LoopStatus {
     pub phase: LoopPhase,
     #[specta(type = specta_typescript::Number)]
@@ -344,6 +437,7 @@ pub struct LoopStatus {
     pub world: WorldState,
     pub sensor_failures: u32,
     pub last_error: Option<String>,
+    pub joint_range_states: Vec<JointRangeState>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]

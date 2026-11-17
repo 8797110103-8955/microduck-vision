@@ -1,0 +1,46 @@
+@use "../../styles/tokens" as *;
+
+.select {
+  position: relative;
+  display: inline-grid;
+  min-width: 0;
+  align-items: center;
+
+  select {
+    width: 100%;
+    min-width: 0;
+    min-height: 34px;
+    padding: 6px 30px 6px 10px;
+    border: 1px solid $border;
+    border-radius: 8px;
+    outline: none;
+    color: $text;
+    background: $surface;
+    appearance: none;
+    cursor: pointer;
+    transition:
+      border-color 0.15s ease,
+      background 0.15s ease;
+
+    &:hover:not(:disabled),
+    &:focus {
+      border-color: rgba($accent, 0.7);
+      background: #fffdf8;
+    }
+
+    &:disabled {
+      cursor: not-allowed;
+    }
+  }
+
+  .chevron {
+    position: absolute;
+    right: 12px;
+    width: 7px;
+    height: 7px;
+    border-right: 1px solid $muted;
+    border-bottom: 1px solid $muted;
+    pointer-events: none;
+    transform: translateY(-2px) rotate(45deg);
+  }
+}

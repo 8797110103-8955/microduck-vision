@@ -28,6 +28,14 @@ pub enum BodyError {
     ControlOrderMismatch,
     #[error("control contract action size {actual} does not match actuator count {expected}")]
     ActionSizeMismatch { actual: usize, expected: usize },
+    #[error(
+        "body control contract home pose does not match joint count or contains non-finite values"
+    )]
+    InvalidHomePose,
+    #[error(
+        "reference pose {name:?} does not match the body joint count or contains non-finite values"
+    )]
+    InvalidReferencePose { name: String },
     #[error("body asset does not exist: {0}")]
     MissingAsset(PathBuf),
     #[error("MJCF parse failed: {0}")]
@@ -54,4 +62,16 @@ pub enum BodyError {
     Dynamics(String),
     #[error("body template TOML parse failed: {0}")]
     Toml(String),
+    #[error("body contract snapshot does not match the loaded body profile")]
+    ContractMismatch,
+    #[error("body contract snapshot serialization failed: {0}")]
+    ContractSerialization(String),
+    #[error("body binding slots do not match body actuator slots")]
+    BindingSlotsMismatch,
+    #[error("calibration for slot {slot:?} has invalid direction {direction}")]
+    InvalidDirection { slot: String, direction: i8 },
+    #[error("calibration for slot {slot:?} has a non-finite zero offset")]
+    NonFiniteOffset { slot: String },
+    #[error("calibration for slot {slot:?} has an invalid installation range")]
+    InvalidInstallationRange { slot: String },
 }

@@ -4,8 +4,8 @@ use duck_body::ServoModelKey;
 use servo::ServoModel;
 
 use crate::types::{
-    LoopPhase as FrontendLoopPhase, LoopStatus as FrontendLoopStatus, SimulationParameters,
-    WorldState as FrontendWorldState,
+    JointRangeState as FrontendJointRangeState, LoopPhase as FrontendLoopPhase,
+    LoopStatus as FrontendLoopStatus, SimulationParameters, WorldState as FrontendWorldState,
 };
 
 pub(crate) fn model(key: &ServoModelKey) -> ServoModel {
@@ -64,6 +64,18 @@ impl From<loop_body::LoopStatus> for FrontendLoopStatus {
             },
             sensor_failures: status.sensor_failures,
             last_error: status.last_error,
+            joint_range_states: status
+                .joint_range_states
+                .into_iter()
+                .map(|state| FrontendJointRangeState {
+                    slot_id: state.slot_id,
+                    target_rad: state.target_rad,
+                    min_rad: state.min_rad,
+                    max_rad: state.max_rad,
+                    below_min: state.below_min,
+                    above_max: state.above_max,
+                })
+                .collect(),
         }
     }
 }

@@ -85,6 +85,7 @@ const cloneMachine = (machine: PhysicalMachine): PhysicalMachine => ({
   ...machine,
   census: machine.census?.map((servo) => ({ ...servo })),
   reconnectHint: machine.reconnectHint ? { ...machine.reconnectHint } : machine.reconnectHint,
+  jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
   onlineServoIds: [...machine.onlineServoIds],
 });
 
@@ -100,6 +101,7 @@ const cloneStatus = (status: LoopStatus | null) =>
         ...status,
         positions: [...status.positions],
         targets: [...status.targets],
+        jointRangeStates: status.jointRangeStates.map((state) => ({ ...state })),
       }
     : null;
 
@@ -329,17 +331,24 @@ export class TestBackend {
           (entry) => entry.id === (input.virtualMachineId ?? machine.virtualMachineId),
         );
         if (!virtual) throw new Error("physical machine is not associated with a virtual machine");
+        const slotId = stringValue(input.slotId, "slotId");
         const bindings = (virtual.jointBindings ?? []).filter(
-          (binding) => binding.slotId !== input.slotId,
+          (binding) => binding.slotId !== slotId,
         );
         if (input.physicalId != null)
           bindings.push({
-            slotId: String(input.slotId),
+            slotId,
             physicalId: Number(input.physicalId),
             direction: 1,
             zeroOffsetRad: 0,
           });
         virtual.jointBindings = bindings;
+        if (input.direction === 1 || input.direction === -1) {
+          machine.jointDirections = [
+            ...(machine.jointDirections ?? []).filter((binding) => binding.slotId !== slotId),
+            { slotId, direction: input.direction },
+          ];
+        }
         return cloneMachine(machine);
       }
       case "virtual_machine_bind": {
@@ -524,6 +533,7 @@ export class TestBackend {
       onlineServoIds: found.map((servo) => servo.servoId),
       connected: true,
       lastSeen: "刚刚",
+      jointDirections: [],
     };
     this.physical.push(machine);
     return cloneMachine(machine);
@@ -695,6 +705,7 @@ export class TestBackend {
       world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
+      jointRangeStates: [],
     };
     return cloneStatus(this.status);
   }
@@ -758,6 +769,7 @@ export class TestBackend {
       world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
+      jointRangeStates: [],
     };
     return cloneStatus(this.previewStatus);
   }

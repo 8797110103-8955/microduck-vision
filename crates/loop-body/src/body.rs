@@ -3,16 +3,17 @@
 use std::time::Duration;
 
 use duck_body::{BodyState, BodyTargets, ServoParameterSet, VirtualBody};
-use servo::{ServoLoopDriver, ServoPositionTargets};
+use servo::ServoLoopDriver;
 
 use crate::{
-    BodyCommand, Calibration, LoopAction, LoopBinding, LoopConfig, LoopError, LoopPhase, LoopStatus,
+    BodyCommand, JointRangeState, LoopAction, LoopBinding, LoopConfig, LoopError, LoopPhase,
+    LoopStatus,
+    adapter::ServoAdapter, lifecycle, safety,
 };
 
 pub struct BodyLoop {
     body: VirtualBody,
-    calibration: Calibration,
-    driver: Box<dyn ServoLoopDriver>,
+    adapter: ServoAdapter,
     config: LoopConfig,
     phase: LoopPhase,
     session: u64,
@@ -23,6 +24,7 @@ pub struct BodyLoop {
     last_targets: Vec<f64>,
     last_error: Option<String>,
     last_velocities: Vec<f64>,
+    joint_range_states: Vec<JointRangeState>,
 }
 
 impl BodyLoop {
@@ -34,7 +36,7 @@ impl BodyLoop {
         if config.gain == 0 {
             return Err(LoopError::ZeroGain);
         }
-        if config.period.is_zero() || config.homing_ticks == 0 || config.sensor_failure_limit == 0 {
+        if config.period.is_zero() || config.sensor_failure_limit == 0 {
             return Err(LoopError::InvalidTick);
         }
         binding.servos.validate(binding.body.template())?;
@@ -45,10 +47,10 @@ impl BodyLoop {
             template.clone(),
             ServoParameterSet::bind_all(&template, binding.servos.model),
         )?;
+        let adapter = ServoAdapter::new(driver, binding.calibration);
         Ok(Self {
             body,
-            calibration: binding.calibration,
-            driver,
+            adapter,
             config,
             phase: LoopPhase::Limp,
             session: 0,
@@ -59,6 +61,18 @@ impl BodyLoop {
             last_targets: vec![0.0; count],
             last_error: None,
             last_velocities: vec![0.0; count],
+            joint_range_states: template
+                .joints
+                .iter()
+                .map(|joint| JointRangeState {
+                    slot_id: joint.name.clone(),
+                    target_rad: 0.0,
+                    min_rad: joint.range_rad[0],
+                    max_rad: joint.range_rad[1],
+                    below_min: false,
+                    above_max: false,
+                })
+                .collect(),
         })
     }
 
@@ -80,14 +94,18 @@ impl BodyLoop {
                 if matches!(self.phase, LoopPhase::Estop) {
                     return Err(LoopError::InvalidAction(self.phase));
                 }
-                self.driver.set_torque(true)?;
-                self.driver.set_gain(self.config.gain)?;
-                self.phase = LoopPhase::Homing;
+                self.adapter.set_torque(true)?;
+                self.adapter.set_gain(self.config.gain)?;
+                self.phase = if self.config.homing_ticks == 0 {
+                    LoopPhase::Ready
+                } else {
+                    LoopPhase::Homing
+                };
                 self.homing_ticks = 0;
                 self.sensor_failures = 0;
             }
             LoopAction::Power(false) => {
-                self.driver.set_torque(false)?;
+                self.adapter.set_torque(false)?;
                 self.phase = LoopPhase::Limp;
                 self.command = None;
             }
@@ -101,11 +119,11 @@ impl BodyLoop {
             }
             LoopAction::Stop => {
                 self.phase = LoopPhase::Stopped;
-                self.driver.set_torque(false)?;
+                self.adapter.set_torque(false)?;
             }
             LoopAction::Estop => {
                 self.phase = LoopPhase::Estop;
-                self.driver.set_torque(false)?;
+                self.adapter.set_torque(false)?;
                 self.command = None;
             }
             LoopAction::Reconnect { session } => {
@@ -131,24 +149,25 @@ impl BodyLoop {
     }
 
     pub fn tick(&mut self, dt: Duration) -> Result<(), LoopError> {
+        self.update_sensors(dt)?;
+        self.apply_targets()
+    }
+
+    pub(crate) fn update_sensors(&mut self, dt: Duration) -> Result<(), LoopError> {
         if dt != self.config.period {
             return Err(LoopError::InvalidTick);
         }
         self.tick += 1;
-        if matches!(
-            self.phase,
-            LoopPhase::Limp | LoopPhase::Stopped | LoopPhase::Estop
-        ) {
+        if !lifecycle::reads_sensors(self.phase) {
             return Ok(());
         }
         if self.phase == LoopPhase::Reconnecting {
             self.phase = LoopPhase::Homing;
-            self.driver.set_torque(true)?;
-            self.driver.set_gain(self.config.gain)?;
+            self.adapter.set_torque(true)?;
+            self.adapter.set_gain(self.config.gain)?;
             self.homing_ticks = 0;
         }
-        let ids = self.calibration.physical_ids();
-        let sample = match self.driver.read_positions(&ids) {
+        let sample = match self.adapter.read() {
             Ok(sample) => sample,
             Err(error) => {
                 self.sensor_failures += 1;
@@ -156,29 +175,30 @@ impl BodyLoop {
                 if self.sensor_failures >= self.config.sensor_failure_limit {
                     self.phase = LoopPhase::Holding;
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
-        if sample.positions.len() != ids.len() || sample.velocities.len() != ids.len() {
-            self.sensor_failures += 1;
-            return Err(LoopError::SensorLength {
-                actual: sample.positions.len(),
-                expected: ids.len(),
-            });
-        }
         self.sensor_failures = 0;
         self.last_error = None;
-        let positions = self.calibration.to_body_positions(&sample.positions);
-        let velocities = self.calibration.to_body_positions(&sample.velocities);
-        self.last_velocities = velocities.clone();
+        self.last_velocities = sample.velocities.clone();
         self.body.apply_sensor_state(BodyState {
-            positions: positions.clone(),
-            velocities,
+            positions: sample.positions,
+            velocities: sample.velocities,
             elapsed: self.body.read_state().elapsed + dt,
         })?;
 
+        Ok(())
+    }
+
+    pub(crate) fn apply_targets(&mut self) -> Result<(), LoopError> {
+        let positions = self.body.read_state().positions;
+
         let targets = match self.phase {
-            LoopPhase::Homing => vec![0.0; ids.len()],
+            // Homing must establish a safe hold, not drive every joint to the numeric zero
+            // frame.  The policy's neutral pose is non-zero for several joints, and a physical
+            // robot may already be in a valid pose when torque is enabled.  Holding the measured
+            // canonical positions avoids an artificial jump before policy inference starts.
+            LoopPhase::Homing => positions.clone(),
             LoopPhase::Driving => self
                 .command
                 .as_ref()
@@ -188,17 +208,40 @@ impl BodyLoop {
             _ => return Ok(()),
         };
         self.validate_targets(&targets)?;
-        self.body.write_targets(BodyTargets {
-            positions: targets.clone(),
-        })?;
-        let servo_targets = self.calibration.to_servo_positions(&targets);
-        self.driver.write_positions(
-            &ids,
-            &ServoPositionTargets {
-                positions: servo_targets,
-            },
-        )?;
-        self.last_targets = targets;
+        self.joint_range_states = self
+            .body
+            .template()
+            .joints
+            .iter()
+            .zip(&targets)
+            .map(|(joint, target)| JointRangeState {
+                slot_id: joint.name.clone(),
+                target_rad: *target,
+                min_rad: joint.range_rad[0],
+                max_rad: joint.range_rad[1],
+                below_min: *target < joint.range_rad[0],
+                above_max: *target > joint.range_rad[1],
+            })
+            .collect();
+        let applied_targets = if self.config.enforce_body_range {
+            targets
+                .iter()
+                .zip(&self.joint_range_states)
+                .map(|(target, range)| target.clamp(range.min_rad, range.max_rad))
+                .collect()
+        } else {
+            targets.clone()
+        };
+        let body_targets = BodyTargets {
+            positions: applied_targets.clone(),
+        };
+        if self.config.enforce_body_range {
+            self.body.write_targets(body_targets)?;
+        } else {
+            self.body.write_targets_unchecked(body_targets)?;
+        }
+        self.adapter.write(&applied_targets)?;
+        self.last_targets = applied_targets;
         if self.phase == LoopPhase::Homing {
             self.homing_ticks += 1;
             if self.homing_ticks >= self.config.homing_ticks {
@@ -214,14 +257,12 @@ impl BodyLoop {
             phase: self.phase,
             session: self.session,
             tick: self.tick,
-            torque: matches!(
-                self.phase,
-                LoopPhase::Homing | LoopPhase::Ready | LoopPhase::Driving | LoopPhase::Holding
-            ),
+            torque: lifecycle::torque_enabled(self.phase),
             positions: state.positions,
             targets: self.last_targets.clone(),
             sensor_failures: self.sensor_failures,
             last_error: self.last_error.clone(),
+            joint_range_states: self.joint_range_states.clone(),
         }
     }
 
@@ -230,19 +271,6 @@ impl BodyLoop {
     }
 
     fn validate_targets(&self, targets: &[f64]) -> Result<(), LoopError> {
-        if targets.len() != self.body.template().joints.len() {
-            return Err(LoopError::TargetLength {
-                actual: targets.len(),
-                expected: self.body.template().joints.len(),
-            });
-        }
-        for (joint, target) in self.body.template().joints.iter().zip(targets) {
-            if !target.is_finite() {
-                return Err(LoopError::NonFiniteTarget {
-                    joint: joint.name.clone(),
-                });
-            }
-        }
-        Ok(())
+        safety::validate_targets(self.body.template(), targets)
     }
 }

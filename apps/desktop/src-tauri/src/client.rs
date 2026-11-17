@@ -5,10 +5,13 @@
 //! [`crate::state`].
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::process::Command as ProcessCommand;
+use std::process::Stdio;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
-use duck_body::{BodyTemplate, ServoModelKey};
+use duck_body::{BodyProfile, BodyTemplate, ServoModelKey};
 use duck_control::obs::Command;
 use loop_body::{
     BodyRuntimeView, Calibration, JointCalibration, LoopAction as BodyLoopAction, LoopBinding,
@@ -40,7 +43,8 @@ use crate::types::{
     SceneGeom as FrontendSceneGeom, SceneInfo as FrontendSceneInfo,
     SceneJoint as FrontendSceneJoint, SceneModel as FrontendSceneModel,
     SceneSite as FrontendSceneSite, SerialPortCandidate, ServoCatalogEntry, ServoIdentity,
-    ServoJointBinding, VirtualMachine, VirtualMachineBindingInput, VirtualMachineInput,
+    ServoJointBinding, TrainingPhase, TrainingPolicyLayout, TrainingProgress, TrainingRunMetadata,
+    TrainingStartInput, VirtualMachine, VirtualMachineBindingInput, VirtualMachineInput,
 };
 
 fn register_table(model: servo::ServoModel) -> Vec<RegisterDescriptor> {
@@ -226,6 +230,60 @@ fn official_servo_bindings(census: &[ServoIdentity]) -> Vec<ServoJointBinding> {
             max_rad: None,
         })
         .collect()
+}
+
+fn effective_servo_bindings(
+    census: &[ServoIdentity],
+    virtual_bindings: &[ServoJointBinding],
+) -> Vec<ServoJointBinding> {
+    let mut bindings = official_servo_bindings(census);
+    for override_binding in virtual_bindings {
+        if let Some(binding) = bindings
+            .iter_mut()
+            .find(|binding| binding.slot_id == override_binding.slot_id)
+        {
+            *binding = override_binding.clone();
+        }
+    }
+    bindings
+}
+
+fn log_joint_range_states(
+    config_dir: Option<&std::path::Path>,
+    states: &[crate::types::JointRangeState],
+) {
+    let violations = states
+        .iter()
+        .filter(|state| state.below_min || state.above_max)
+        .map(|state| {
+            format!(
+                "{} target={} range=[{},{}] side={}",
+                state.slot_id,
+                state.target_rad,
+                state.min_rad,
+                state.max_rad,
+                if state.below_min { "min" } else { "max" }
+            )
+        })
+        .collect::<Vec<_>>();
+    if !violations.is_empty() {
+        append_control_event(
+            config_dir,
+            format!("joint_range_violation {}", violations.join(" | ")),
+        );
+    }
+}
+
+fn apply_physical_directions(bindings: &mut [ServoJointBinding], physical: &PhysicalMachine) {
+    for binding in bindings {
+        if let Some(override_direction) = physical
+            .joint_directions
+            .iter()
+            .find(|item| item.slot_id == binding.slot_id)
+        {
+            binding.direction = override_direction.direction;
+        }
+    }
 }
 
 #[tauri::command]
@@ -710,6 +768,7 @@ pub(crate) fn physical_machine_save(
         connected: true,
         last_seen: Some("刚刚".into()),
         torque_enabled: false,
+        joint_directions: Vec::new(),
     };
     let pending_bus_key = hint
         .as_ref()
@@ -894,6 +953,7 @@ pub(crate) fn physical_machine_create(
         connected: false,
         last_seen: None,
         torque_enabled: false,
+        joint_directions: Vec::new(),
     };
     machines.push(machine.clone());
     drop(machines);
@@ -1339,6 +1399,11 @@ pub(crate) fn physical_machine_bind(
     if !duck_control::model::JOINT_NAMES.contains(&input.slot_id.as_str()) {
         return Err(format!("unknown joint slot: {}", input.slot_id));
     }
+    if let Some(direction) = input.direction
+        && !matches!(direction, -1 | 1)
+    {
+        return Err(format!("invalid joint direction: {direction}"));
+    }
     let physical = state
         .physical_machines
         .lock()
@@ -1392,6 +1457,36 @@ pub(crate) fn physical_machine_bind(
         duck_control::model::joint_index(&binding.slot_id).unwrap_or(usize::MAX)
     });
     drop(virtual_machines);
+    let physical = if let Some(direction) = input.direction {
+        let mut physical_machines = state
+            .physical_machines
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let machine = physical_machines
+            .iter_mut()
+            .find(|machine| machine.id == input.physical_machine_id)
+            .ok_or_else(|| "unknown physical machine".to_owned())?;
+        if let Some(binding) = machine
+            .joint_directions
+            .iter_mut()
+            .find(|binding| binding.slot_id == input.slot_id)
+        {
+            binding.direction = direction;
+        } else {
+            machine
+                .joint_directions
+                .push(crate::types::ServoJointDirection {
+                    slot_id: input.slot_id.clone(),
+                    direction,
+                });
+        }
+        machine.joint_directions.sort_by_key(|binding| {
+            duck_control::model::joint_index(&binding.slot_id).unwrap_or(usize::MAX)
+        });
+        machine.clone()
+    } else {
+        physical
+    };
     state.persist()?;
     Ok(physical)
 }
@@ -1560,11 +1655,9 @@ pub(crate) fn physical_machine_set_pose_zero(
             .find(|item| item.id == virtual_id)
             .cloned()
             .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
-        let bindings = if virtual_machine.joint_bindings.is_empty() {
-            official_servo_bindings(&machine.census)
-        } else {
-            virtual_machine.joint_bindings
-        };
+        let mut bindings =
+            effective_servo_bindings(&machine.census, &virtual_machine.joint_bindings);
+        apply_physical_directions(&mut bindings, &machine);
         let model = model(&virtual_machine.servo_model);
         (model, bindings)
     };
@@ -1585,7 +1678,12 @@ pub(crate) fn physical_machine_set_pose_zero(
     let zeroes = bindings
         .iter()
         .zip(positions)
-        .map(|(binding, position)| (binding.slot_id.clone(), position))
+        .map(|(binding, position)| {
+            (
+                binding.slot_id.clone(),
+                position * f64::from(binding.direction),
+            )
+        })
         .collect::<Vec<_>>();
     let mut virtual_machines = state
         .virtual_machines
@@ -1650,11 +1748,8 @@ pub(crate) fn physical_machine_pose(
             .find(|item| item.id == virtual_id)
             .map(|item| item.joint_bindings.clone())
             .unwrap_or_default();
-        let bindings = if !virtual_bindings.is_empty() {
-            virtual_bindings
-        } else {
-            official_servo_bindings(&machine.census)
-        };
+        let mut bindings = effective_servo_bindings(&machine.census, &virtual_bindings);
+        apply_physical_directions(&mut bindings, &machine);
         (model, bindings)
     };
     if let Some(error) = binding_conflict_error(&bindings) {
@@ -1688,6 +1783,8 @@ pub(crate) fn physical_machine_pose(
         .ok_or_else(|| "实机没有可用连接".to_owned())?
         .read_positions(model, &ids)?;
     Ok(Calibration {
+        body_id: template.id.clone(),
+        body_version: template.version,
         joints: calibration,
     }
     .to_body_positions(&positions))
@@ -1795,7 +1892,10 @@ pub(crate) fn physical_machine_write_position(
         return Err("实机没有可用连接".into());
     }
     if !machine.online_servo_ids.contains(&servo_id)
-        && !machine.census.iter().any(|servo| servo.servo_id == servo_id)
+        && !machine
+            .census
+            .iter()
+            .any(|servo| servo.servo_id == servo_id)
     {
         return Err(format!("实机舵机 {servo_id} 当前不在线"));
     }
@@ -2017,27 +2117,435 @@ pub(crate) fn policy_open_folder(state: State<'_, DesktopState>) -> Result<(), S
         .map_err(|error| format!("打开策略缓存目录失败：{error}"))
 }
 
+fn training_runs_root(config_dir: Option<&std::path::Path>) -> std::path::PathBuf {
+    config_dir
+        .and_then(std::path::Path::parent)
+        .map(|root| root.join("training").join("runs"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("microduck-vision")
+                .join("training")
+                .join("runs")
+        })
+}
+
+fn new_training_run_id() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("run-{stamp}-{}", std::process::id())
+}
+
+fn training_metadata(
+    state: &DesktopState,
+    input: &TrainingStartInput,
+    run_id: &str,
+) -> Result<TrainingRunMetadata, String> {
+    let machine = state
+        .virtual_machines
+        .lock()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .find(|machine| machine.id == input.virtual_machine_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown virtual machine: {}", input.virtual_machine_id))?;
+    let profile = BodyProfile::official().map_err(|error| error.to_string())?;
+    let identity = profile.identity();
+    if machine.body_id != identity.id {
+        return Err(format!(
+            "virtual machine body {} does not match training body {}",
+            machine.body_id, identity.id
+        ));
+    }
+
+    let (policy_layout, policy_id) = if let Some(policy_id) = input
+        .policy_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let entry = policy::list(state.config_dir.as_deref())?
+            .into_iter()
+            .find(|entry| entry.id == policy_id)
+            .ok_or_else(|| format!("unknown policy: {policy_id}"))?;
+        let descriptor = policy::descriptor(state.config_dir.as_deref(), &entry)?;
+        (
+            TrainingPolicyLayout {
+                obs_len: descriptor.obs_len,
+                action_len: descriptor.action_len,
+                control_hz: descriptor.control_hz,
+                command_encoding: descriptor.command_encoding,
+            },
+            Some(policy_id.to_owned()),
+        )
+    } else {
+        (
+            TrainingPolicyLayout {
+                obs_len: 61,
+                action_len: 14,
+                control_hz: 50,
+                command_encoding: None,
+            },
+            None,
+        )
+    };
+
+    Ok(TrainingRunMetadata {
+        experiment_id: input
+            .experiment_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(run_id)
+            .to_owned(),
+        body_template_id: identity.id,
+        body_version: identity.version,
+        body_source_hash: identity.source_hash,
+        policy_id,
+        policy_layout,
+        servo_profile: machine.servo_model,
+        recipe: input.recipe.trim().to_owned(),
+        teacher_motion_provenance: input.teacher_motion_provenance.trim().to_owned(),
+    })
+}
+
+fn persist_training_progress(progress: &TrainingProgress) {
+    let result_dir = std::path::Path::new(&progress.result_dir);
+    if std::fs::create_dir_all(result_dir).is_err() {
+        return;
+    }
+    let run = serde_json::json!({
+        "runId": progress.run_id,
+        "resultDir": progress.result_dir,
+        "metadata": progress.metadata,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&run) {
+        let _ = std::fs::write(result_dir.join("metadata.json"), bytes);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(progress) {
+        let _ = std::fs::write(result_dir.join("progress.json"), bytes);
+    }
+}
+
+fn training_number(line: &str, names: &[&str]) -> Option<f64> {
+    for token in line.split_whitespace() {
+        let normalized = token.trim_matches(|character: char| {
+            matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+        });
+        let lower = normalized.to_ascii_lowercase();
+        for name in names {
+            for separator in ["=", ":"] {
+                let prefix = format!("{name}{separator}");
+                if let Some(value) = lower.strip_prefix(&prefix)
+                    && let Ok(value) = value.trim_end_matches('%').parse::<f64>()
+                {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_training_line(progress: &mut TrainingProgress, line: &str) {
+    progress.phase = TrainingPhase::Running;
+    progress.line = line.to_owned();
+    progress.message = line.to_owned();
+    progress.step = training_number(line, &["step", "steps", "iteration", "iter"])
+        .map(|value| value.max(0.0) as u64)
+        .or(progress.step);
+    progress.total_steps = training_number(
+        line,
+        &[
+            "total_steps",
+            "total",
+            "max_steps",
+            "max_iter",
+            "iterations",
+        ],
+    )
+    .map(|value| value.max(0.0) as u64)
+    .or(progress.total_steps);
+    progress.reward =
+        training_number(line, &["reward", "mean_reward", "episode_reward"]).or(progress.reward);
+    progress.loss = training_number(line, &["loss", "policy_loss", "value_loss"]).or(progress.loss);
+    if let Some((step, total)) = line.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+        });
+        let (step, total) = token.split_once('/')?;
+        Some((step.parse::<u64>().ok()?, total.parse::<u64>().ok()?))
+    }) {
+        progress.step = Some(step);
+        progress.total_steps = Some(total);
+    }
+    if let Some(percent) = line
+        .split_whitespace()
+        .find_map(|token| token.trim_end_matches('%').parse::<f64>().ok())
+        && (0.0..=100.0).contains(&percent)
+    {
+        progress.percent = Some(percent);
+    }
+    if progress.percent.is_none()
+        && let (Some(step), Some(total)) = (progress.step, progress.total_steps)
+        && total > 0
+    {
+        progress.percent = Some((step as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
+    }
+}
+
+fn emit_training_progress(state: &DesktopState, progress: TrainingProgress) {
+    persist_training_progress(&progress);
+    if let Ok(mut current) = state.training_progress.lock() {
+        *current = Some(progress.clone());
+    }
+    if let Ok(app) = state.app_handle.lock()
+        && let Some(app) = app.as_ref()
+    {
+        let _ = app.emit("training-progress", progress);
+    }
+}
+
+fn spawn_training_reader(app: AppHandle<Wry>, reader: impl std::io::Read + Send + 'static) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            let state = app.state::<DesktopState>();
+            let Some(mut progress) = state
+                .training_progress
+                .lock()
+                .ok()
+                .and_then(|current| current.clone())
+            else {
+                continue;
+            };
+            parse_training_line(&mut progress, &line);
+            emit_training_progress(&state, progress);
+        }
+    });
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn training_start(
+    state: State<'_, DesktopState>,
+    input: TrainingStartInput,
+) -> Result<TrainingProgress, String> {
+    if input.program.trim().is_empty() {
+        return Err("训练程序不能为空".into());
+    }
+    if input.working_dir.trim().is_empty() {
+        return Err("训练工作目录不能为空".into());
+    }
+    if input.virtual_machine_id.trim().is_empty() {
+        return Err("训练必须选择模拟机".into());
+    }
+    if input.recipe.trim().is_empty() {
+        return Err("训练 recipe 不能为空".into());
+    }
+    if input.teacher_motion_provenance.trim().is_empty() {
+        return Err("训练 teacher/motion provenance 不能为空".into());
+    }
+    {
+        let mut process = state
+            .training_process
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = process.as_ref() {
+            let running = existing
+                .lock()
+                .map_err(|error| error.to_string())?
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none();
+            if running {
+                return Err("已有训练正在运行".into());
+            }
+            *process = None;
+        }
+    }
+    let working_dir = std::path::absolute(&input.working_dir)
+        .map_err(|error| format!("解析训练目录失败：{error}"))?;
+    if !working_dir.is_dir() {
+        return Err(format!("训练目录不存在：{}", working_dir.display()));
+    }
+    let run_id = new_training_run_id();
+    let metadata = training_metadata(&state, &input, &run_id)?;
+    let result_dir = training_runs_root(state.config_dir.as_deref()).join(&run_id);
+    std::fs::create_dir_all(&result_dir)
+        .map_err(|error| format!("创建训练结果目录失败：{error}"))?;
+    let app = state
+        .app_handle
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or_else(|| "训练事件通道尚未初始化".to_owned())?;
+    let mut command = ProcessCommand::new(&input.program);
+    command
+        .args(&input.args)
+        .current_dir(&working_dir)
+        .env("MICRODUCK_TRAINING_RUN_ID", &run_id)
+        .env("MICRODUCK_TRAINING_RESULT_DIR", &result_dir)
+        .env("MICRODUCK_TRAINING_EXPERIMENT_ID", &metadata.experiment_id)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动本地训练失败：{error}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let process = Arc::new(Mutex::new(child));
+    *state
+        .training_process
+        .lock()
+        .map_err(|error| error.to_string())? = Some(process.clone());
+    *state
+        .training_stop_requested
+        .lock()
+        .map_err(|error| error.to_string())? = false;
+    let starting = TrainingProgress {
+        run_id,
+        result_dir: result_dir.to_string_lossy().into_owned(),
+        metadata,
+        phase: TrainingPhase::Starting,
+        step: None,
+        total_steps: None,
+        percent: None,
+        reward: None,
+        loss: None,
+        message: format!("正在启动：{} {}", input.program, input.args.join(" ")),
+        line: String::new(),
+        exit_code: None,
+    };
+    emit_training_progress(&state, starting.clone());
+    if let Some(stdout) = stdout {
+        spawn_training_reader(app.clone(), stdout);
+    }
+    if let Some(stderr) = stderr {
+        spawn_training_reader(app.clone(), stderr);
+    }
+    let initial_progress = starting.clone();
+    std::thread::spawn(move || {
+        loop {
+            let result = process
+                .lock()
+                .ok()
+                .and_then(|mut child| child.try_wait().ok().flatten());
+            let Some(status) = result else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            };
+            let state = app.state::<DesktopState>();
+            let same_process = state
+                .training_process
+                .lock()
+                .ok()
+                .and_then(|current| current.clone())
+                .is_some_and(|current| Arc::ptr_eq(&current, &process));
+            if !same_process {
+                break;
+            }
+            let stopped = state
+                .training_stop_requested
+                .lock()
+                .map(|requested| *requested)
+                .unwrap_or(false);
+            let phase = if stopped {
+                TrainingPhase::Stopped
+            } else if status.success() {
+                TrainingPhase::Finished
+            } else {
+                TrainingPhase::Failed
+            };
+            let mut progress = state
+                .training_progress
+                .lock()
+                .ok()
+                .and_then(|current| current.clone())
+                .unwrap_or_else(|| initial_progress.clone());
+            progress.phase = phase;
+            progress.exit_code = status.code();
+            progress.percent = (phase == TrainingPhase::Finished)
+                .then_some(100.0)
+                .or(progress.percent);
+            progress.message = match phase {
+                TrainingPhase::Finished => "训练完成".into(),
+                TrainingPhase::Stopped => "训练已停止".into(),
+                TrainingPhase::Failed => format!("训练退出（代码 {:?}）", status.code()),
+                _ => progress.message,
+            };
+            emit_training_progress(&state, progress);
+            if let Ok(mut current) = state.training_process.lock()
+                && current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &process))
+            {
+                *current = None;
+            }
+            break;
+        }
+    });
+    Ok(starting)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn training_stop(state: State<'_, DesktopState>) -> Result<(), String> {
+    let process = state
+        .training_process
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or_else(|| "当前没有运行中的训练".to_owned())?;
+    *state
+        .training_stop_requested
+        .lock()
+        .map_err(|error| error.to_string())? = true;
+    process
+        .lock()
+        .map_err(|error| error.to_string())?
+        .kill()
+        .map_err(|error| format!("停止训练失败：{error}"))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn training_status(
+    state: State<'_, DesktopState>,
+) -> Result<Option<TrainingProgress>, String> {
+    state
+        .training_progress
+        .lock()
+        .map(|progress| progress.clone())
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub(crate) fn open_logs(state: State<'_, DesktopState>) -> Result<(), String> {
-    let folder = state
-        .config_dir
-        .as_deref()
-        .and_then(std::path::Path::parent)
-        .map(|root| root.join("logs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("microduck-vision").join("logs"));
-    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    let file = crate::logging::current_log_file(state.config_dir.as_deref());
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if !file.exists() {
+        std::fs::File::create(&file).map_err(|error| error.to_string())?;
+    }
     #[cfg(target_os = "windows")]
-    let mut command = ProcessCommand::new("explorer");
+    let mut command = {
+        let mut command = ProcessCommand::new("cmd");
+        command.args(["/C", "start", ""]).arg(&file);
+        command
+    };
     #[cfg(target_os = "macos")]
     let mut command = ProcessCommand::new("open");
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = ProcessCommand::new("xdg-open");
+    #[cfg(not(target_os = "windows"))]
+    command.arg(&file);
     command
-        .arg(folder)
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("打开日志目录失败：{error}"))
+        .map_err(|error| format!("打开日志文件失败：{error}"))
 }
 
 #[tauri::command]
@@ -2070,10 +2578,11 @@ pub(crate) fn loop_open(
             .into_iter()
             .find(|entry| entry.id == policy_id && entry.cached && entry.selected)
             .ok_or_else(|| "selected ONNX policy is not downloaded".to_owned())?;
-        Some(
-            policy::selected_path(state.config_dir.as_deref())
-                .ok_or_else(|| format!("selected ONNX policy is unavailable: {}", selected.id))?,
-        )
+        let path = policy::selected_path(state.config_dir.as_deref())
+            .ok_or_else(|| format!("selected ONNX policy is unavailable: {}", selected.id))?;
+        let config = policy::runtime_config(state.config_dir.as_deref(), &selected)?;
+        let descriptor = policy::descriptor(state.config_dir.as_deref(), &selected)?;
+        Some((path, config, descriptor))
     } else {
         None
     };
@@ -2111,11 +2620,7 @@ pub(crate) fn loop_open(
         .as_ref()
         .map(|machine| (machine.id.clone(), machine.name.clone()));
     let bound_servo_ids = if let Some(physical) = physical.as_ref() {
-        let bindings = if !machine.joint_bindings.is_empty() {
-            machine.joint_bindings.clone()
-        } else {
-            official_servo_bindings(&physical.census)
-        };
+        let bindings = effective_servo_bindings(&physical.census, &machine.joint_bindings);
         let mut ids = Vec::with_capacity(template.actuators.len());
         for slot in &template.actuators {
             let binding = bindings
@@ -2151,14 +2656,19 @@ pub(crate) fn loop_open(
             ids
         }
     };
-    let saved_bindings = if !machine.joint_bindings.is_empty() {
+    let mut saved_bindings = if let Some(physical_machine) = physical.as_ref() {
+        effective_servo_bindings(&physical_machine.census, &machine.joint_bindings)
+    } else if !machine.joint_bindings.is_empty() {
         machine.joint_bindings.clone()
-    } else if let Some(physical_machine) = physical.as_ref() {
-        official_servo_bindings(&physical_machine.census)
     } else {
         Vec::new()
     };
+    if let Some(physical_machine) = physical.as_ref() {
+        apply_physical_directions(&mut saved_bindings, physical_machine);
+    }
     let calibration = Calibration {
+        body_id: template.id.clone(),
+        body_version: template.version,
         joints: template
             .actuators
             .iter()
@@ -2183,12 +2693,29 @@ pub(crate) fn loop_open(
         .iter()
         .map(|joint| {
             format!(
-                "{}->{} dir={} offset={}",
-                joint.slot_id, joint.physical_id, joint.direction, joint.zero_offset_rad
+                "{}->{} dir={} offset={} min={:?} max={:?}",
+                joint.slot_id,
+                joint.physical_id,
+                joint.direction,
+                joint.zero_offset_rad,
+                joint.min_rad,
+                joint.max_rad
             )
         })
         .collect::<Vec<_>>()
         .join(" | ");
+    let non_identity_calibration = calibration.joints.iter().any(|joint| {
+        joint.direction != 1
+            || joint.zero_offset_rad != 0.0
+            || joint.min_rad.is_some()
+            || joint.max_rad.is_some()
+    });
+    let nonzero_offsets = calibration
+        .joints
+        .iter()
+        .filter(|joint| joint.zero_offset_rad != 0.0)
+        .map(|joint| format!("{}={}", joint.slot_id, joint.zero_offset_rad))
+        .collect::<Vec<_>>();
     let binding = LoopBinding {
         body: BodyRuntimeView::new(template.clone()).map_err(|e| e.to_string())?,
         servos: ServoBinding::all_slots(&template, model),
@@ -2209,6 +2736,22 @@ pub(crate) fn loop_open(
         log_machine_name,
         &binding_summary,
     );
+    append_control_event(
+        state.config_dir.as_deref(),
+        format!(
+            "binding_check servo_model={model:?} physical_driver={} actuator_count={} non_identity_calibration={} velocity_transform=position_transform nonzero_offsets={:?}",
+            physical_id.is_some(),
+            calibration.joints.len(),
+            non_identity_calibration,
+            nonzero_offsets
+        ),
+    );
+    if !nonzero_offsets.is_empty() {
+        append_control_event(
+            state.config_dir.as_deref(),
+            "calibration_warning velocity_observation_uses_position_transform=true zero_offset_will_bias_velocity",
+        );
+    }
     let driver: Box<dyn ServoLoopDriver> = if let Some(physical_id) = physical_id {
         let bus = state
             .connected_buses
@@ -2243,15 +2786,32 @@ pub(crate) fn loop_open(
     };
     let mut body_loop =
         PolicyLoop::open(binding, driver, LoopConfig::default()).map_err(|e| e.to_string())?;
-    if let Some(path) = policy_path {
+    if let Some((path, config, descriptor)) = policy_path.as_ref() {
         append_control_event(
             state.config_dir.as_deref(),
-            format!("policy_selected path={:?}", path),
+            format!("policy_selected path={path:?} config={config:?}"),
         );
-        body_loop.select_policy(path).map_err(|e| e.to_string())?;
+        if let Err(error) = body_loop.select_policy_with_descriptor(path, descriptor, *config) {
+            append_control_event(
+                state.config_dir.as_deref(),
+                format!("policy_load_error path={path:?} error={error}"),
+            );
+            return Err(error.to_string());
+        }
     } else {
         append_control_event(state.config_dir.as_deref(), "policy_selected none");
     }
+    let runtime_config = policy_path
+        .as_ref()
+        .map(|(_, config, _)| *config)
+        .unwrap_or_default();
+    append_control_event(
+        state.config_dir.as_deref(),
+        format!(
+            "policy_runtime config={runtime_config:?} observation_dim=61 action_dim=14 imu_source=default gain={}",
+            LoopConfig::default().gain
+        ),
+    );
     let mut motion = state.motion.lock().map_err(|e| e.to_string())?;
     motion.reset();
     // Servo buses expose joint feedback only.  Keep a command estimate for simulation, but do
@@ -2260,6 +2820,8 @@ pub(crate) fn loop_open(
     drop(motion);
     let mut status = FrontendLoopStatus::from(body_loop.status());
     status.world = state.motion.lock().map_err(|e| e.to_string())?.world();
+    state.emit_joint_range_states(&status.joint_range_states);
+    log_joint_range_states(state.config_dir.as_deref(), &status.joint_range_states);
     *state.loop_state.lock().map_err(|e| e.to_string())? = Some(body_loop);
     Ok(status)
 }
@@ -2342,6 +2904,8 @@ pub(crate) fn loop_action(
     }
     let mut status = FrontendLoopStatus::from(loop_state.status());
     status.world = state.motion.lock().map_err(|e| e.to_string())?.world();
+    state.emit_joint_range_states(&status.joint_range_states);
+    log_joint_range_states(state.config_dir.as_deref(), &status.joint_range_states);
     Ok(status)
 }
 
@@ -2364,6 +2928,8 @@ pub(crate) fn loop_tick(state: State<'_, DesktopState>) -> Result<FrontendLoopSt
         .tick(driving, LoopConfig::default().period);
     let mut status = FrontendLoopStatus::from(loop_state.status());
     status.world = world;
+    state.emit_joint_range_states(&status.joint_range_states);
+    log_joint_range_states(state.config_dir.as_deref(), &status.joint_range_states);
     Ok(status)
 }
 
@@ -2380,6 +2946,7 @@ pub(crate) fn loop_status(
         .map(|body_loop| FrontendLoopStatus::from(body_loop.status()));
     if let Some(status) = &mut status {
         status.world = state.motion.lock().map_err(|e| e.to_string())?.world();
+        state.emit_joint_range_states(&status.joint_range_states);
     }
     Ok(status)
 }
@@ -2388,8 +2955,12 @@ pub(crate) fn loop_status(
 #[specta::specta]
 pub(crate) fn loop_close(state: State<'_, DesktopState>) -> Result<(), String> {
     append_control_event(state.config_dir.as_deref(), "loop_close");
+    if let Some(loop_state) = state.loop_state.lock().map_err(|e| e.to_string())?.as_mut() {
+        let _ = loop_state.send(BodyLoopAction::Power(false));
+    }
     *state.loop_state.lock().map_err(|e| e.to_string())? = None;
     state.motion.lock().map_err(|e| e.to_string())?.reset();
+    state.emit_joint_range_states(&[]);
     Ok(())
 }
 
@@ -2414,6 +2985,7 @@ pub(crate) fn preview_loop_open(
         &machine.name,
     )?;
     let status = preview.status();
+    state.emit_joint_range_states(&status.joint_range_states);
     *state.preview_loop.lock().map_err(|e| e.to_string())? = Some(preview);
     Ok(status)
 }
@@ -2434,8 +3006,19 @@ pub(crate) fn preview_loop_policy(
     let preview = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?;
-    preview.select_policy(&path, selected.command)?;
-    Ok(preview.status())
+    let config = policy::runtime_config(state.config_dir.as_deref(), &selected)?;
+    let descriptor = policy::descriptor(state.config_dir.as_deref(), &selected)?;
+    preview.select_policy(
+        &path,
+        selected.command,
+        descriptor,
+        config,
+        selected.kind.as_deref(),
+        selected.duration_s,
+    )?;
+    let status = preview.status();
+    state.emit_joint_range_states(&status.joint_range_states);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2449,7 +3032,9 @@ pub(crate) fn preview_loop_command(
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?;
     preview.set_input(input);
-    Ok(preview.status())
+    let status = preview.status();
+    state.emit_joint_range_states(&status.joint_range_states);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2462,7 +3047,9 @@ pub(crate) fn preview_loop_reset_world(
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?;
     preview.reset_world();
-    Ok(preview.status())
+    let status = preview.status();
+    state.emit_joint_range_states(&status.joint_range_states);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2471,10 +3058,13 @@ pub(crate) fn preview_loop_tick(
     state: State<'_, DesktopState>,
 ) -> Result<FrontendLoopStatus, String> {
     let mut guard = state.preview_loop.lock().map_err(|e| e.to_string())?;
-    guard
+    let status = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?
-        .tick()
+        .tick()?;
+    state.emit_joint_range_states(&status.joint_range_states);
+    log_joint_range_states(state.config_dir.as_deref(), &status.joint_range_states);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2482,6 +3072,7 @@ pub(crate) fn preview_loop_tick(
 pub(crate) fn preview_loop_close(state: State<'_, DesktopState>) -> Result<(), String> {
     append_control_event(state.config_dir.as_deref(), "preview_loop_close");
     *state.preview_loop.lock().map_err(|e| e.to_string())? = None;
+    state.emit_joint_range_states(&[]);
     Ok(())
 }
 
@@ -2556,6 +3147,7 @@ mod register_table_tests {
             connected: true,
             last_seen: None,
             torque_enabled: false,
+            joint_directions: Vec::new(),
         };
 
         update_servo_id_cache(&mut machine, 5, 7).unwrap();
@@ -2597,6 +3189,7 @@ mod register_table_tests {
             connected: true,
             last_seen: None,
             torque_enabled: false,
+            joint_directions: Vec::new(),
         };
         let before = machine.clone();
         assert!(update_servo_id_cache(&mut machine, 9, 3).is_err());
@@ -2633,6 +3226,38 @@ mod register_table_tests {
             binding_conflict_error(&bindings).as_deref(),
             Some("绑定冲突：42 → left_hip_yaw,right_hip_yaw")
         );
+    }
+}
+
+#[cfg(test)]
+mod training_tests {
+    use super::training_metadata;
+    use crate::state::DesktopState;
+    use crate::types::TrainingStartInput;
+
+    #[test]
+    fn training_metadata_uses_the_selected_body_and_fixed_policy_layout() {
+        let state = DesktopState::new(None);
+        let input = TrainingStartInput {
+            program: "uv".into(),
+            args: vec!["run".into(), "train".into()],
+            working_dir: ".".into(),
+            virtual_machine_id: "official-hd1910".into(),
+            policy_id: None,
+            experiment_id: Some("experiment-1".into()),
+            recipe: "student-distillation".into(),
+            teacher_motion_provenance: "teacher:official-motion".into(),
+        };
+
+        let metadata = training_metadata(&state, &input, "run-1").expect("training metadata");
+        assert_eq!(metadata.experiment_id, "experiment-1");
+        assert_eq!(metadata.body_template_id, "official");
+        assert_eq!(metadata.body_version, 1);
+        assert!(!metadata.body_source_hash.is_empty());
+        assert_eq!(metadata.policy_layout.obs_len, 61);
+        assert_eq!(metadata.policy_layout.action_len, 14);
+        assert_eq!(metadata.policy_layout.control_hz, 50);
+        assert_eq!(metadata.servo_profile, duck_body::ServoModelKey::Hd1910);
     }
 }
 

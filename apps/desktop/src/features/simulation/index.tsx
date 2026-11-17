@@ -1,6 +1,7 @@
 import { computed, defineComponent, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import type { ServoCatalogEntry, ServoModelKey, SimulationParameters } from "../../bridge/types";
+import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
 import { desktopBackend, useDesktopStore } from "../../store";
 import { servoModel } from "../debug/helpers";
@@ -18,7 +19,6 @@ export const SimulationPage = defineComponent(() => {
   const createPanel = shallowRef<HTMLElement>();
   const createButton = shallowRef<HTMLElement>();
   const newNameInput = shallowRef<HTMLInputElement>();
-  const newServoSelect = shallowRef<HTMLSelectElement>();
   const editingNameInput = shallowRef<HTMLInputElement>();
   const newName = ref("");
   const newServo = ref<ServoModelKey>(store.state.selectedServo);
@@ -167,18 +167,21 @@ export const SimulationPage = defineComponent(() => {
             </label>
             <label>
               舵机
-              <select
-                ref={newServoSelect}
+              <Select
                 value={newServo.value}
-                onChange={() => {
-                  newServo.value = servoModel(newServoSelect.value?.value ?? "");
+                onChange={(event: Event) => {
+                  const value =
+                    event.currentTarget instanceof HTMLSelectElement
+                      ? event.currentTarget.value
+                      : "";
+                  newServo.value = servoModel(value);
                   newSimulation.value = randomSimulation(newServo.value);
                 }}
               >
                 {store.state.catalog.map((entry) => (
                   <option value={entry.key}>{entry.label}</option>
                 ))}
-              </select>
+              </Select>
             </label>
             <div class={style.simulationCreateParameters}>
               <strong>仿真参数</strong>

@@ -7,6 +7,7 @@ import type {
   PhysicalMachineSaveInput,
   PhysicalServoRegister,
 } from "../../bridge/types";
+import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
 import { desktopBackend, useDesktopStore } from "../../store";
 import style from "./style.module.scss";
@@ -157,11 +158,8 @@ export const PhysicalMachinesPage = defineComponent(() => {
   const registerDrafts = ref<Record<string, string>>({});
   const registerErrors = ref<Record<string, string>>({});
   const selectedServoIds = ref<Record<string, number>>({});
-  const portSelect = shallowRef<HTMLSelectElement>();
-  const baudSelect = shallowRef<HTMLSelectElement>();
   const autoReconnectInput = shallowRef<HTMLInputElement>();
   const nameInputs = new Map<string, HTMLInputElement>();
-  const virtualMachineSelects = new Map<string, HTMLSelectElement>();
 
   const canSaveDetected = () => {
     const candidate = store.state.detectedPhysicalMachine;
@@ -290,10 +288,12 @@ export const PhysicalMachinesPage = defineComponent(() => {
       <section class={[style.physicalConnectionBar, style.panelCard]} aria-label="舵机连接">
         <label>
           USB/串口
-          <select
-            ref={portSelect}
+          <Select
             value={port.value}
-            onChange={() => (port.value = portSelect.value?.value ?? "")}
+            onChange={(event: Event) => {
+              if (event.currentTarget instanceof HTMLSelectElement)
+                port.value = event.currentTarget.value;
+            }}
             disabled={detecting.value}
           >
             <option value="">选择端口</option>
@@ -303,7 +303,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
                 {candidate.product ? ` · ${candidate.product}` : ""}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
         <button
           class={style.smallButton}
@@ -315,10 +315,12 @@ export const PhysicalMachinesPage = defineComponent(() => {
         </button>
         <label>
           波特率
-          <select
-            ref={baudSelect}
+          <Select
             value={baud.value}
-            onChange={() => (baud.value = baudSelect.value?.value ?? "")}
+            onChange={(event: Event) => {
+              if (event.currentTarget instanceof HTMLSelectElement)
+                baud.value = event.currentTarget.value;
+            }}
             disabled={detecting.value}
           >
             {(store.state.physicalBaudChoices.length
@@ -327,7 +329,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
             ).map((value) => (
               <option value={String(value)}>{value.toLocaleString()}</option>
             ))}
-          </select>
+          </Select>
         </label>
         <button
           class={style.smallButton}
@@ -441,16 +443,13 @@ export const PhysicalMachinesPage = defineComponent(() => {
                 </div>
                 <label class={[style.physicalFact, style.physicalVirtualMachine]}>
                   <span>模拟机：</span>
-                  <select
-                    ref={(element) => {
-                      if (element) {
-                        // oxlint-disable-next-line no-unsafe-type-assertion
-                        virtualMachineSelects.set(machine.id, element as HTMLSelectElement);
-                      } else virtualMachineSelects.delete(machine.id);
-                    }}
+                  <Select
                     value={machine.virtualMachineId ?? ""}
-                    onChange={() => {
-                      const id = virtualMachineSelects.get(machine.id)?.value ?? "";
+                    onChange={(event: Event) => {
+                      const id =
+                        event.currentTarget instanceof HTMLSelectElement
+                          ? event.currentTarget.value
+                          : "";
                       if (id) void mountPhysicalMachine(machine.id, id);
                     }}
                   >
@@ -458,7 +457,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
                     {store.state.virtualMachines.map((vm) => (
                       <option value={vm.id}>{vm.name}</option>
                     ))}
-                  </select>
+                  </Select>
                 </label>
                 <span class={machine.connected ? [style.tag, style.ok] : style.tag}>
                   {machine.connected ? "已连接" : "未连接"}

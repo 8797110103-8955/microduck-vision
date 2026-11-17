@@ -1,0 +1,157 @@
+@use "../../styles/tokens" as *;
+
+.trainingPage {
+  position: fixed;
+  inset: 72px 16px 32px 50vw;
+  z-index: 20;
+  display: grid;
+  align-content: start;
+  gap: 18px;
+  min-height: 0;
+  padding: 30px 32px;
+  border: 1px solid $border;
+  border-radius: 12px;
+  background: $background;
+  box-shadow: 0 18px 50px rgba(35, 30, 18, 0.18);
+  overflow: auto;
+}
+
+.header,
+.progressHeader,
+.metrics {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.header {
+  h2,
+  p {
+    margin: 0;
+  }
+
+  p {
+    margin-top: 5px;
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.phase {
+  color: $muted;
+  font-size: 12px;
+
+  &.active {
+    color: $accent;
+  }
+}
+
+.form {
+  display: grid;
+  gap: 12px;
+
+  label {
+    display: grid;
+    gap: 5px;
+    color: $muted;
+    font-size: 11px;
+  }
+
+  input,
+  select {
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid $border;
+    border-radius: 7px;
+    color: $text;
+    background: $surface;
+  }
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+
+  button {
+    padding: 7px 12px;
+    border: 1px solid $border;
+    border-radius: 7px;
+    color: $text;
+    background: $surface;
+
+    &:first-child {
+      border-color: $accent;
+      background: $accent;
+      font-weight: 600;
+    }
+
+    &:disabled {
+      cursor: default;
+      opacity: 0.5;
+    }
+  }
+}
+
+.progressCard {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid $border;
+  border-radius: 9px;
+  background: $surface;
+}
+
+.progressHeader span,
+.metrics,
+.progressCard pre,
+.error {
+  color: $muted;
+  font-size: 11px;
+}
+
+.track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba($border, 0.65);
+
+  div {
+    height: 100%;
+    border-radius: inherit;
+    background: $accent;
+    transition: width 0.2s ease;
+  }
+}
+
+.metrics {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: $muted;
+  font-size: 11px;
+}
+
+.resultDir {
+  overflow-wrap: anywhere;
+  color: $muted;
+  font-size: 10px;
+}
+
+.progressCard pre {
+  max-height: 90px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.error {
+  margin: 0;
+  color: $red;
+}

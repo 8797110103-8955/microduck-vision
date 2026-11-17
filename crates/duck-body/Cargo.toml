@@ -12,6 +12,7 @@ duck-ipc-proto = { path = "../../vendor/microduck/duck-ipc-proto" }
 kinematics = { path = "../../vendor/microduck/kinematics" }
 roxmltree = "0.21.2"
 serde.workspace = true
+serde_json.workspace = true
 specta = { version = "=2.0.0-rc.28", features = ["derive"] }
 thiserror.workspace = true
 toml.workspace = true

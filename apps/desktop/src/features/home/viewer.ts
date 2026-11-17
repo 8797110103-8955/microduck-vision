@@ -32,7 +32,7 @@ export class DuckViewer {
   private frame: SceneFrame | null = null;
   private raf = 0;
   private resize: ResizeObserver;
-  private highlighted: number | null = null;
+  private highlightedBodies = new Set<number>();
   private dim = false;
   private grid: THREE.GridHelper;
   /** Stand-ins for the other virtual machines: the same model at rest, side by side. */
@@ -44,6 +44,12 @@ export class DuckViewer {
   private worldPose: [number, number, number] = [0, 0, 0];
   private configuredWorldPositions: [number, number, number][] = [];
   private readonly baseHeight: number;
+  /** Convert the vendor/MuJoCo Z-up frame into the Three.js Y-up frame. */
+  private readonly mujocoToThree = new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(-Math.PI / 2, 0, 0),
+  );
+  private readonly mujocoUp = new THREE.Vector3(0, 0, 1);
+  private readonly yawRotation = new THREE.Quaternion();
   private viewRestored = false;
   private defaultFocused = false;
   private previousFocusedView: ViewState | null = null;
@@ -82,7 +88,7 @@ export class DuckViewer {
     this.grid = new THREE.GridHelper(1000, 1000, 0xc9c4b5, 0xe4e0d4);
     this.scene.add(this.grid);
 
-    this.root.rotation.x = -Math.PI / 2;
+    this.setRootYaw(this.root, 0);
     this.root.position.y = this.baseHeight;
     this.scene.add(this.root);
     this.build();
@@ -202,7 +208,14 @@ export class DuckViewer {
     const angle = n(yaw);
     this.worldPose = [x, z, angle];
     this.applyMainWorldPosition();
-    this.root.rotation.y = angle;
+    this.setRootYaw(this.root, angle);
+  }
+
+  /** Apply a MuJoCo/world yaw without changing the fixed Z-up to Y-up basis. */
+  private setRootYaw(root: THREE.Group, yaw: number) {
+    root.quaternion
+      .copy(this.mujocoToThree)
+      .multiply(this.yawRotation.setFromAxisAngle(this.mujocoUp, yaw));
   }
 
   private applyMainWorldPosition() {
@@ -218,7 +231,7 @@ export class DuckViewer {
     this.ghosts.forEach((root, index) => {
       const [x, y, z] = this.configuredWorldPositions[index + 1] ?? [0, 0, 0];
       root.position.set(x, this.baseHeight + y, z);
-      root.rotation.y = 0;
+      this.setRootYaw(root, 0);
     });
   }
 
@@ -252,10 +265,9 @@ export class DuckViewer {
     this.root.updateMatrixWorld();
     for (let k = 1; k <= count; k++) {
       const root = new THREE.Group();
-      root.rotation.copy(this.root.rotation);
+      this.setRootYaw(root, 0);
       const [x, y, z] = this.configuredWorldPositions[k] ?? [0, 0, 0];
       root.position.set(x, this.baseHeight + y, z);
-      root.rotation.y = 0;
       const bodies = this.bodies.map((_, i) => {
         const g = new THREE.Group();
         for (const m of this.meshesByBody[i]) {
@@ -322,17 +334,22 @@ export class DuckViewer {
   }
 
   highlight(body: number | null) {
-    if (body === this.highlighted) return;
-    const set = (b: number | null, on: boolean) =>
-      b !== null &&
-      this.meshesByBody[b]?.forEach((m) => {
+    this.highlightBodies(body === null ? [] : [body]);
+  }
+
+  highlightBodies(bodies: number[]) {
+    const next = [...new Set(bodies)].filter((body) => this.meshesByBody[body]);
+    const set = (body: number, on: boolean) =>
+      this.meshesByBody[body]?.forEach((m) => {
         const mat = m.material;
         mat.emissive.set(on ? 0xf5b700 : 0x000000);
         mat.emissiveIntensity = on ? 0.9 : 0;
       });
-    set(this.highlighted, false);
-    set(body, true);
-    this.highlighted = body;
+    [...this.highlightedBodies]
+      .filter((body) => !next.includes(body))
+      .forEach((body) => set(body, false));
+    next.filter((body) => !this.highlightedBodies.has(body)).forEach((body) => set(body, true));
+    this.highlightedBodies = new Set(next);
   }
 
   pick(clientX: number, clientY: number): number | null {

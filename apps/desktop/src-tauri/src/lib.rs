@@ -29,7 +29,9 @@ pub fn run() {
                 .path()
                 .app_config_dir()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            app.manage(DesktopState::load(config_dir));
+            let state = DesktopState::load(config_dir);
+            state.set_app_handle(app.handle().clone());
+            app.manage(state);
             app.manage(device_watcher::DeviceWatcher::start(app.handle().clone()));
             Ok(())
         })
@@ -38,6 +40,7 @@ pub fn run() {
                 .button_id("snap-btn")
                 .build(),
         )
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(builder.invoke_handler())
         .run(tauri::generate_context!())
         .expect("error while running Microduck");

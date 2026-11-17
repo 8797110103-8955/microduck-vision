@@ -65,7 +65,7 @@ describe("desktop frontend flow", () => {
     expect(store.state.catalog.map((entry) => entry.key)).toEqual(["hd1910", "xl330"]);
     expect(store.state.selectedVirtualMachine).toBe("official-hd1910");
     expect(backend.calls.filter((call) => call.name === "servo_catalog")).toHaveLength(1);
-    expect(wrapper.text()).toContain("VLA预览");
+    expect(wrapper.text()).toContain("VLA");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     expect(wrapper.text()).toContain("策略");
@@ -160,7 +160,7 @@ describe("desktop frontend flow", () => {
     const backend = new TestBackend(memoryServoCatalog);
     const { host, wrapper, store } = await mountApp(backend);
 
-    await buttonByText(wrapper, "VLA预览").trigger("click");
+    await buttonByText(wrapper, "VLA").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("当前电脑还没有已缓存的 ONNX");
@@ -190,7 +190,7 @@ describe("desktop frontend flow", () => {
     expect(wrapper.text()).toContain("已缓存");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
-    await buttonByText(wrapper, "VLA预览").trigger("click");
+    await buttonByText(wrapper, "VLA").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("Alpha Walking");
@@ -280,7 +280,7 @@ describe("desktop frontend flow", () => {
 
     expect(store.state.error).toBeNull();
     expect(store.state.catalog).toHaveLength(2);
-    expect(wrapper.text()).toContain("VLA预览");
+    expect(wrapper.text()).toContain("VLA");
 
     wrapper.unmount();
     host.remove();

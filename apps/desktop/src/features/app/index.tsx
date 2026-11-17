@@ -1,11 +1,12 @@
 import { computed, defineComponent, onMounted, onUnmounted, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
+import type { JointRangeState, TrainingProgress } from "../../bridge/types";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../../../assets/icons/icon.ico";
 import { Message } from "../../components/message";
 import { Titlebar } from "../../components/titlebar";
-import { useDesktopStore } from "../../store";
+import { desktopBackend, useDesktopStore } from "../../store";
 import { load } from "../debug";
 import { HomePage } from "../home";
 import { refreshPhysicalMachines, refreshPhysicalPorts } from "../machines";
@@ -177,6 +178,8 @@ export const App = defineComponent(() => {
   const reloadButton = shallowRef<HTMLButtonElement>();
   const appShell = shallowRef<HTMLDivElement>();
   let stopPhysicalMachineEvents: (() => void) | undefined;
+  let stopTrainingEvents: (() => void) | undefined;
+  let stopJointRangeEvents: (() => void) | undefined;
   let eventListenerDisposed = false;
 
   onMounted(() => {
@@ -190,11 +193,31 @@ export const App = defineComponent(() => {
       if (eventListenerDisposed) unlisten();
       else stopPhysicalMachineEvents = unlisten;
     });
+    void listen<TrainingProgress>("training-progress", (event) => {
+      store.state.training = event.payload;
+    }).then((unlisten) => {
+      if (eventListenerDisposed) unlisten();
+      else stopTrainingEvents = unlisten;
+    });
+    void listen<JointRangeState[]>("joint-range-state", (event) => {
+      store.state.jointRangeStates = event.payload;
+    }).then((unlisten) => {
+      if (eventListenerDisposed) unlisten();
+      else stopJointRangeEvents = unlisten;
+    });
+    void desktopBackend()
+      .trainingStatus()
+      .then((progress) => {
+        store.state.training = progress;
+      })
+      .catch(() => undefined);
   });
 
   onUnmounted(() => {
     eventListenerDisposed = true;
     stopPhysicalMachineEvents?.();
+    stopTrainingEvents?.();
+    stopJointRangeEvents?.();
   });
   useEventListener(reloadButton, "click", () => void load());
   useEventListener(appShell, "contextmenu", (event: MouseEvent) => event.preventDefault());

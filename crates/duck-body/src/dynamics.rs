@@ -157,6 +157,24 @@ impl VirtualBody {
         Ok(())
     }
 
+    /// Write finite targets without applying the body's posture range. The caller is responsible
+    /// for deciding whether the range should be enforced at the driver boundary.
+    pub fn write_targets_unchecked(&mut self, targets: BodyTargets) -> Result<(), BodyError> {
+        if targets.positions.len() != self.template.joints.len() {
+            return Err(BodyError::VectorLength {
+                actual: targets.positions.len(),
+                expected: self.template.joints.len(),
+            });
+        }
+        if targets.positions.iter().any(|position| !position.is_finite()) {
+            return Err(BodyError::Dynamics(
+                "target state contains a non-finite value".into(),
+            ));
+        }
+        self.targets = targets;
+        Ok(())
+    }
+
     pub fn reset_dynamics(&mut self) {
         self.dynamics.reset(&self.state);
     }

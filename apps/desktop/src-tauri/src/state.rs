@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::process::Child;
+use std::sync::{Arc, Mutex};
 
 use duck_body::ServoModelKey;
 use loop_body::PolicyLoop;
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Wry};
 
 use crate::control::ConnectedBus;
 use crate::helpers::default_simulation;
@@ -15,7 +17,7 @@ use crate::physical;
 use crate::simulation::PreviewPolicyLoop;
 use crate::types::{
     ActionKind, ActionRecord, ActionSource, PhysicalMachine, ReconnectHint, ServoIdentity,
-    VirtualMachine,
+    ServoJointDirection, TrainingProgress, VirtualMachine,
 };
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -52,6 +54,8 @@ struct PersistedPhysicalMachine {
     census: Vec<PersistedServoIdentity>,
     reconnect_hint: Option<PersistedReconnectHint>,
     virtual_machine_id: Option<String>,
+    #[serde(default)]
+    joint_directions: Vec<ServoJointDirection>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -95,6 +99,7 @@ impl From<&PhysicalMachine> for PersistedPhysicalMachine {
                     product: hint.product.clone(),
                 }),
             virtual_machine_id: machine.virtual_machine_id.clone(),
+            joint_directions: machine.joint_directions.clone(),
         }
     }
 }
@@ -137,6 +142,11 @@ impl From<PersistedPhysicalMachine> for PhysicalMachine {
             connected: false,
             last_seen: None,
             torque_enabled: false,
+            joint_directions: machine
+                .joint_directions
+                .into_iter()
+                .filter(|binding| matches!(binding.direction, -1 | 1))
+                .collect(),
         }
     }
 }
@@ -153,6 +163,12 @@ pub(crate) struct DesktopState {
     pub(crate) preview_loop: Mutex<Option<PreviewPolicyLoop>>,
     pub(crate) connected_buses: Mutex<HashMap<String, ConnectedBus>>,
     pub(crate) actions: Mutex<Vec<ActionRecord>>,
+    /// The optional local trainer is owned by the desktop process so its
+    /// output can continue to reach the UI while the command itself returns.
+    pub(crate) training_process: Mutex<Option<Arc<Mutex<Child>>>>,
+    pub(crate) training_progress: Mutex<Option<TrainingProgress>>,
+    pub(crate) training_stop_requested: Mutex<bool>,
+    pub(crate) app_handle: Mutex<Option<AppHandle<Wry>>>,
 }
 
 impl Default for DesktopState {
@@ -237,6 +253,24 @@ impl DesktopState {
                     source: ActionSource::Builtin,
                 },
             ]),
+            training_process: Mutex::new(None),
+            training_progress: Mutex::new(None),
+            training_stop_requested: Mutex::new(false),
+            app_handle: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn set_app_handle(&self, app: AppHandle<Wry>) {
+        if let Ok(mut current) = self.app_handle.lock() {
+            *current = Some(app);
+        }
+    }
+
+    pub(crate) fn emit_joint_range_states(&self, states: &[crate::types::JointRangeState]) {
+        if let Ok(handle) = self.app_handle.lock()
+            && let Some(app) = handle.as_ref()
+        {
+            let _ = app.emit("joint-range-state", states);
         }
     }
 
@@ -308,7 +342,7 @@ impl DesktopState {
 #[cfg(test)]
 mod tests {
     use super::DesktopState;
-    use crate::types::{PhysicalMachine, ReconnectHint, ServoIdentity};
+    use crate::types::{PhysicalMachine, ReconnectHint, ServoIdentity, ServoJointDirection};
 
     fn servo(id: u8, model: &str) -> ServoIdentity {
         ServoIdentity {
@@ -347,8 +381,14 @@ mod tests {
                 connected: true,
                 last_seen: Some("刚刚".into()),
                 torque_enabled: false,
+                joint_directions: vec![ServoJointDirection {
+                    slot_id: "left_hip_yaw".into(),
+                    direction: -1,
+                }],
             });
-        state.virtual_machines.lock().unwrap()[0].simulation.world_position = [1.25, -0.4, 2.0];
+        state.virtual_machines.lock().unwrap()[0]
+            .simulation
+            .world_position = [1.25, -0.4, 2.0];
         state.persist().unwrap();
 
         let loaded = DesktopState::new(Some(config_dir.clone()));
@@ -367,6 +407,7 @@ mod tests {
             physical.virtual_machine_id.as_deref(),
             Some("official-hd1910")
         );
+        assert_eq!(physical.joint_directions[0].direction, -1);
         assert_eq!(
             loaded.virtual_machines.lock().unwrap()[0].referenced_by,
             vec!["physical-1"]
@@ -383,7 +424,7 @@ mod tests {
         assert!(machines_text.contains("auto_reconnect = true"));
         let robots_text = std::fs::read_to_string(config_dir.join("robots.toml")).unwrap();
         assert!(robots_text.contains("reconnect_hint"));
-        assert!(!robots_text.contains("joint_bindings"));
+        assert!(robots_text.contains("joint_directions"));
         assert!(!robots_text.contains("machine_code"));
         assert!(!robots_text.contains("connected"));
         let _ = std::fs::remove_dir_all(config_dir);

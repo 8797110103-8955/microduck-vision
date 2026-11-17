@@ -10,6 +10,7 @@
     "core:window:allow-start-dragging",
     "core:window:allow-set-cursor-position",
     "core:window:allow-set-cursor-visible",
-    "snap-layout:default"
+    "snap-layout:default",
+    "opener:default"
   ]
 }

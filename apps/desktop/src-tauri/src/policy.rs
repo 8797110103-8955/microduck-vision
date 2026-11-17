@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use duck_control::policy::Net;
+use loop_body::{PolicyConfig, PolicyDescriptor};
 use serde::Deserialize;
 
 use crate::types::{PolicyCommand, PolicyEntry};
 
-const CACHE_DIR: &str = "library/policies/official";
+const CACHE_DIR: &str = "policies/official";
 const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_URL: &str =
     "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/manifest.json";
@@ -25,6 +27,24 @@ const MANIFEST_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Clone, Deserialize)]
 struct OfficialManifest {
     policies: Vec<ManifestPolicy>,
+    #[serde(default)]
+    obs_len: Option<usize>,
+    #[serde(default)]
+    action_len: Option<usize>,
+    #[serde(default)]
+    body_id: Option<String>,
+    #[serde(default)]
+    body_version: Option<u32>,
+    #[serde(default)]
+    control_hz: Option<u32>,
+    #[serde(default)]
+    robot: Option<ManifestRobot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestRobot {
+    #[serde(default)]
+    control_hz: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +60,22 @@ struct ManifestPolicy {
     duration_s: Option<f64>,
     #[serde(default)]
     command: Option<PolicyCommand>,
+    #[serde(default)]
+    action_scale: Option<f64>,
+    #[serde(default)]
+    obs_len: Option<usize>,
+    #[serde(default)]
+    action_len: Option<usize>,
+    #[serde(default)]
+    body_id: Option<String>,
+    #[serde(default)]
+    body_version: Option<u32>,
+    #[serde(default)]
+    control_hz: Option<u32>,
+    #[serde(default)]
+    command_encoding: Option<String>,
+    #[serde(default)]
+    recurrent: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +88,76 @@ struct OfficialSource {
     slot: Option<String>,
     duration_s: Option<f64>,
     command: Option<PolicyCommand>,
+    action_scale: Option<f64>,
+    obs_len: Option<usize>,
+    action_len: Option<usize>,
+    body_id: Option<String>,
+    body_version: Option<u32>,
+    control_hz: Option<u32>,
+    command_encoding: Option<String>,
+    recurrent: Option<bool>,
+}
+
+pub(crate) fn descriptor(
+    config_dir: Option<&Path>,
+    entry: &PolicyEntry,
+) -> Result<PolicyDescriptor, String> {
+    let source = sources(config_dir)?
+        .into_iter()
+        .find(|source| source.id == entry.id)
+        .ok_or_else(|| format!("unknown official policy: {}", entry.id))?;
+    Ok(PolicyDescriptor {
+        id: source.id,
+        body_id: source.body_id.unwrap_or_else(|| "official".into()),
+        body_version: source.body_version.unwrap_or(1),
+        obs_len: source.obs_len.unwrap_or(61),
+        action_len: source.action_len.unwrap_or(14),
+        control_hz: source.control_hz.unwrap_or(50),
+        command_encoding: source.command_encoding,
+        recurrent: source.recurrent,
+    })
+}
+
+/// Resolve controller tuning once, identically for preview and physical loops.
+pub(crate) fn runtime_config(
+    config_dir: Option<&Path>,
+    entry: &PolicyEntry,
+) -> Result<PolicyConfig, String> {
+    let source = sources(config_dir)?
+        .into_iter()
+        .find(|source| source.id == entry.id)
+        .ok_or_else(|| format!("unknown official policy: {}", entry.id))?;
+    let name = Path::new(&source.file)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let net = match source.slot.as_deref() {
+        Some("walk") => Net::Walk,
+        Some("stand") => Net::Stand,
+        Some("sitstand") => Net::SitStand,
+        Some("ground_pick") => Net::GroundPick,
+        _ => match name {
+            "alpha_stand" => Net::Stand,
+            "alpha_sitstand" => Net::SitStand,
+            "alpha_ground_pick" => Net::GroundPick,
+            "roller_crouch" | "roulade" | "ball_kick_left" | "ball_kick_right" => Net::Skill(0),
+            _ if source.kind.as_deref() == Some("episodic") => Net::Skill(0),
+            _ => Net::Walk,
+        },
+    };
+    // Match the official controller's per-state defaults; manifest overrides win.
+    let action_scale = source.action_scale.unwrap_or(match net {
+        Net::Stand | Net::SitStand | Net::GroundPick => 1.0,
+        _ => PolicyConfig::default().action_scale,
+    });
+    if !action_scale.is_finite() || action_scale <= 0.0 {
+        return Err(format!("invalid action_scale for policy: {}", entry.id));
+    }
+    Ok(PolicyConfig {
+        net,
+        action_scale,
+        ..PolicyConfig::default()
+    })
 }
 
 pub(crate) fn cache_root(config_dir: Option<&Path>) -> PathBuf {
@@ -194,6 +300,13 @@ pub(crate) fn selected_path(config_dir: Option<&Path>) -> Option<PathBuf> {
 
 fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
     let manifest = load_manifest(config_dir)?;
+    let default_obs_len = manifest.obs_len;
+    let default_action_len = manifest.action_len;
+    let default_body_id = manifest.body_id;
+    let default_body_version = manifest.body_version;
+    let default_control_hz = manifest
+        .control_hz
+        .or_else(|| manifest.robot.and_then(|robot| robot.control_hz));
     Ok(manifest
         .policies
         .into_iter()
@@ -206,6 +319,12 @@ fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
             let stem = path.file_stem()?.to_str()?;
             let id = stem.replace('_', "-");
             let name = policy.name.unwrap_or_else(|| stem.replace('_', " "));
+            let command_encoding = policy.command_encoding.or_else(|| {
+                policy
+                    .command
+                    .as_ref()
+                    .and_then(|command| command.encoding.clone())
+            });
             Some(OfficialSource {
                 id,
                 name,
@@ -218,6 +337,14 @@ fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
                 slot: policy.slot,
                 duration_s: policy.duration_s,
                 command: policy.command,
+                action_scale: policy.action_scale,
+                obs_len: policy.obs_len.or(default_obs_len),
+                action_len: policy.action_len.or(default_action_len),
+                body_id: policy.body_id.or_else(|| default_body_id.clone()),
+                body_version: policy.body_version.or(default_body_version),
+                control_hz: policy.control_hz.or(default_control_hz),
+                command_encoding,
+                recurrent: policy.recurrent,
             })
         })
         .collect())
@@ -289,7 +416,7 @@ mod tests {
         let config = PathBuf::from("C:/microduck/config");
         assert_eq!(
             cache_root(Some(&config)),
-            PathBuf::from("C:/microduck/library/policies/official")
+            PathBuf::from("C:/microduck/policies/official")
         );
     }
 

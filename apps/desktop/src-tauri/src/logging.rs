@@ -16,8 +16,27 @@ fn log_directory(config_dir: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("microduck-vision").join("logs"))
 }
 
-fn log_file(config_dir: Option<&Path>) -> PathBuf {
-    log_directory(config_dir).join("control-loop.log")
+fn date_stamp() -> String {
+    let days = (timestamp_millis() / 86_400_000) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+pub(crate) fn current_log_file(config_dir: Option<&Path>) -> PathBuf {
+    log_directory(config_dir).join(format!("{}.log", date_stamp()))
 }
 
 fn timestamp_millis() -> u128 {
@@ -42,18 +61,52 @@ fn append_line(path: &Path, line: &str) {
 
 fn append_handle(handle: &LogHandle, line: &str) {
     let result = (|| -> std::io::Result<()> {
-        let mut file = handle
+        let mut writer = handle
             .lock()
             .map_err(|_| std::io::Error::other("control-loop log lock poisoned"))?;
-        writeln!(file, "[{}] {line}", timestamp_millis())?;
-        file.flush()
+        writer.rotate_if_needed()?;
+        writeln!(writer.file, "[{}] {line}", timestamp_millis())?;
+        writer.file.flush()
     })();
     if let Err(error) = result {
         eprintln!("control-loop log write failed: {error}");
     }
 }
 
-pub(crate) type LogHandle = Arc<Mutex<File>>;
+pub(crate) struct LogWriter {
+    config_dir: Option<PathBuf>,
+    day: String,
+    file: File,
+}
+
+impl LogWriter {
+    fn open(config_dir: Option<&Path>) -> std::io::Result<Self> {
+        let day = date_stamp();
+        let path = current_log_file(config_dir);
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            config_dir: config_dir.map(Path::to_path_buf),
+            day,
+            file,
+        })
+    }
+
+    fn rotate_if_needed(&mut self) -> std::io::Result<()> {
+        let day = date_stamp();
+        if day == self.day {
+            return Ok(());
+        }
+        let next = Self::open(self.config_dir.as_deref())?;
+        self.day = next.day;
+        self.file = next.file;
+        Ok(())
+    }
+}
+
+pub(crate) type LogHandle = Arc<Mutex<LogWriter>>;
 
 pub(crate) fn begin_control_loop(
     config_dir: Option<&Path>,
@@ -61,14 +114,16 @@ pub(crate) fn begin_control_loop(
     machine_name: &str,
     binding_summary: &str,
 ) -> Option<LogHandle> {
-    let path = log_file(config_dir);
-    let result = (|| -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+    let mut writer = match LogWriter::open(config_dir) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("control-loop log initialization failed: {error}");
+            return None;
         }
-        let mut file = File::create(&path)?;
+    };
+    let result = (|| -> std::io::Result<()> {
         writeln!(
-            file,
+            writer.file,
             "[{}] loop_open machine_id={} machine_name={:?} binding={ids}",
             timestamp_millis(),
             machine_id,
@@ -80,43 +135,55 @@ pub(crate) fn begin_control_loop(
         eprintln!("control-loop log initialization failed: {error}");
         return None;
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(|file| Arc::new(Mutex::new(file)))
-        .map_err(|error| {
-            eprintln!("control-loop log handle failed: {error}");
-        })
-        .ok()
+    Some(Arc::new(Mutex::new(writer)))
 }
 
 pub(crate) fn append_policy_trace(config_dir: Option<&Path>, tick: u64, trace: &PolicyTrace) {
+    let imu_observation = trace.observation.get(..6).unwrap_or_default();
+    let joint_position_observation = trace.observation.get(6..20).unwrap_or_default();
+    let joint_velocity_observation = trace.observation.get(20..34).unwrap_or_default();
+    let previous_action_observation = trace.observation.get(34..48).unwrap_or_default();
     let body_targets = trace
         .body_targets
         .as_deref()
         .map(|targets| format!("{targets:?}"))
         .unwrap_or_else(|| "none".into());
+    let raw_targets = trace
+        .raw_targets
+        .as_deref()
+        .map(|targets| format!("{targets:?}"))
+        .unwrap_or_else(|| "none".into());
     append_line(
-        &log_file(config_dir),
+        &current_log_file(config_dir),
         &format!(
-            "policy_trace tick={} phase={:?} command_twist={:?} command_head={:?} command_body=[{}, {}, {}] observation={:?} onnx_action={:?} body_targets={}",
+            "policy_trace tick={} phase={:?} stages={:?} imu_source={} imu_gyro={:?} imu_gravity={:?} imu_observation={:?} joint_position_observation={:?} joint_velocity_observation={:?} previous_action_observation={:?} command_twist={:?} command_head={:?} command_body=[{}, {}, {}] observation_len={} action_len={} observation={:?} onnx_action={:?} raw_targets={} body_targets={}",
             tick,
             trace.phase,
+            trace.stages,
+            trace.imu_source,
+            trace.imu.gyro,
+            trace.imu.gravity,
+            imu_observation,
+            joint_position_observation,
+            joint_velocity_observation,
+            previous_action_observation,
             trace.command.twist,
             trace.command.head,
             trace.command.body.z,
             trace.command.body.roll,
             trace.command.body.pitch,
+            trace.observation.len(),
+            trace.action.len(),
             trace.observation,
             trace.action,
+            raw_targets,
             body_targets
         ),
     );
 }
 
 pub(crate) fn append_control_event(config_dir: Option<&Path>, message: impl AsRef<str>) {
-    append_line(&log_file(config_dir), message.as_ref());
+    append_line(&current_log_file(config_dir), message.as_ref());
 }
 
 pub(crate) struct LoggedServoDriver {
@@ -273,7 +340,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let text = std::fs::read_to_string(log_file(Some(&config_dir))).unwrap();
+        let text = std::fs::read_to_string(current_log_file(Some(&config_dir))).unwrap();
         assert!(text.contains("servo_read id=1"));
         assert!(text.contains("servo_read id=2"));
         assert!(text.contains("servo_write id=1 target_rad=0.1"));

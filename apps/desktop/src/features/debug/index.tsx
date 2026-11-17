@@ -9,6 +9,7 @@ import type {
 } from "../../bridge/types";
 import { showMessage } from "../../components/message";
 import { ScrollArea } from "../../components/scroll-area";
+import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
 import {
   requestDuckFocus,
@@ -74,9 +75,8 @@ export function debugPhysicalMachineFor(
 /**
  * Resolve the body-to-servo mapping used by the debug view and the 3D stage.
  *
- * Physical machines do not own bindings.  Their census only describes which
- * IDs are currently online; the simulated machine mapping is the source of
- * truth used by both the debug controls and the 3D stage.
+ * The simulated machine owns the body-to-servo slot mapping.  A physical
+ * machine adds installation-specific direction overrides alongside it.
  */
 export function debugBindingFor(virtualMachine: VirtualMachine | undefined, slotId: string) {
   const virtualBindings = virtualMachine?.jointBindings ?? [];
@@ -99,7 +99,8 @@ export const DebugPage = defineComponent(() => {
   const rangeView = ref(false);
   const jointSlots = ref<string[]>([]);
   const jointRanges = ref<JointRange[]>([]);
-  const selectedRangeEndpoint = ref<{ slotId: string; endpoint: "min" | "max" } | null>(null);
+  const selectedRangeEndpoints = ref<Record<string, "min" | "max">>({});
+  const rangeEntryPose = ref<number[] | null>(null);
   const bindingConflictSignature = ref("");
   let suppressServoSelectionEvent = false;
   let poseRequestInFlight = false;
@@ -107,7 +108,6 @@ export const DebugPage = defineComponent(() => {
   const bindingOverrides = ref<Record<string, number>>({});
   const targetDraft = ref("");
   const worldPositionDraft = ref<[number, number, number]>([0, 0, 0]);
-  const bindingSelects = new Map<string, HTMLSelectElement>();
   const selectedIndex = computed(() =>
     selectedId.value === null ? 0 : Math.max(0, selectedId.value - 1),
   );
@@ -185,6 +185,7 @@ export const DebugPage = defineComponent(() => {
     stopPosePolling();
     posePollingActive = false;
     poseRequestInFlight = false;
+    store.state.rangePreview = null;
     store.state.debugPose = null;
   });
   onUnmounted(() => {
@@ -372,6 +373,11 @@ export const DebugPage = defineComponent(() => {
           })
     );
   };
+  const directionFor = (slotId: string) =>
+    selectedPhysicalMachine.value?.jointDirections?.find((binding) => binding.slotId === slotId)
+      ?.direction ??
+    bindingFor(slotId)?.direction ??
+    1;
   const physicalIdForIndex = (index: number) => {
     const slotId = jointSlots.value[index];
     return slotId
@@ -406,6 +412,31 @@ export const DebugPage = defineComponent(() => {
       else delete bindingOverrides.value[slotId];
       store.state.error = null;
       checkBindingConflict();
+    } catch (error) {
+      store.state.error = error instanceof Error ? error.message : String(error);
+    }
+  };
+  const updateDirection = async (slotId: string, direction: number) => {
+    const physical = selectedPhysicalMachine.value;
+    const virtualMachineId = store.state.selectedVirtualMachine;
+    if (!physical?.connected || !virtualMachineId) return;
+    const index = jointSlots.value.indexOf(slotId);
+    const physicalId = bindingFor(slotId)?.physicalId ?? officialServoIds[index];
+    if (physicalId === undefined) return;
+    try {
+      const updated = await desktopBackend().bindPhysicalMachine({
+        physicalMachineId: physical.id,
+        virtualMachineId,
+        slotId,
+        physicalId,
+        direction,
+      });
+      const physicalIndex = store.state.physicalMachines.findIndex(
+        (item) => item.id === updated.id,
+      );
+      if (physicalIndex >= 0) store.state.physicalMachines[physicalIndex] = updated;
+      store.state.physicalMachines = await desktopBackend().physicalMachines();
+      store.state.error = null;
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
     }
@@ -455,33 +486,46 @@ export const DebugPage = defineComponent(() => {
       store.state.error = error instanceof Error ? error.message : String(error);
     }
   };
-  const scenePose = async () => {
-    const machine = selectedPhysicalMachine.value;
-    if (machine?.connected && !store.state.loop) {
-      if (bindingConflictsFor(selectedMachine.value).length) {
-        checkBindingConflict();
-        requestDuckFocus();
-        return;
-      }
-      try {
-        store.state.debugPose = await desktopBackend().physicalMachinePose(
-          machine.id,
-          store.state.selectedVirtualMachine,
-        );
-      } catch (error) {
-        store.state.error = error instanceof Error ? error.message : String(error);
-      }
-    } else {
-      await refresh();
-    }
-    requestDuckFocus();
-  };
   const rangeFor = (slotId: string) =>
     jointRanges.value.find((range) => range.slotId === slotId) ?? {
       slotId,
       minRad: -Math.PI,
       maxRad: Math.PI,
     };
+  const rangeStateFor = (slotId: string) =>
+    store.state.jointRangeStates.find((state) => state.slotId === slotId);
+  const scenePose = () => {
+    store.state.rangePreview = jointSlots.value.map((slotId) => {
+      const range = rangeFor(slotId);
+      const endpoint = selectedRangeEndpoints.value[slotId];
+      if (endpoint === "min") return range.minRad ?? -Math.PI;
+      if (endpoint === "max") return range.maxRad ?? Math.PI;
+      return 0;
+    });
+    requestDuckFocus();
+  };
+  const toggleRangeView = () => {
+    if (rangeView.value) {
+      rangeView.value = false;
+      store.state.rangePreview = null;
+      if (rangeEntryPose.value) store.state.debugPose = [...rangeEntryPose.value];
+      rangeEntryPose.value = null;
+      return;
+    }
+    rangeEntryPose.value = [
+      ...(store.state.loop?.positions ?? store.state.debugPose ?? Array(15).fill(0)),
+    ];
+    selectedRangeEndpoints.value = {};
+    store.state.rangePreview = Array(15).fill(0);
+    rangeView.value = true;
+  };
+  const selectRangeEndpoint = (slotId: string, endpoint: "min" | "max") => {
+    const current = selectedRangeEndpoints.value[slotId];
+    const next = { ...selectedRangeEndpoints.value };
+    if (current === endpoint) delete next[slotId];
+    else next[slotId] = endpoint;
+    selectedRangeEndpoints.value = next;
+  };
 
   return () => (
     <ScrollArea className={[style.page, style.debugPage].filter(Boolean).join(" ")}>
@@ -497,14 +541,14 @@ export const DebugPage = defineComponent(() => {
         />
         <span
           class={[rangeView.value ? style.machineTitle : undefined, style.machineViewToggle]}
-          onClick={() => (rangeView.value = !rangeView.value)}
+          onClick={toggleRangeView}
         >
           肢体范围
         </span>
       </div>
       <div class={style.systemActions}>
         {rangeView.value ? (
-          <button type="button" onClick={() => void scenePose()}>
+          <button type="button" onClick={scenePose}>
             场景姿态预览
           </button>
         ) : (
@@ -551,35 +595,50 @@ export const DebugPage = defineComponent(() => {
                 onClick={() => selectServo(index + 1)}
               >
                 <span>{slotId}</span>
-                <select
-                  value={String(bindingFor(slotId)?.physicalId ?? officialServoIds[index])}
-                  ref={(element) => {
-                    // oxlint-disable-next-line no-unsafe-type-assertion
-                    if (element) bindingSelects.set(slotId, element as HTMLSelectElement);
-                    else bindingSelects.delete(slotId);
-                  }}
-                  onClick={(event: MouseEvent) => {
-                    event.stopPropagation();
-                    selectBinding(index + 1);
-                  }}
-                  onChange={() => {
-                    void updateBinding(slotId, bindingSelects.get(slotId)?.value ?? "");
-                  }}
-                >
-                  {!bindingOptionsFor(index).some(
-                    (option) =>
-                      option.id === (bindingFor(slotId)?.physicalId ?? officialServoIds[index]),
-                  ) && (
-                    <option hidden value={String(bindingFor(slotId)?.physicalId)}>
-                      {bindingFor(slotId)?.physicalId} · 当前绑定
-                    </option>
-                  )}
-                  {bindingOptionsFor(index).map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
+                <div class={style.bindingControl}>
+                  <Select
+                    value={String(bindingFor(slotId)?.physicalId ?? officialServoIds[index])}
+                    onClick={(event: MouseEvent) => {
+                      event.stopPropagation();
+                      selectBinding(index + 1);
+                    }}
+                    onChange={(event: Event) => {
+                      const value =
+                        event.currentTarget instanceof HTMLSelectElement
+                          ? event.currentTarget.value
+                          : "";
+                      void updateBinding(slotId, value);
+                    }}
+                  >
+                    {!bindingOptionsFor(index).some(
+                      (option) =>
+                        option.id === (bindingFor(slotId)?.physicalId ?? officialServoIds[index]),
+                    ) && (
+                      <option hidden value={String(bindingFor(slotId)?.physicalId)}>
+                        {bindingFor(slotId)?.physicalId} · 当前绑定
+                      </option>
+                    )}
+                    {bindingOptionsFor(index).map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </Select>
+                  <div
+                    class={style.directionButtons}
+                    onClick={(event: MouseEvent) => event.stopPropagation()}
+                  >
+                    <button
+                      type="button"
+                      disabled={!physicalConnected.value}
+                      onClick={() =>
+                        void updateDirection(slotId, directionFor(slotId) === 1 ? -1 : 1)
+                      }
+                    >
+                      {directionFor(slotId)}
+                    </button>
+                  </div>
+                </div>
               </div>
             ))}
           </div>
@@ -588,35 +647,48 @@ export const DebugPage = defineComponent(() => {
           <div class={style.rangePanel}>
             <div class={style.rangeHeader}>
               <span>肢体名</span>
-              <span>最小角度限制</span>
-              <span>最大角度限制</span>
+              <span
+                class={
+                  store.state.jointRangeStates.some((state) => state.belowMin)
+                    ? style.rangeMinTitle
+                    : undefined
+                }
+              >
+                最小角度限制
+              </span>
+              <span
+                class={
+                  store.state.jointRangeStates.some((state) => state.aboveMax)
+                    ? style.rangeMaxTitle
+                    : undefined
+                }
+              >
+                最大角度限制
+              </span>
             </div>
             {jointSlots.value.map((slotId) => {
               const range = rangeFor(slotId);
+              const rangeState = rangeStateFor(slotId);
               return (
                 <div class={style.rangeRow}>
                   <span>{slotId}</span>
                   <button
                     type="button"
-                    class={
-                      selectedRangeEndpoint.value?.slotId === slotId &&
-                      selectedRangeEndpoint.value.endpoint === "min"
-                        ? style.active
-                        : undefined
-                    }
-                    onClick={() => (selectedRangeEndpoint.value = { slotId, endpoint: "min" })}
+                    class={[
+                      selectedRangeEndpoints.value[slotId] === "min" ? style.active : undefined,
+                      rangeState?.belowMin ? style.rangeMinExceeded : undefined,
+                    ]}
+                    onClick={() => selectRangeEndpoint(slotId, "min")}
                   >
                     {(range.minRad ?? -Math.PI).toFixed(3)} rad
                   </button>
                   <button
                     type="button"
-                    class={
-                      selectedRangeEndpoint.value?.slotId === slotId &&
-                      selectedRangeEndpoint.value.endpoint === "max"
-                        ? style.active
-                        : undefined
-                    }
-                    onClick={() => (selectedRangeEndpoint.value = { slotId, endpoint: "max" })}
+                    class={[
+                      selectedRangeEndpoints.value[slotId] === "max" ? style.active : undefined,
+                      rangeState?.aboveMax ? style.rangeMaxExceeded : undefined,
+                    ]}
+                    onClick={() => selectRangeEndpoint(slotId, "max")}
                   >
                     {(range.maxRad ?? Math.PI).toFixed(3)} rad
                   </button>
@@ -883,6 +955,7 @@ export async function closeLoop() {
   const store = useDesktopStore();
   await desktopBackend().loopClose();
   store.state.loop = null;
+  store.state.jointRangeStates = [];
 }
 
 export async function officialSceneModel() {

@@ -16,6 +16,8 @@ import type {
   PhysicalMachineInput,
   PhysicalServoRegister,
   PolicyEntry,
+  TrainingProgress,
+  TrainingStartInput,
   SerialPortCandidate,
   SceneFrame,
   SceneInfo,
@@ -49,6 +51,7 @@ export interface DesktopBackend {
     virtualMachineId?: string | null;
     slotId: string;
     physicalId: number | null;
+    direction?: number | null;
   }): Promise<PhysicalMachine>;
   bindVirtualMachine(input: {
     virtualMachineId: string;
@@ -89,6 +92,9 @@ export interface DesktopBackend {
   policyDownload(id: string): Promise<PolicyEntry>;
   policySelect(id: string): Promise<PolicyEntry>;
   policyOpenFolder(): Promise<void>;
+  trainingStart(input: TrainingStartInput): Promise<TrainingProgress>;
+  trainingStop(): Promise<void>;
+  trainingStatus(): Promise<TrainingProgress | null>;
   openLogs(): Promise<void>;
   createVirtualMachine(
     input: Pick<VirtualMachine, "name" | "bodyId" | "servoModel" | "simulation">,

@@ -33,8 +33,7 @@
   }
 
   p,
-  .cardTitle span,
-  .muted {
+  .cardTitle span {
     color: $muted;
   }
 
@@ -93,6 +92,21 @@
   }
 }
 
+.external {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  color: $accent;
+  background: transparent;
+  font-size: 11px;
+  text-decoration: underline;
+
+  &:hover:not(:disabled) {
+    border: 0;
+    background: transparent;
+  }
+}
+
 .policyActions {
   display: flex;
   flex-wrap: wrap;
@@ -107,12 +121,6 @@
 }
 
 .cachedLabel {
-  color: $muted;
-  font-size: 12px;
-}
-
-.muted {
-  margin: 0;
   color: $muted;
   font-size: 12px;
 }

@@ -1,5 +1,6 @@
 import { defineComponent, onMounted, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { desktopBackend, useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
@@ -28,6 +29,19 @@ export const PolicyPage = defineComponent(() => {
       error.value = reason instanceof Error ? reason.message : String(reason);
     } finally {
       busy.value = null;
+    }
+  };
+
+  const openSource = async (url: string) => {
+    try {
+      const hasTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
+      if (hasTauriRuntime) {
+        await openUrl(url);
+      } else {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+    } catch (reason) {
+      error.value = reason instanceof Error ? reason.message : String(reason);
     }
   };
 
@@ -72,15 +86,16 @@ export const PolicyPage = defineComponent(() => {
           {store.state.policies.map((policy) => (
             <article class={style.policyRow}>
               <div class={style.policyMain}>
-                <strong>{policy.name}</strong>
-                {policy.cached ? (
-                  <>
-                    <code>{policy.file}</code>
-                    <small>{policy.size} bytes · 已缓存</small>
-                  </>
-                ) : (
-                  <small>尚未从 Hugging Face 下载</small>
-                )}
+                <button
+                  type="button"
+                  class={style.external}
+                  onClick={() =>
+                    void openSource(policy.sourceUrl.replace("/resolve/main/", "/blob/main/"))
+                  }
+                  title="打开模型页面"
+                >
+                  <code>{policy.file}</code>
+                </button>
               </div>
               <div class={style.policyActions}>
                 {policy.cached ? (
@@ -92,10 +107,6 @@ export const PolicyPage = defineComponent(() => {
             </article>
           ))}
         </div>
-        <p class={style.muted}>
-          来源：Hugging Face 的 microduck-policies，文件保存在应用缓存目录的
-          library/policies/official。
-        </p>
       </section>
     </div>
   );

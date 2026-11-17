@@ -3,6 +3,7 @@ use loop_body::{
     BodyLoop, BodyRuntimeView, Calibration, JointCalibration, LoopBinding, LoopConfig, ServoBinding,
 };
 use servo::{ServoError, ServoLoopDriver, ServoModel, ServoPositionSample, ServoPositionTargets};
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct FakeDriver {
@@ -12,6 +13,7 @@ pub struct FakeDriver {
     pub torque: Option<bool>,
     pub gains: Vec<u16>,
     pub fail_reads: usize,
+    pub events: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl FakeDriver {
@@ -19,13 +21,20 @@ impl FakeDriver {
         Self {
             positions: vec![0.0; count],
             velocities: vec![0.0; count],
+            events: Arc::new(Mutex::new(Vec::new())),
             ..Self::default()
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn event_log(&self) -> Arc<Mutex<Vec<&'static str>>> {
+        Arc::clone(&self.events)
     }
 }
 
 impl ServoLoopDriver for FakeDriver {
     fn read_positions(&mut self, _ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
+        self.events.lock().unwrap().push("read");
         if self.fail_reads > 0 {
             self.fail_reads -= 1;
             return Err(ServoError::Bus("fake disconnect".into()));
@@ -41,17 +50,20 @@ impl ServoLoopDriver for FakeDriver {
         _ids: &[u8],
         targets: &ServoPositionTargets,
     ) -> Result<(), ServoError> {
+        self.events.lock().unwrap().push("write");
         self.positions = targets.positions.clone();
         self.writes.push(targets.positions.clone());
         Ok(())
     }
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ServoError> {
+        self.events.lock().unwrap().push("torque");
         self.torque = Some(enabled);
         Ok(())
     }
 
     fn set_gain(&mut self, gain: u16) -> Result<(), ServoError> {
+        self.events.lock().unwrap().push("gain");
         self.gains.push(gain);
         Ok(())
     }
@@ -63,6 +75,8 @@ impl ServoLoopDriver for FakeDriver {
 
 pub fn binding(model: ServoModel, count: usize) -> LoopBinding {
     let body = BodyTemplate::official().unwrap();
+    let body_id = body.id.clone();
+    let body_version = body.version;
     let ids: Vec<_> = (1..=count as u8).collect();
     let slots: Vec<_> = body.actuators.iter().map(|slot| slot.id.clone()).collect();
     LoopBinding {
@@ -72,6 +86,8 @@ pub fn binding(model: ServoModel, count: usize) -> LoopBinding {
             slot_ids: slots.clone(),
         },
         calibration: Calibration {
+            body_id,
+            body_version,
             joints: slots
                 .into_iter()
                 .zip(ids)

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use duck_body::{BodyError, BodyTemplate, ServoParameterSet};
+use duck_body::{BodyBinding, BodyError, BodyProfile, BodyTemplate, ServoParameterSet};
 use serde::{Deserialize, Serialize};
 use servo::ServoModel;
 use thiserror::Error;
@@ -57,9 +57,14 @@ pub enum LoopPhase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopConfig {
     pub period: Duration,
+    /// Startup sensor-hold ticks. Zero skips the physical homing phase, which is useful for a
+    /// virtual driver whose initial positions are already known.
     pub homing_ticks: u32,
     pub sensor_failure_limit: u32,
     pub gain: u16,
+    /// Clamp requested body targets before writing to a physical driver. Virtual previews keep
+    /// this disabled so the scene can show the requested out-of-range posture while reporting it.
+    pub enforce_body_range: bool,
 }
 
 impl Default for LoopConfig {
@@ -69,6 +74,7 @@ impl Default for LoopConfig {
             homing_ticks: 5,
             sensor_failure_limit: 3,
             gain: 200,
+            enforce_body_range: true,
         }
     }
 }
@@ -76,19 +82,24 @@ impl Default for LoopConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyRuntimeView {
     template: BodyTemplate,
+    profile: BodyProfile,
 }
 
 impl BodyRuntimeView {
     pub fn new(template: BodyTemplate) -> Result<Self, LoopError> {
-        template.validate()?;
+        let profile = BodyProfile::from_template(template.clone())?;
         if template.actuators.is_empty() {
             return Err(LoopError::NoActuators);
         }
-        Ok(Self { template })
+        Ok(Self { template, profile })
     }
 
     pub fn template(&self) -> &BodyTemplate {
         &self.template
+    }
+
+    pub fn profile(&self) -> &BodyProfile {
+        &self.profile
     }
 }
 
@@ -125,92 +136,8 @@ impl ServoBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct JointCalibration {
-    pub slot_id: String,
-    pub physical_id: u8,
-    pub direction: i8,
-    pub zero_offset_rad: f64,
-    pub min_rad: Option<f64>,
-    pub max_rad: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Calibration {
-    pub joints: Vec<JointCalibration>,
-}
-
-impl Calibration {
-    /// The driver order is always the body actuator order.  This is the boundary
-    /// between canonical simulation/ONNX slots and machine-specific servo IDs.
-    pub fn physical_ids(&self) -> Vec<u8> {
-        self.joints.iter().map(|joint| joint.physical_id).collect()
-    }
-
-    pub fn to_servo_positions(&self, positions: &[f64]) -> Vec<f64> {
-        positions
-            .iter()
-            .zip(&self.joints)
-            .map(|(position, calibration)| {
-                let bounded = match (calibration.min_rad, calibration.max_rad) {
-                    (Some(min), Some(max)) => position.clamp(min, max),
-                    (Some(min), None) => position.max(min),
-                    (None, Some(max)) => position.min(max),
-                    (None, None) => *position,
-                };
-                (bounded + calibration.zero_offset_rad) * f64::from(calibration.direction)
-            })
-            .collect()
-    }
-
-    pub fn to_body_positions(&self, positions: &[f64]) -> Vec<f64> {
-        positions
-            .iter()
-            .zip(&self.joints)
-            .map(|(position, calibration)| {
-                *position * f64::from(calibration.direction) - calibration.zero_offset_rad
-            })
-            .collect()
-    }
-
-    pub(crate) fn validate(&self, template: &BodyTemplate) -> Result<(), LoopError> {
-        let expected: Vec<_> = template
-            .actuators
-            .iter()
-            .map(|slot| slot.id.clone())
-            .collect();
-        let actual: Vec<_> = self
-            .joints
-            .iter()
-            .map(|joint| joint.slot_id.clone())
-            .collect();
-        if actual != expected {
-            return Err(LoopError::CalibrationSlotsMismatch);
-        }
-        for joint in &self.joints {
-            if !matches!(joint.direction, -1 | 1) {
-                return Err(LoopError::InvalidDirection {
-                    slot: joint.slot_id.clone(),
-                    direction: joint.direction,
-                });
-            }
-            if !joint.zero_offset_rad.is_finite() {
-                return Err(LoopError::NonFiniteOffset {
-                    slot: joint.slot_id.clone(),
-                });
-            }
-            if joint.min_rad.is_some_and(|value| !value.is_finite())
-                || joint.max_rad.is_some_and(|value| !value.is_finite())
-                || matches!((joint.min_rad, joint.max_rad), (Some(min), Some(max)) if min > max)
-            {
-                return Err(LoopError::NonFiniteOffset {
-                    slot: joint.slot_id.clone(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
+pub use duck_body::JointCalibration;
+pub type Calibration = BodyBinding;
 
 #[cfg(test)]
 mod calibration_tests {
@@ -219,6 +146,8 @@ mod calibration_tests {
     #[test]
     fn canonical_slots_translate_to_bound_machine_ids() {
         let calibration = Calibration {
+            body_id: String::new(),
+            body_version: 0,
             joints: vec![
                 JointCalibration {
                     slot_id: "left_hip_yaw".into(),
@@ -245,11 +174,15 @@ mod calibration_tests {
         let body = calibration.to_body_positions(&servo);
         assert!((body[0] - 0.5).abs() < 1e-9);
         assert!((body[1] - 0.25).abs() < 1e-9);
+        assert_eq!(calibration.to_body_velocities(&[0.0, 0.0]), vec![0.0, 0.0]);
+        assert_eq!(calibration.to_body_velocities(&[2.0, 3.0]), vec![-2.0, 3.0]);
     }
 
     #[test]
     fn installation_range_clamps_servo_targets() {
         let calibration = Calibration {
+            body_id: String::new(),
+            body_version: 0,
             joints: vec![JointCalibration {
                 slot_id: "left_hip_yaw".into(),
                 physical_id: 42,
@@ -276,6 +209,24 @@ pub struct BodyCommand {
     pub targets: Vec<f64>,
 }
 
+/// Canonical sensor frame exposed by the adapter boundary. Values are already
+/// in body order and body coordinates; policy/controller code never sees IDs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensorFrame {
+    pub positions: Vec<f64>,
+    pub velocities: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointRangeState {
+    pub slot_id: String,
+    pub target_rad: f64,
+    pub min_rad: f64,
+    pub max_rad: f64,
+    pub below_min: bool,
+    pub above_max: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopAction {
     Power(bool),
@@ -295,4 +246,5 @@ pub struct LoopStatus {
     pub targets: Vec<f64>,
     pub sensor_failures: u32,
     pub last_error: Option<String>,
+    pub joint_range_states: Vec<JointRangeState>,
 }

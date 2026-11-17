@@ -33,6 +33,16 @@ fn power_homing_ready_drive_hold_and_stop_are_explicit() {
 }
 
 #[test]
+fn homing_holds_the_measured_canonical_pose() {
+    let mut driver = FakeDriver::new(15);
+    driver.positions[1] = 0.05;
+    let mut body_loop = loop_with(driver);
+    body_loop.send(LoopAction::Power(true)).unwrap();
+    body_loop.tick(Duration::from_millis(20)).unwrap();
+    assert_eq!(body_loop.status().targets[1], 0.05);
+}
+
+#[test]
 fn calibration_direction_and_zero_are_applied_after_body_targets() {
     let mut binding = binding(ServoModel::Hd1910, 15);
     binding.calibration.joints[0].direction = -1;
@@ -110,7 +120,7 @@ fn stale_session_and_nonfinite_target_are_rejected() {
 }
 
 #[test]
-fn body_range_is_checked_before_a_servo_write() {
+fn physical_body_range_is_logged_in_status_and_clamped_before_a_servo_write() {
     let mut body_loop = loop_with(FakeDriver::new(15));
     body_loop.send(LoopAction::Power(true)).unwrap();
     body_loop.tick(Duration::from_millis(20)).unwrap();
@@ -124,10 +134,38 @@ fn body_range_is_checked_before_a_servo_write() {
             targets,
         })
         .unwrap();
-    assert!(matches!(
-        body_loop.tick(Duration::from_millis(20)),
-        Err(LoopError::Body(_))
-    ));
+    body_loop.tick(Duration::from_millis(20)).unwrap();
+    let status = body_loop.status();
+    assert!((status.targets[0] - std::f64::consts::FRAC_PI_6).abs() < 1e-12);
+    assert!(status.joint_range_states[0].above_max);
+}
+
+#[test]
+fn virtual_preview_keeps_out_of_range_target_for_scene_feedback() {
+    let mut body_loop = BodyLoop::open(
+        binding(ServoModel::Hd1910, 15),
+        Box::new(FakeDriver::new(15)),
+        LoopConfig {
+            homing_ticks: 0,
+            enforce_body_range: false,
+            ..LoopConfig::default()
+        },
+    )
+    .unwrap();
+    body_loop.send(LoopAction::Power(true)).unwrap();
+    body_loop.send(LoopAction::Drive(true)).unwrap();
+    let mut targets = vec![0.0; 15];
+    targets[0] = 99.0;
+    body_loop
+        .set_command(BodyCommand {
+            session: 0,
+            targets,
+        })
+        .unwrap();
+    body_loop.tick(Duration::from_millis(20)).unwrap();
+    let status = body_loop.status();
+    assert_eq!(status.targets[0], 99.0);
+    assert!(status.joint_range_states[0].above_max);
 }
 
 #[test]

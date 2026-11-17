@@ -27,10 +27,10 @@ pnpm dev
 
 ### 自定义哪些部分
 
-- 
+-
 
 ---
 
-核心开发约定见 [.rules](.rules)  
+核心开发约定见 [AGENTS](AGENTS.md)
 
 每个 crate 的作用自行查看`Cargo.toml`~`description`

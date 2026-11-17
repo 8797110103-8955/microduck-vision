@@ -202,6 +202,36 @@ describe("desktop to loop data flow", () => {
     expect(backend.calls.map((call) => call.name)).not.toContain("loopOpen");
   });
 
+  it("keeps training runs, metadata, and progress isolated per runtime", async () => {
+    const first = new MemoryBackend(memoryServoCatalog);
+    const second = new MemoryBackend(memoryServoCatalog);
+    const input = {
+      program: "uv",
+      args: ["run", "train", "task-a"],
+      workingDir: "vendor/microduck_rl",
+      virtualMachineId: "official-hd1910",
+      policyId: "alpha-walking",
+      experimentId: null,
+      recipe: "student-distillation",
+      teacherMotionProvenance: "teacher:official-motion",
+    };
+
+    const firstProgress = await first.trainingStart(input);
+    const secondProgress = await second.trainingStart({
+      ...input,
+      args: ["run", "train", "task-b"],
+      recipe: "stand-recovery",
+    });
+
+    expect(firstProgress.runId).not.toBe(secondProgress.runId);
+    expect(firstProgress.metadata.recipe).toBe("student-distillation");
+    expect(secondProgress.metadata.recipe).toBe("stand-recovery");
+    await first.trainingStop();
+    expect((await first.trainingStatus())?.phase).toBe("stopped");
+    expect((await second.trainingStatus())?.phase).toBe("starting");
+    expect((await second.trainingStatus())?.runId).toBe(secondProgress.runId);
+  });
+
   it("selects a cached official policy and opens a simulation loop without a motor", async () => {
     const backend = new MemoryBackend(memoryServoCatalog);
     const app = setup(backend);

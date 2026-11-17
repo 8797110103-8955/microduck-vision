@@ -1,0 +1,38 @@
+import { defineComponent, useAttrs } from "vue";
+import style from "./style.module.scss";
+
+/** Native select with one shared shell and option content supplied by the caller. */
+export const Select = defineComponent({
+  name: "Select",
+  inheritAttrs: false,
+  props: {
+    value: { type: [String, Number], default: undefined },
+    disabled: { type: Boolean, default: false },
+    onChange: Function,
+    onClick: Function,
+  },
+  setup(props, { slots }) {
+    const attrs = useAttrs();
+    return () => {
+      const { class: className, ...selectAttrs } = attrs;
+      return (
+        <span class={[style.select, className]}>
+          <select
+            {...selectAttrs}
+            value={props.value}
+            disabled={props.disabled}
+            onChange={(event: Event) => {
+              if (typeof props.onChange === "function") props.onChange(event);
+            }}
+            onClick={(event: PointerEvent) => {
+              if (typeof props.onClick === "function") props.onClick(event);
+            }}
+          >
+            {slots.default?.()}
+          </select>
+          <span class={style.chevron} aria-hidden="true" />
+        </span>
+      );
+    };
+  },
+});

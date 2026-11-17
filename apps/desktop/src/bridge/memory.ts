@@ -16,6 +16,9 @@ import type {
   SceneFrame,
   ServoCatalogEntry,
   ServoModelKey,
+  TrainingProgress,
+  TrainingRunMetadata,
+  TrainingStartInput,
   VirtualMachine,
 } from "./types";
 import type { DesktopBackend } from "./types";
@@ -32,6 +35,8 @@ function simulationFor(catalog: ServoCatalogEntry[], model: ServoModelKey) {
     worldPosition: [0, 0, 0] as [number, number, number],
   };
 }
+
+let memoryTrainingRunSequence = 0;
 
 function sameCensus(a: PhysicalMachine["census"], b: PhysicalMachine["census"]) {
   const leftCensus = a ?? [];
@@ -213,141 +218,23 @@ export class MemoryBackend implements DesktopBackend {
     targetDistanceM: null,
   };
   private previewCommandEncoding: string | null = null;
-  private policies: PolicyEntry[] = [
-    {
-      id: "alpha-walking",
-      name: "Alpha Walking",
-      file: "alpha_walking.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_walking.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-      kind: "perpetual",
-      slot: "walk",
-    },
-    {
-      id: "velstand",
-      name: "Velstand（行走与站立）",
-      file: "velstand.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/velstand.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-      kind: "perpetual",
-      slot: "walk",
-    },
-    {
-      id: "alpha-stand",
-      name: "Alpha Stand",
-      file: "alpha_stand.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_stand.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-      kind: "perpetual",
-      slot: "stand",
-    },
-    {
-      id: "roller",
-      name: "Roller",
-      file: "roller.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roller.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-    },
-    {
-      id: "alpha-sitstand",
-      name: "Sitstand",
-      file: "alpha_sitstand.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_sitstand.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-      kind: "scripted",
-      command: {
-        slot: null,
-        encoding: "posture_flag",
-        idle: [0, 0, 0],
-        twist: null,
-        head: null,
-        body: null,
-        periodS: null,
-        endPhase: null,
-        sit: 1,
-        stand: 0,
-      },
-    },
-    {
-      id: "alpha-ground-pick",
-      name: "Ground Pick",
-      file: "alpha_ground_pick.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/alpha_ground_pick.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-      kind: "episodic",
-      durationS: 2.8,
-      command: {
-        slot: null,
-        encoding: "phase",
-        idle: [0, 0, 0],
-        twist: null,
-        head: null,
-        body: null,
-        periodS: 4,
-        endPhase: 0.7,
-        sit: null,
-        stand: null,
-      },
-    },
-    {
-      id: "roller-crouch",
-      name: "Crouch",
-      file: "roller_crouch.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roller_crouch.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-    },
-    {
-      id: "roulade",
-      name: "Roulade",
-      file: "roulade.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/roulade.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-    },
-    {
-      id: "ball-kick-left",
-      name: "Kick Left",
-      file: "ball_kick_left.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/ball_kick_left.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-    },
-    {
-      id: "ball-kick-right",
-      name: "Kick Right",
-      file: "ball_kick_right.onnx",
-      sourceUrl:
-        "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/ball_kick_right.onnx",
-      cached: false,
-      selected: false,
-      size: 0,
-    },
+  private trainingProgress: TrainingProgress | null = null;
+  private readonly policyFiles = [
+    "alpha_walking.onnx",
+    "velstand.onnx",
+    "alpha_stand.onnx",
+    "roller.onnx",
+    "alpha_sitstand.onnx",
+    "alpha_ground_pick.onnx",
+    "roller_crouch.onnx",
+    "roulade.onnx",
+    "ball_kick_left.onnx",
+    "ball_kick_right.onnx",
   ];
+  private readonly policyState = new Map<
+    string,
+    { cached: boolean; selected: boolean; size: number }
+  >();
 
   private readonly catalog: ServoCatalogEntry[];
 
@@ -436,6 +323,7 @@ export class MemoryBackend implements DesktopBackend {
     this.calls.push({ name: "physicalMachines" });
     return this.physical.map((machine) => ({
       ...machine,
+      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     }));
   }
@@ -528,11 +416,13 @@ export class MemoryBackend implements DesktopBackend {
       onlineServoIds: detected.census.map((servo) => servo.servoId),
       connected: true,
       lastSeen: "刚刚",
+      jointDirections: [],
     };
     this.physical.push(machine);
     return {
       ...machine,
       census: [...(machine.census ?? [])],
+      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     };
   }
@@ -545,6 +435,7 @@ export class MemoryBackend implements DesktopBackend {
     return {
       ...machine,
       census: [...(machine.census ?? [])],
+      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     };
   }
@@ -590,6 +481,7 @@ export class MemoryBackend implements DesktopBackend {
       onlineServoIds: [],
       connected: false,
       lastSeen: null,
+      jointDirections: [],
     };
     this.calls.push({ name: "createPhysicalMachine", value: machine });
     this.physical.push(machine);
@@ -632,6 +524,7 @@ export class MemoryBackend implements DesktopBackend {
     virtualMachineId?: string | null;
     slotId: string;
     physicalId: number | null;
+    direction?: number | null;
   }) {
     this.calls.push({ name: "bindPhysicalMachine", value: input });
     const machine = this.physical.find((entry) => entry.id === input.physicalMachineId);
@@ -655,7 +548,20 @@ export class MemoryBackend implements DesktopBackend {
       });
     }
     virtualMachine.jointBindings = bindings;
-    return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
+    if (input.direction !== undefined && input.direction !== null) {
+      if (input.direction !== 1 && input.direction !== -1)
+        throw new Error(`invalid joint direction: ${input.direction}`);
+      const directions = (machine.jointDirections ?? []).filter(
+        (binding) => binding.slotId !== input.slotId,
+      );
+      directions.push({ slotId: input.slotId, direction: input.direction });
+      machine.jointDirections = directions;
+    }
+    return {
+      ...machine,
+      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
+      onlineServoIds: [...machine.onlineServoIds],
+    };
   }
 
   async bindVirtualMachine(input: {
@@ -840,30 +746,105 @@ export class MemoryBackend implements DesktopBackend {
 
   async policyList() {
     this.calls.push({ name: "policyList" });
-    return this.policies.map((policy) => ({ ...policy }));
+    return this.policyEntries();
   }
 
   async policyDownload(id: string) {
     this.calls.push({ name: "policyDownload", value: id });
-    const policy = this.policies.find((entry) => entry.id === id);
+    const policy = this.policyEntries().find((entry) => entry.id === id);
     if (!policy) throw new Error(`unknown policy: ${id}`);
-    policy.cached = true;
-    policy.size = 42;
-    policy.selected = true;
-    this.policies.forEach((entry) => (entry.selected = entry.id === id));
-    return { ...policy };
+    this.policyState.set(policy.file, { cached: true, selected: true, size: 42 });
+    this.policyFiles.forEach((file) => {
+      if (file !== policy.file) {
+        const state = this.policyState.get(file);
+        if (state) this.policyState.set(file, { ...state, selected: false });
+      }
+    });
+    return this.policyEntries().find((entry) => entry.id === id)!;
   }
 
   async policySelect(id: string) {
     this.calls.push({ name: "policySelect", value: id });
-    const policy = this.policies.find((entry) => entry.id === id);
+    const policy = this.policyEntries().find((entry) => entry.id === id);
     if (!policy?.cached) throw new Error("请先下载这个官方策略");
-    this.policies.forEach((entry) => (entry.selected = entry.id === id));
-    return { ...policy, selected: true };
+    this.policyFiles.forEach((file) => {
+      const state = this.policyState.get(file);
+      if (state) this.policyState.set(file, { ...state, selected: file === policy.file });
+    });
+    return this.policyEntries().find((entry) => entry.id === id)!;
+  }
+
+  private policyEntries(): PolicyEntry[] {
+    return this.policyFiles.map((file) => {
+      const state = this.policyState.get(file) ?? { cached: false, selected: false, size: 0 };
+      const id = file.slice(0, -".onnx".length).replaceAll("_", "-");
+      return {
+        id,
+        name: file,
+        file,
+        sourceUrl: `https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/${file}`,
+        ...state,
+      };
+    });
   }
 
   async policyOpenFolder() {
     this.calls.push({ name: "policyOpenFolder" });
+  }
+
+  async trainingStart(input: TrainingStartInput) {
+    this.calls.push({ name: "trainingStart", value: input });
+    if (!input.virtualMachineId) throw new Error("训练必须选择模拟机");
+    if (!input.recipe.trim()) throw new Error("训练 recipe 不能为空");
+    if (!input.teacherMotionProvenance.trim())
+      throw new Error("训练 teacher/motion provenance 不能为空");
+    const runId = `memory-training-${++memoryTrainingRunSequence}`;
+    const policy = input.policyId
+      ? this.policyEntries().find((entry) => entry.id === input.policyId)
+      : undefined;
+    const metadata: TrainingRunMetadata = {
+      experimentId: input.experimentId?.trim() || runId,
+      bodyTemplateId: "official",
+      bodyVersion: 1,
+      bodySourceHash: "memory",
+      policyId: input.policyId ?? null,
+      policyLayout: {
+        obsLen: 61,
+        actionLen: 14,
+        controlHz: 50,
+        commandEncoding: policy?.command?.encoding ?? null,
+      },
+      servoProfile: "hd1910",
+      recipe: input.recipe.trim(),
+      teacherMotionProvenance: input.teacherMotionProvenance.trim(),
+    };
+    this.trainingProgress = {
+      runId,
+      resultDir: `memory://training/${runId}`,
+      metadata,
+      phase: "starting",
+      step: null,
+      totalSteps: null,
+      percent: null,
+      reward: null,
+      loss: null,
+      message: "模拟训练已启动",
+      line: "",
+      exitCode: null,
+    };
+    return { ...this.trainingProgress };
+  }
+
+  async trainingStop() {
+    this.calls.push({ name: "trainingStop" });
+    if (this.trainingProgress) {
+      this.trainingProgress = { ...this.trainingProgress, phase: "stopped", message: "训练已停止" };
+    }
+  }
+
+  async trainingStatus() {
+    this.calls.push({ name: "trainingStatus" });
+    return this.trainingProgress ? { ...this.trainingProgress } : null;
   }
 
   async createVirtualMachine(
@@ -960,6 +941,7 @@ export class MemoryBackend implements DesktopBackend {
       world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
+      jointRangeStates: [],
     };
     return this.status;
   }
@@ -1040,6 +1022,7 @@ export class MemoryBackend implements DesktopBackend {
       world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
       lastError: null,
+      jointRangeStates: [],
     };
     this.previewCommandEncoding = null;
     return {
@@ -1052,7 +1035,7 @@ export class MemoryBackend implements DesktopBackend {
   async previewLoopPolicy(id: string) {
     this.calls.push({ name: "previewLoopPolicy", value: id });
     if (!this.previewStatus) throw new Error("preview loop is closed");
-    const policy = this.policies.find((entry) => entry.id === id);
+    const policy = this.policyEntries().find((entry) => entry.id === id);
     if (!policy?.cached) throw new Error("请先下载这个官方策略");
     this.previewCommandEncoding = policy.command?.encoding ?? null;
     this.previewStatus = { ...this.previewStatus, torque: true, lastError: null };

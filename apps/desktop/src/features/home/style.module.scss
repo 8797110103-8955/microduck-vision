@@ -21,7 +21,7 @@
   inset: 72px 16px 32px 50vw;
   z-index: 20;
   min-height: 0;
-  padding: 30px 32px;
+  padding: 30px 32px 0;
   border: 1px solid $border;
   border-radius: 12px;
   background: $background;
@@ -60,6 +60,11 @@
     color: $text;
     text-decoration: underline;
   }
+
+  &.syncOn {
+    color: $accent;
+    font-weight: 600;
+  }
 }
 
 .previewLoopBar {
@@ -67,7 +72,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 18px;
+  margin-bottom: 32px;
 
   button {
     padding: 6px 12px;

@@ -205,6 +205,7 @@ dependencies = [
  "kinematics",
  "roxmltree",
  "serde",
+ "serde_json",
  "servo",
  "specta",
  "thiserror",
@@ -389,6 +390,7 @@ dependencies = [
  "duck-body",
  "duck-control",
  "serde",
+ "serde_json",
  "servo",
  "thiserror",
 ]
