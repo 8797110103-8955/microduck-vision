@@ -295,26 +295,28 @@ pub fn servo_profiles() -> Vec<ServoProfile> {
     xl.datasheet_torque_constant = None;
     xl.no_load_speed_rpm = None;
     xl.peak_stall_torque_kg_cm = None;
-    xl.bam_vin = 7.5;
-    xl.bam_kp = 400.0;
+    // Keep these values in lockstep with vendor/microduck_rl's BAM M6 model and
+    // infer_policy.py CPU reference. The deployed policy overrides firmware kp to 200.
+    xl.bam_vin = 7.4;
+    xl.bam_kp = 200.0;
     xl.bam_error_gain = 0.00287737750222636;
     xl.bam_max_pwm = 1.0;
-    xl.bam_kt = 0.3459739511711113;
-    xl.bam_resistance = 2.501880848390462;
-    xl.bam_armature = 0.0015732226779339757;
-    xl.bam_q_offset = 0.01499659309559756;
+    xl.bam_kt = 0.36601349688984386;
+    xl.bam_resistance = 2.8113923539223227;
+    xl.bam_armature = 0.0018077432831600838;
+    xl.bam_q_offset = 0.0271132870444849;
     xl.bam_command_delay = 0.010220594809412403;
-    xl.bam_friction_base = 0.011919956825702578;
-    xl.bam_friction_stribeck = 0.0008513719673776765;
-    xl.bam_friction_viscous = 0.005788445053875673;
-    xl.bam_load_friction_motor = 0.22781736172050673;
-    xl.bam_load_friction_external = 0.10651211228971481;
-    xl.bam_load_friction_motor_stribeck = 1.4725366831870136e-8;
-    xl.bam_load_friction_external_stribeck = 0.14201808120858034;
-    xl.bam_load_friction_motor_quad = 0.00526632315329998;
-    xl.bam_load_friction_external_quad = 0.00298581585293041;
-    xl.bam_dtheta_stribeck = 0.2606668812858925;
-    xl.bam_alpha = 8.528815753151498;
+    xl.bam_friction_base = 0.004771183165566;
+    xl.bam_friction_stribeck = 0.004676345799486616;
+    xl.bam_friction_viscous = 0.005359668274599504;
+    xl.bam_load_friction_motor = 0.2667860954283698;
+    xl.bam_load_friction_external = 8.515871897059342e-06;
+    xl.bam_load_friction_motor_stribeck = 1.0722918395099123e-05;
+    xl.bam_load_friction_external_stribeck = 0.08077928978935671;
+    xl.bam_load_friction_motor_quad = 0.009972471242139415;
+    xl.bam_load_friction_external_quad = 0.004902565732332559;
+    xl.bam_dtheta_stribeck = 2.890372094130307;
+    xl.bam_alpha = 8.683259907618984;
 
     let hd = &mut profiles[1];
     hd.hardware_mass_g = Some(21.0);

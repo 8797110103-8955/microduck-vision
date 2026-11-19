@@ -1,4 +1,4 @@
-import type { ServoCatalogEntry, ServoModelKey } from "../../src/bridge";
+import type { ServoCatalogEntry, ServoModelKey } from "../../generated/types";
 
 // The browser-only backend only needs the simulation fields used by data-flow tests.
 // Production catalog values are supplied by duck-body through the Tauri command.

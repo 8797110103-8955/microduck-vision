@@ -1,0 +1,2 @@
+[env]
+DUCK_RELEASE_OUTPUT = { value = "target/bin", relative = true, force = true }

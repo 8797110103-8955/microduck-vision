@@ -1,16 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { mockMemoryCommands } from "./mock-commands";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { MemoryBackend } from "../../src/bridge";
-import { configureDesktopBackend, useDesktopStore } from "../../src/store";
-import {
-  createAction,
-  deleteAction,
-  load,
-  openLoop,
-  sendAction,
-  sendTargets,
-  tick,
-} from "../../src/features/debug";
+import { MemoryBackend } from "./memory";
+import { useDesktopStore } from "../../src/store";
+import { createAction, deleteAction, load, openLoop } from "../../src/features/debug";
 import {
   connectPhysicalMachine,
   createPhysicalMachine,
@@ -30,12 +23,13 @@ import {
 import { memoryServoCatalog } from "../fixtures/servoCatalog.fixture";
 
 function setup(backend: MemoryBackend) {
-  configureDesktopBackend(backend);
+  mockMemoryCommands(backend);
   setActivePinia(createPinia());
   return useDesktopStore();
 }
 
 describe("desktop to loop data flow", () => {
+  afterEach(() => vi.restoreAllMocks());
   it("keeps virtual-machine bindings when no physical machine exists", async () => {
     const backend = new MemoryBackend(memoryServoCatalog);
     const app = setup(backend);
@@ -240,19 +234,10 @@ describe("desktop to loop data flow", () => {
     const policy = await backend.policyDownload("velstand");
     app.state.policies = await backend.policyList();
     app.state.selectedPolicyId = policy.id;
-    await openLoop(
-      Array.from({ length: 15 }, (_, index) => index + 1),
-      undefined,
-      policy.id,
-    );
-
-    expect(app.state.loop?.phase).toBe("limp");
-    expect(backend.calls.at(-1)).toMatchObject({
-      name: "loopOpen",
-      value: { policyId: "velstand" },
-    });
+    app.state.previewLoop = await backend.previewLoopOpen("official-hd1910");
+    app.state.previewLoop = await backend.previewLoopPolicy(policy.id);
+    expect(backend.calls.at(-1)).toMatchObject({ name: "previewLoopPolicy", value: "velstand" });
   });
-
   it("loads servo catalog, selects a virtual machine, drives the loop, and estops", async () => {
     const backend = new MemoryBackend(memoryServoCatalog);
     const app = setup(backend);
@@ -272,19 +257,25 @@ describe("desktop to loop data flow", () => {
       onlineServoIds: [1, 2],
       virtualMachineId: virtualMachine.id,
     });
-    await openLoop([1, 2]);
-    await sendAction({ kind: "power", on: true });
-    for (let index = 0; index < 5; index += 1) await tick();
+    app.state.loop = await backend.loopOpen({
+      virtualMachineId: virtualMachine.id,
+      physicalMachineId: physicalMachine.id,
+      access: "control",
+      policyId: "velstand",
+    });
+    app.state.loop = await backend.loopAction({ kind: "power", on: true });
+    for (let index = 0; index < 5; index += 1) app.state.loop = await backend.loopTick();
     expect(app.state.loop?.phase).toBe("ready");
 
-    await sendAction({ kind: "drive", on: true });
-    await sendTargets([0.25, -0.25]);
-    await tick();
+    app.state.loop = await backend.loopAction({ kind: "drive", on: true });
+    await backend.loopCommand([0.25, -0.25]);
+    app.state.loop = await backend.loopStatus();
+    app.state.loop = await backend.loopTick();
     expect(app.state.loop?.phase).toBe("driving");
     expect(app.state.loop?.targets).toEqual([0.25, -0.25]);
     expect(app.state.loop?.positions).toEqual([0.25, -0.25]);
 
-    await sendAction({ kind: "estop" });
+    app.state.loop = await backend.loopAction({ kind: "estop" });
     expect(app.state.loop?.phase).toBe("estop");
     expect(app.state.loop?.torque).toBe(false);
     expect(backend.calls.map((call) => call.name)).toEqual([
@@ -320,7 +311,7 @@ describe("desktop to loop data flow", () => {
     setup(backend);
     await load();
     await deleteVirtualMachine("official-hd1910");
-    await expect(openLoop([1])).rejects.toThrow("请选择模拟机");
+    await expect(openLoop("physical-test")).rejects.toThrow("请选择模拟机");
   });
 
   it("clears a physical machine cache without deleting its virtual template", async () => {

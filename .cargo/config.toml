@@ -1,2 +1,15 @@
 [build]
-target-dir = "target"
+target-dir = "target/generate"
+
+[alias]
+release-desktop = [
+    "rustc",
+    "--config", ".cargo/desktop-release.toml",
+    "--manifest-path", "apps/desktop/src-tauri/Cargo.toml",
+    "--release",
+    "--bin", "microduck-vision",
+    "--features", "tauri/custom-protocol",
+    "--",
+    "--emit=link=../../../target/bin/microduck-vision.exe",
+    "-Clink-arg=/PDB:../../../target/generate/release/microduck_vision.pdb",
+]

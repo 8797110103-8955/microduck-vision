@@ -1,15 +1,15 @@
+import * as commands from "../../../generated/types";
 import { defineComponent, onMounted, ref, shallowRef, watch } from "vue";
 import type {
-  DesktopBackend,
   PhysicalMachineDetectInput,
   PhysicalMachineProbeInput,
   PhysicalMachineReconnectInput,
   PhysicalMachineSaveInput,
   PhysicalServoRegister,
-} from "../../bridge/types";
+} from "../../../generated/types";
 import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
 const registerRowKey = (id: string, row: PhysicalServoRegister) =>
@@ -182,12 +182,15 @@ export const PhysicalMachinesPage = defineComponent(() => {
     registerLoading.value[id] = true;
     delete registerErrors.value[id];
     try {
-      registerRows.value[id] = await desktopBackend().physicalMachineRegisters(id);
+      registerRows.value[id] = await commands.physicalMachineRegisters(id);
     } catch (error) {
       registerErrors.value[id] = error instanceof Error ? error.message : String(error);
     } finally {
       registerLoading.value[id] = false;
     }
+  };
+  const syncPhysicalParameters = async (id: string) => {
+    await loadRegisters(id);
   };
   const toggle = (id: string) => {
     const expanding = collapsed.value.includes(id);
@@ -201,7 +204,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
     const value = Number(registerDrafts.value[key] ?? row.value);
     if (!Number.isFinite(value)) return;
     try {
-      const updated = await desktopBackend().writePhysicalMachineRegister({
+      const updated = await commands.physicalMachineWriteRegister({
         physicalMachineId: machineId,
         servoId: row.servoId,
         name: row.name,
@@ -212,10 +215,10 @@ export const PhysicalMachinesPage = defineComponent(() => {
         // machine binding that points at that ID. Reload both caches and the
         // register rows so no stale row key survives the rename.
         [store.state.physicalMachines, store.state.virtualMachines] = await Promise.all([
-          desktopBackend().physicalMachines(),
-          desktopBackend().virtualMachines(),
+          commands.physicalMachines(),
+          commands.virtualMachines(),
         ]);
-        registerRows.value[machineId] = await desktopBackend().physicalMachineRegisters(machineId);
+        registerRows.value[machineId] = await commands.physicalMachineRegisters(machineId);
       } else {
         registerRows.value[machineId] = (registerRows.value[machineId] ?? []).map((entry) =>
           registerRowKey(machineId, entry) === key ? updated : entry,
@@ -398,7 +401,13 @@ export const PhysicalMachinesPage = defineComponent(() => {
           <div class={[style.panelCard, style.emptyState]}>未检测到实机连接 &amp; 无历史缓存</div>
         ) : (
           store.state.physicalMachines.map((machine) => (
-            <article class={[style.physicalMachineRow, machine.connected && style.connected]}>
+            <article
+              class={[
+                style.physicalMachineRow,
+                machine.connected && style.connected,
+                registerErrors.value[machine.id] && style.hasError,
+              ]}
+            >
               <div class={style.physicalMachineSummary}>
                 <button
                   class={[style.physicalExpand, isExpanded(machine.id) && style.expanded]}
@@ -415,9 +424,35 @@ export const PhysicalMachinesPage = defineComponent(() => {
                     aria-hidden="true"
                   />
                 </button>
+                <span
+                  class={[
+                    style.physicalStatusIcon,
+                    registerErrors.value[machine.id]
+                      ? style.error
+                      : machine.connected
+                        ? style.online
+                        : style.offline,
+                  ]}
+                  role="img"
+                  aria-label={
+                    registerErrors.value[machine.id]
+                      ? "实机状态错误"
+                      : machine.connected
+                        ? "实机在线"
+                        : "实机离线"
+                  }
+                  title={
+                    registerErrors.value[machine.id]
+                      ? registerErrors.value[machine.id]
+                      : machine.connected
+                        ? "实机在线"
+                        : "实机离线"
+                  }
+                />
                 <label class={style.physicalNameField}>
                   <span>Name：</span>
                   <input
+                    style="cursor:text"
                     ref={(element) => {
                       // oxlint-disable-next-line no-unsafe-type-assertion
                       if (element) nameInputs.set(machine.id, element as HTMLInputElement);
@@ -437,10 +472,6 @@ export const PhysicalMachinesPage = defineComponent(() => {
                     }}
                   />
                 </label>
-                <div class={style.physicalFact}>
-                  <span>硬件码：</span>
-                  <code>{machine.machineCode || "—"}</code>
-                </div>
                 <label class={[style.physicalFact, style.physicalVirtualMachine]}>
                   <span>模拟机：</span>
                   <Select
@@ -459,9 +490,6 @@ export const PhysicalMachinesPage = defineComponent(() => {
                     ))}
                   </Select>
                 </label>
-                <span class={machine.connected ? [style.tag, style.ok] : style.tag}>
-                  {machine.connected ? "已连接" : "未连接"}
-                </span>
               </div>
               {isExpanded(machine.id) && (
                 <div class={style.physicalMachineDetails}>
@@ -489,6 +517,14 @@ export const PhysicalMachinesPage = defineComponent(() => {
                     </button>
                     <span class={style.tag}>在线 {machine.onlineServoIds.length}</span>
                     <span class={style.tag}>舵机型号 {servoModelLabel(machine)}</span>
+                    <button
+                      class={style.smallButton}
+                      type="button"
+                      disabled={!machine.connected || registerLoading.value[machine.id]}
+                      onClick={() => void syncPhysicalParameters(machine.id)}
+                    >
+                      {registerLoading.value[machine.id] ? "同步中…" : "同步实机参数"}
+                    </button>
                     <button
                       class={[style.smallButton, style.danger, style.physicalDelete]}
                       type="button"
@@ -532,7 +568,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
                                   aria-selected={id === selectedServoId}
                                   onClick={() => (selectedServoIds.value[machine.id] = id)}
                                 >
-                                  舵机 {id}
+                                  {id}
                                 </button>
                               ))}
                             </div>
@@ -622,7 +658,7 @@ export const PhysicalMachinesPage = defineComponent(() => {
   );
 });
 
-const replaceMachine = (machine: Awaited<ReturnType<DesktopBackend["connectPhysicalMachine"]>>) => {
+const replaceMachine = (machine: Awaited<ReturnType<typeof commands.physicalMachineConnect>>) => {
   const store = useDesktopStore();
   const index = store.state.physicalMachines.findIndex((entry) => entry.id === machine.id);
   if (index >= 0) store.state.physicalMachines[index] = machine;
@@ -631,64 +667,64 @@ const replaceMachine = (machine: Awaited<ReturnType<DesktopBackend["connectPhysi
 
 export async function createPhysicalMachine(name: string, usbPort: string, machineCode: string) {
   const store = useDesktopStore();
-  const machine = await desktopBackend().createPhysicalMachine({ name, usbPort, machineCode });
+  const machine = await commands.physicalMachineCreate({ name, usbPort, machineCode });
   store.state.physicalMachines.push(machine);
   return machine;
 }
 export async function detectPhysicalMachine(input: PhysicalMachineDetectInput) {
   const store = useDesktopStore();
-  store.state.detectedPhysicalMachine = await desktopBackend().detectPhysicalMachine(input);
+  store.state.detectedPhysicalMachine = await commands.physicalMachineDetect(input);
   return store.state.detectedPhysicalMachine;
 }
 export async function probePhysicalMachine(input: PhysicalMachineProbeInput) {
   const store = useDesktopStore();
-  store.state.detectedPhysicalMachine = await desktopBackend().probePhysicalMachine(input);
+  store.state.detectedPhysicalMachine = await commands.physicalMachineProbe(input);
   return store.state.detectedPhysicalMachine;
 }
 export async function refreshPhysicalPorts() {
   const store = useDesktopStore();
   [store.state.physicalPorts, store.state.physicalBaudChoices] = await Promise.all([
-    desktopBackend().physicalPorts(),
-    desktopBackend().physicalBaudChoices(),
+    commands.physicalPorts(),
+    commands.physicalBaudChoices(),
   ]);
   return store.state.physicalPorts;
 }
 export async function refreshPhysicalMachines() {
   const store = useDesktopStore();
-  store.state.physicalMachines = await desktopBackend().physicalMachines();
+  store.state.physicalMachines = await commands.physicalMachines();
   return store.state.physicalMachines;
 }
 export async function setAutoReconnectEnabled(enabled: boolean) {
   const store = useDesktopStore();
-  store.state.autoReconnectEnabled = await desktopBackend().setAutoReconnectEnabled(enabled);
+  store.state.autoReconnectEnabled = await commands.setAutoReconnectEnabled(enabled);
   return store.state.autoReconnectEnabled;
 }
 export async function savePhysicalMachine(input: PhysicalMachineSaveInput) {
   const store = useDesktopStore();
-  const machine = await desktopBackend().savePhysicalMachine(input);
+  const machine = await commands.physicalMachineSave(input);
   if (!store.state.physicalMachines.some((entry) => entry.id === machine.id))
     store.state.physicalMachines.push(machine);
   store.state.detectedPhysicalMachine = null;
   return machine;
 }
 export async function disconnectPhysicalMachine(id: string) {
-  return replaceMachine(await desktopBackend().disconnectPhysicalMachine(id));
+  return replaceMachine(await commands.physicalMachineDisconnect(id));
 }
 export async function reconnectPhysicalMachine(input: PhysicalMachineReconnectInput) {
-  return replaceMachine(await desktopBackend().reconnectPhysicalMachine(input));
+  return replaceMachine(await commands.physicalMachineReconnect(input));
 }
 export async function autoReconnectPhysicalMachine(id: string, baud: number) {
-  return replaceMachine(await desktopBackend().autoReconnectPhysicalMachine(id, baud));
+  return replaceMachine(await commands.physicalMachineAutoReconnect(id, baud));
 }
 export async function connectPhysicalMachine(id: string) {
-  return replaceMachine(await desktopBackend().connectPhysicalMachine(id));
+  return replaceMachine(await commands.physicalMachineConnect(id));
 }
 export async function scanPhysicalMachine(id: string) {
-  return replaceMachine(await desktopBackend().scanPhysicalMachine(id));
+  return replaceMachine(await commands.physicalMachineScan(id));
 }
 export async function mountPhysicalMachine(id: string, virtualMachineId: string) {
   const store = useDesktopStore();
-  const machine = await desktopBackend().mountPhysicalMachine(id, virtualMachineId);
+  const machine = await commands.physicalMachineMount(id, virtualMachineId);
   replaceMachine(machine);
   const virtualMachine = store.state.virtualMachines.find((entry) => entry.id === virtualMachineId);
   if (virtualMachine && !virtualMachine.referencedBy.includes(id))
@@ -697,7 +733,7 @@ export async function mountPhysicalMachine(id: string, virtualMachineId: string)
 }
 export async function deletePhysicalMachine(id: string) {
   const store = useDesktopStore();
-  await desktopBackend().deletePhysicalMachine(id);
+  await commands.physicalMachineDelete(id);
   store.state.physicalMachines = store.state.physicalMachines.filter(
     (machine) => machine.id !== id,
   );
@@ -706,5 +742,5 @@ export async function deletePhysicalMachine(id: string) {
   });
 }
 export async function renamePhysicalMachine(id: string, name: string) {
-  return replaceMachine(await desktopBackend().renamePhysicalMachine(id, name));
+  return replaceMachine(await commands.physicalMachineRename(id, name));
 }

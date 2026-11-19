@@ -1,5 +1,6 @@
+import * as commands from "../../../generated/types";
 import { computed, defineComponent, onMounted, ref } from "vue";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import { Select } from "../../components/select";
 import style from "./style.module.scss";
 
@@ -29,7 +30,7 @@ export const TrainingPage = defineComponent(() => {
   const start = async () => {
     try {
       error.value = null;
-      await desktopBackend().trainingStart({
+      await commands.trainingStart({
         program: "uv",
         args: ["run", "train", task.value.trim()],
         workingDir: workingDir.value.trim(),
@@ -47,7 +48,7 @@ export const TrainingPage = defineComponent(() => {
   const stop = async () => {
     try {
       error.value = null;
-      await desktopBackend().trainingStop();
+      await commands.trainingStop();
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
     }
@@ -57,7 +58,7 @@ export const TrainingPage = defineComponent(() => {
     virtualMachineId.value =
       store.state.selectedVirtualMachine ?? store.state.virtualMachines[0]?.id ?? "";
     policyId.value = store.state.selectedPolicyId ?? "";
-    void desktopBackend()
+    void commands
       .trainingStatus()
       .then((value) => (store.state.training = value))
       .catch(() => undefined);

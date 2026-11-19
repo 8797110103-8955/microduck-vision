@@ -388,7 +388,6 @@ name = "loop-body"
 version = "0.1.0"
 dependencies = [
  "duck-body",
- "duck-control",
  "serde",
  "serde_json",
  "servo",

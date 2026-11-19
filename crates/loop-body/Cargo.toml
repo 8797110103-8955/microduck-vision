@@ -1,8 +1,9 @@
 [package]
 name = "loop-body"
-description = "Servo-backed body control loop with shared policy execution, not policy storage or UI state."
-# The boundary excludes body assets, servo register facts, policy storage and UI state. The policy
-# executor itself belongs here so virtual and physical drivers share one control path.
+description = "Product-agnostic servo-backed body control loop and backend boundary."
+# The boundary excludes body assets, servo register facts, policy files, policy contracts, and UI
+# state. Product applications inject canonical targets or a controller around the body loop.
+# The instance registry owns generic factories and access leases; product backends stay in apps.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +11,6 @@ license.workspace = true
 
 [dependencies]
 duck-body = { path = "../duck-body" }
-duck-control = { path = "../../vendor/microduck/duck-control" }
 servo = { path = "../servo" }
 serde.workspace = true
 thiserror.workspace = true
@@ -21,7 +21,3 @@ serde_json.workspace = true
 [[test]]
 name = "body_loop"
 path = "tests/body_loop.rs"
-
-[[test]]
-name = "policy_loop"
-path = "tests/policy_loop.rs"

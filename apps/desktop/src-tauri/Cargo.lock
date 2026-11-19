@@ -2343,7 +2343,6 @@ name = "loop-body"
 version = "0.1.0"
 dependencies = [
  "duck-body",
- "duck-control",
  "serde",
  "servo",
  "thiserror 2.0.21",
@@ -2425,6 +2424,7 @@ dependencies = [
 name = "microduck-vision"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "duck-body",
  "duck-control",
  "loop-body",

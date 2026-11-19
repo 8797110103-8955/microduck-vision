@@ -7,12 +7,19 @@ export type MessageType = "info" | "success" | "warning" | "error";
 export interface MessageOptions {
   type?: MessageType;
   duration?: number;
+  action?: {
+    label: string;
+    onClick: () => void;
+  };
+  dismissible?: boolean;
 }
 
 interface MessageItem {
   id: number;
   content: string;
   type: MessageType;
+  action?: MessageOptions["action"];
+  dismissible: boolean;
 }
 
 const messages = ref<MessageItem[]>([]);
@@ -28,6 +35,8 @@ export function showMessage(content: string, options: MessageOptions = {}) {
     id,
     content,
     type: options.type ?? "info",
+    action: options.action,
+    dismissible: options.dismissible ?? true,
   });
   if ((options.duration ?? 4_000) > 0) {
     window.setTimeout(() => dismissMessage(id), options.duration ?? 4_000);
@@ -51,9 +60,23 @@ const MessageItem = defineComponent({
         role="alert"
       >
         <span>{props.message.content}</span>
-        <button ref={closeButton} type="button" class={style.close} aria-label="关闭消息">
-          ×
-        </button>
+        {props.message.action && (
+          <button
+            type="button"
+            class={style.action}
+            onClick={() => {
+              props.message.action?.onClick();
+              dismissMessage(props.message.id);
+            }}
+          >
+            {props.message.action.label}
+          </button>
+        )}
+        {props.message.dismissible && (
+          <button ref={closeButton} type="button" class={style.close} aria-label="关闭消息">
+            ×
+          </button>
+        )}
       </div>
     );
   },

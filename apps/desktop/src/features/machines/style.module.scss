@@ -137,6 +137,10 @@
     &.connected {
       border-color: rgba($green, 0.55);
     }
+
+    &.hasError {
+      border-color: rgba($red, 0.6);
+    }
   }
 
   .physicalMachineSummary,
@@ -149,6 +153,28 @@
 
   .physicalMachineSummary {
     width: 100%;
+  }
+
+  .physicalStatusIcon {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #aaa59a;
+
+    &.online {
+      background: $green;
+      box-shadow: 0 0 0 3px rgba($green, 0.12);
+    }
+
+    &.offline {
+      background: #aaa59a;
+    }
+
+    &.error {
+      background: $red;
+      box-shadow: 0 0 0 3px rgba($red, 0.12);
+    }
   }
 
   .physicalExpand {

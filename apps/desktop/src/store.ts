@@ -1,8 +1,7 @@
+import * as commands from "../generated/types";
 import { reactive } from "vue";
 import { defineStore } from "pinia";
-import type { DesktopBackend, JointRangeState, ServoModelKey, WorldState } from "./bridge/types";
-
-let configuredBackend: DesktopBackend | null = null;
+import type { JointRangeState, ServoModelKey, WorldState } from "../generated/types";
 
 const selectedServoStorageKey = "microduck.selected-servo";
 const worldCacheStorageKey = "microduck.world-cache";
@@ -63,40 +62,31 @@ function readStoredServo(): ServoModelKey {
   return stored === "xl330" || stored === "hd1910" ? stored : "hd1910";
 }
 
-export function configureDesktopBackend(backend: DesktopBackend) {
-  configuredBackend = backend;
-}
-
-export function desktopBackend() {
-  if (!configuredBackend) throw new Error("desktop backend is not configured");
-  return configuredBackend;
-}
-
 export function createDesktopStore() {
   const state = reactive({
     tab: "home",
     machineView: "simulation",
-    catalog: [] as Awaited<ReturnType<DesktopBackend["servoCatalog"]>>,
+    catalog: [] as Awaited<ReturnType<typeof commands.servoCatalog>>,
     selectedServo: readStoredServo(),
-    virtualMachines: [] as Awaited<ReturnType<DesktopBackend["virtualMachines"]>>,
-    physicalMachines: [] as Awaited<ReturnType<DesktopBackend["physicalMachines"]>>,
+    virtualMachines: [] as Awaited<ReturnType<typeof commands.virtualMachines>>,
+    physicalMachines: [] as Awaited<ReturnType<typeof commands.physicalMachines>>,
     autoReconnectEnabled: true,
     detectedPhysicalMachine: null as Awaited<
-      ReturnType<DesktopBackend["detectPhysicalMachine"]>
+      ReturnType<typeof commands.physicalMachineDetect>
     > | null,
-    physicalPorts: [] as Awaited<ReturnType<DesktopBackend["physicalPorts"]>>,
-    physicalBaudChoices: [] as Awaited<ReturnType<DesktopBackend["physicalBaudChoices"]>>,
-    policies: [] as Awaited<ReturnType<DesktopBackend["policyList"]>>,
+    physicalPorts: [] as Awaited<ReturnType<typeof commands.physicalPorts>>,
+    physicalBaudChoices: [] as Awaited<ReturnType<typeof commands.physicalBaudChoices>>,
+    policies: [] as Awaited<ReturnType<typeof commands.policyList>>,
     selectedPolicyId: null as string | null,
-    actions: [] as Awaited<ReturnType<DesktopBackend["actions"]>>,
-    loop: null as Awaited<ReturnType<DesktopBackend["loopStatus"]>>,
+    actions: [] as Awaited<ReturnType<typeof commands.actions>>,
+    loop: null as Awaited<ReturnType<typeof commands.loopStatus>>,
     jointRangeStates: [] as JointRangeState[],
     debugPose: null as number[] | null,
     rangePreview: null as number[] | null,
     physicalSyncEnabled: false,
     worldCache: readWorldCache(),
-    previewLoop: null as Awaited<ReturnType<DesktopBackend["loopStatus"]>>,
-    training: null as Awaited<ReturnType<DesktopBackend["trainingStatus"]>>,
+    previewLoop: null as Awaited<ReturnType<typeof commands.loopStatus>>,
+    training: null as Awaited<ReturnType<typeof commands.trainingStatus>>,
     selectedVirtualMachine: null as string | null,
     selectedVirtualMachineManual: false,
     error: null as string | null,
@@ -107,6 +97,5 @@ export function createDesktopStore() {
 }
 
 export const useDesktopStore = defineStore("desktop", () => {
-  if (!configuredBackend) throw new Error("desktop backend is not configured");
   return createDesktopStore();
 });

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { PhysicalMachine, VirtualMachine } from "../../src/bridge/types";
+import type { PhysicalMachine, VirtualMachine } from "../../generated/types";
 import {
   bindingConflictsFor,
+  bindingConflictsForDrafts,
   debugBindingFor,
   debugPhysicalMachineFor,
   defaultDebugVirtualMachineId,
 } from "../../src/features/debug";
+import { physicalMarkerState } from "../../src/features/home";
 
 const virtualMachine = (id: string, name: string): VirtualMachine => ({
   id,
@@ -71,6 +73,13 @@ describe("debug physical pairing", () => {
     expect(debugBindingFor(virtual, "right_hip_yaw")).toBeUndefined();
   });
 
+  it("marks an unmatched virtual binding missing without affecting matched IDs", () => {
+    expect(physicalMarkerState(7, [7], true)).toBe("online");
+    expect(physicalMarkerState(42, [7], true)).toBe("missing");
+    expect(physicalMarkerState(null, [7], true)).toBe("missing");
+    expect(physicalMarkerState(7, [7], true, 1)).toBe("warn");
+  });
+
   it("reports duplicate virtual IDs without needing a physical machine", () => {
     const virtual = virtualMachine("machine-0", "机器 0");
     virtual.jointBindings = [
@@ -79,5 +88,20 @@ describe("debug physical pairing", () => {
     ];
 
     expect(bindingConflictsFor(virtual)).toEqual(["42:left_hip_yaw,right_hip_yaw"]);
+  });
+
+  it("detects conflicts from frontend binding drafts without mutating the saved machine", () => {
+    const virtual = virtualMachine("machine-0", "机器 0");
+    virtual.jointBindings = [
+      { slotId: "left_hip_yaw", physicalId: 1, direction: 1, zeroOffsetRad: 0 },
+    ];
+
+    expect(bindingConflictsForDrafts(virtual, { right_hip_yaw: 1 })).toEqual([
+      "1:left_hip_yaw,right_hip_yaw",
+    ]);
+    expect(virtual.jointBindings).toEqual([
+      { slotId: "left_hip_yaw", physicalId: 1, direction: 1, zeroOffsetRad: 0 },
+    ]);
+    expect(bindingConflictsForDrafts(virtual, { right_hip_yaw: 2 })).toEqual([]);
   });
 });

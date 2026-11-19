@@ -1,9 +1,14 @@
+import * as commands from "../../../generated/types";
 import { computed, defineComponent, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
-import type { ServoCatalogEntry, ServoModelKey, SimulationParameters } from "../../bridge/types";
+import type {
+  ServoCatalogEntry,
+  ServoModelKey,
+  SimulationParameters,
+} from "../../../generated/types";
 import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import { servoModel } from "../debug/helpers";
 import style from "./style.module.scss";
 
@@ -347,7 +352,7 @@ export async function createVirtualMachine(
     forceRange: profile.simForceRange,
     worldPosition: [0, 0, 0],
   };
-  const machine = await desktopBackend().createVirtualMachine({
+  const machine = await commands.virtualMachineCreate({
     name,
     bodyId: "official",
     servoModel: selectedServo,
@@ -358,7 +363,7 @@ export async function createVirtualMachine(
 }
 export async function setStartupVirtualMachine(id: string) {
   const store = useDesktopStore();
-  await desktopBackend().setStartupVirtualMachine(id);
+  await commands.virtualMachineSetStartup(id);
   store.state.virtualMachines.forEach((machine) => (machine.startupSelected = machine.id === id));
   store.state.selectedVirtualMachine = id;
   store.state.selectedVirtualMachineManual = true;
@@ -366,7 +371,7 @@ export async function setStartupVirtualMachine(id: string) {
 export async function deleteVirtualMachine(id: string) {
   const store = useDesktopStore();
   const wasSelected = store.state.selectedVirtualMachine === id;
-  await desktopBackend().deleteVirtualMachine(id);
+  await commands.virtualMachineDelete(id);
   store.state.virtualMachines = store.state.virtualMachines.filter((machine) => machine.id !== id);
   if (wasSelected) {
     store.state.selectedVirtualMachine = null;
@@ -375,7 +380,7 @@ export async function deleteVirtualMachine(id: string) {
 }
 export async function renameVirtualMachine(id: string, name: string) {
   const store = useDesktopStore();
-  const machine = await desktopBackend().renameVirtualMachine(id, name);
+  const machine = await commands.virtualMachineRename(id, name);
   const index = store.state.virtualMachines.findIndex((entry) => entry.id === id);
   if (index >= 0) store.state.virtualMachines[index] = machine;
   return machine;

@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import type { SceneFrame, SceneInfo } from "../../bridge/types";
+import type { SceneFrame, SceneInfo } from "../../../generated/types";
 
 const n = (v: number | null | undefined) => v ?? 0;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -42,7 +42,10 @@ export class DuckViewer {
   /** Each ghost mesh and the main-duck mesh whose geometry it borrows. */
   private ghostSources = new Map<DuckMesh, DuckMesh>();
   private worldPose: [number, number, number] = [0, 0, 0];
+  private simulationFrame = false;
   private configuredWorldPositions: [number, number, number][] = [];
+  private selectedDuckIndex = 0;
+  private static readonly ghostOpacity = 0.55;
   private readonly baseHeight: number;
   /** Convert the vendor/MuJoCo Z-up frame into the Three.js Y-up frame. */
   private readonly mujocoToThree = new THREE.Quaternion().setFromEuler(
@@ -140,13 +143,41 @@ export class DuckViewer {
   }
 
   setFrame(frame: SceneFrame) {
+    this.simulationFrame = false;
+    this.applyMachineWorldPositions();
     this.frame = frame;
-    this.pose(this.bodies, frame);
+    this.pose(this.bodiesForDuck(this.selectedDuckIndex), frame);
     if (!this.restFrame) {
       this.restFrame = frame;
       this.ghostBodies.forEach((b) => this.pose(b, frame));
     }
     if (!this.viewRestored && !this.defaultFocused) this.focusDuck(true);
+  }
+
+  /** Native body poses already include trunk translation, attitude and passive hinges.
+   * Apply only the fixed world-basis conversion and the saved display offset. */
+  setSimulationFrame(frame: SceneFrame) {
+    this.simulationFrame = true;
+    this.applyMachineWorldPositions();
+    this.frame = frame;
+    this.pose(this.bodiesForDuck(this.selectedDuckIndex), frame);
+  }
+
+  setSelectedDuck(index: number) {
+    const next = Math.max(0, Math.min(index, this.ghosts.length));
+    if (next === this.selectedDuckIndex) return;
+    const previous = this.selectedDuckIndex;
+    this.selectedDuckIndex = next;
+    if (this.restFrame) {
+      this.pose(this.bodiesForDuck(previous), this.restFrame);
+      this.pose(this.bodiesForDuck(next), this.restFrame);
+    }
+    this.applyMachineWorldPositions();
+    this.updateDuckOpacity();
+    this.highlightedBodies.forEach((body) => {
+      this.setBodyHighlight(previous, body, false);
+      this.setBodyHighlight(next, body, true);
+    });
   }
 
   focusCurrentDuck() {
@@ -169,8 +200,9 @@ export class DuckViewer {
   }
 
   private focusDuck(adjustDistance: boolean, alignLeftHalf = false) {
-    this.root.updateMatrixWorld(true);
-    const bounds = new THREE.Box3().setFromObject(this.root);
+    const root = this.rootForDuck(this.selectedDuckIndex);
+    root.updateMatrixWorld(true);
+    const bounds = new THREE.Box3().setFromObject(root);
     if (bounds.isEmpty()) return;
     const center = bounds.getCenter(new THREE.Vector3());
     const direction = this.camera.position.clone().sub(this.controls.target);
@@ -207,8 +239,8 @@ export class DuckViewer {
     const z = n(position[1]);
     const angle = n(yaw);
     this.worldPose = [x, z, angle];
-    this.applyMainWorldPosition();
-    this.setRootYaw(this.root, angle);
+    if (this.simulationFrame) return;
+    this.applySelectedWorldPose();
   }
 
   /** Apply a MuJoCo/world yaw without changing the fixed Z-up to Y-up basis. */
@@ -218,25 +250,63 @@ export class DuckViewer {
       .multiply(this.yawRotation.setFromAxisAngle(this.mujocoUp, yaw));
   }
 
-  private applyMainWorldPosition() {
-    const [x, y, z] = this.configuredWorldPositions[0] ?? [0, 0, 0];
-    this.root.position.set(x + this.worldPose[0], this.baseHeight + y, z + this.worldPose[1]);
+  private applyMachineWorldPositions() {
+    const roots = [this.root, ...this.ghosts];
+    roots.forEach((root, index) => {
+      const [x, y, z] = this.configuredWorldPositions[index] ?? [0, 0, 0];
+      root.position.set(x, this.rootUsesAbsoluteHeight() ? y : this.baseHeight + y, z);
+      this.setRootYaw(root, 0);
+    });
+    this.applySelectedWorldPose();
+  }
+
+  private rootUsesAbsoluteHeight() {
+    return this.simulationFrame;
+  }
+
+  private applySelectedWorldPose() {
+    const root = this.rootForDuck(this.selectedDuckIndex);
+    const [x, y, z] = this.configuredWorldPositions[this.selectedDuckIndex] ?? [0, 0, 0];
+    if (this.simulationFrame) {
+      root.position.set(x, y, z);
+      this.setRootYaw(root, 0);
+    } else {
+      root.position.set(x + this.worldPose[0], this.baseHeight + y, z + this.worldPose[1]);
+      this.setRootYaw(root, this.worldPose[2]);
+    }
   }
 
   setMachineWorldPositions(positions: [number, number, number][]) {
     this.configuredWorldPositions = positions.map(
       (position) => [...position] as [number, number, number],
     );
-    this.applyMainWorldPosition();
-    this.ghosts.forEach((root, index) => {
-      const [x, y, z] = this.configuredWorldPositions[index + 1] ?? [0, 0, 0];
-      root.position.set(x, this.baseHeight + y, z);
-      this.setRootYaw(root, 0);
-    });
+    this.applyMachineWorldPositions();
   }
 
   /** The first frame is the default posture the ghosts keep. */
   private restFrame: SceneFrame | null = null;
+
+  private rootForDuck(index: number) {
+    return index === 0 ? this.root : (this.ghosts[index - 1] ?? this.root);
+  }
+
+  private bodiesForDuck(index: number) {
+    return index === 0 ? this.bodies : (this.ghostBodies[index - 1] ?? this.bodies);
+  }
+
+  private meshesForDuckBody(index: number, body: number): DuckMesh[] {
+    if (index === 0) return this.meshesByBody[body] ?? [];
+    return (this.ghostBodies[index - 1]?.[body]?.children ?? []).filter(
+      (child): child is DuckMesh => child instanceof THREE.Mesh,
+    );
+  }
+
+  private setBodyHighlight(index: number, body: number, on: boolean) {
+    this.meshesForDuckBody(index, body).forEach((mesh) => {
+      mesh.material.emissive.set(on ? 0xf5b700 : 0x000000);
+      mesh.material.emissiveIntensity = on ? 0.9 : 0;
+    });
+  }
 
   private pose(bodies: THREE.Group[], frame: SceneFrame) {
     frame.bodies.forEach((p, i) => {
@@ -251,6 +321,7 @@ export class DuckViewer {
   setGhosts(count: number, _spacing = 0.25, positions: [number, number, number][] = []) {
     if (count === this.ghosts.length) {
       this.setMachineWorldPositions(positions);
+      this.updateDuckOpacity();
       return;
     }
     this.ghosts.forEach((g) => this.scene.remove(g));
@@ -261,18 +332,18 @@ export class DuckViewer {
     this.configuredWorldPositions = positions.map(
       (position) => [...position] as [number, number, number],
     );
-    this.applyMainWorldPosition();
+    this.applyMachineWorldPositions();
     this.root.updateMatrixWorld();
     for (let k = 1; k <= count; k++) {
       const root = new THREE.Group();
       this.setRootYaw(root, 0);
       const [x, y, z] = this.configuredWorldPositions[k] ?? [0, 0, 0];
-      root.position.set(x, this.baseHeight + y, z);
+      root.position.set(x, this.rootUsesAbsoluteHeight() ? y : this.baseHeight + y, z);
       const bodies = this.bodies.map((_, i) => {
         const g = new THREE.Group();
         for (const m of this.meshesByBody[i]) {
           const mat = m.material.clone();
-          mat.opacity = 0.55;
+          mat.opacity = DuckViewer.ghostOpacity;
           mat.emissiveIntensity = 0;
           const c: DuckMesh = new THREE.Mesh(m.geometry, mat);
           c.position.copy(m.position);
@@ -288,6 +359,24 @@ export class DuckViewer {
       this.scene.add(root);
       this.ghosts.push(root);
       this.ghostBodies.push(bodies);
+    }
+    this.applyMachineWorldPositions();
+    this.updateDuckOpacity();
+  }
+
+  private updateDuckOpacity() {
+    this.meshesByBody.flat().forEach((mesh) => {
+      mesh.material.opacity = this.selectedDuckIndex === 0 ? 1 : DuckViewer.ghostOpacity;
+    });
+    for (let index = 0; index < this.ghostBodies.length; index++) {
+      const duckIndex = index + 1;
+      const bodies = this.ghostBodies[index];
+      for (let body = 0; body < bodies.length; body++) {
+        this.meshesForDuckBody(duckIndex, body).forEach((mesh) => {
+          mesh.material.opacity =
+            duckIndex === this.selectedDuckIndex ? 1 : DuckViewer.ghostOpacity;
+        });
+      }
     }
   }
 
@@ -339,16 +428,12 @@ export class DuckViewer {
 
   highlightBodies(bodies: number[]) {
     const next = [...new Set(bodies)].filter((body) => this.meshesByBody[body]);
-    const set = (body: number, on: boolean) =>
-      this.meshesByBody[body]?.forEach((m) => {
-        const mat = m.material;
-        mat.emissive.set(on ? 0xf5b700 : 0x000000);
-        mat.emissiveIntensity = on ? 0.9 : 0;
-      });
     [...this.highlightedBodies]
       .filter((body) => !next.includes(body))
-      .forEach((body) => set(body, false));
-    next.filter((body) => !this.highlightedBodies.has(body)).forEach((body) => set(body, true));
+      .forEach((body) => this.setBodyHighlight(this.selectedDuckIndex, body, false));
+    next
+      .filter((body) => !this.highlightedBodies.has(body))
+      .forEach((body) => this.setBodyHighlight(this.selectedDuckIndex, body, true));
     this.highlightedBodies = new Set(next);
   }
 
@@ -362,15 +447,17 @@ export class DuckViewer {
     const m = this.frame?.markers[i];
     if (!m) return null;
     return this.projectScreenPoint(
-      new THREE.Vector3(n(m[0]), n(m[1]), n(m[2])).applyMatrix4(this.root.matrixWorld),
+      new THREE.Vector3(n(m[0]), n(m[1]), n(m[2])).applyMatrix4(
+        this.rootForDuck(this.selectedDuckIndex).matrixWorld,
+      ),
     );
   }
 
   /** Project a fixed point in a body frame for UI-only anchors such as mouth. */
   markerScreenAt(body: number, point: [number, number, number]) {
-    const group = this.bodies[body];
+    const group = this.bodiesForDuck(this.selectedDuckIndex)[body];
     if (!group) return null;
-    this.root.updateMatrixWorld(true);
+    this.rootForDuck(this.selectedDuckIndex).updateMatrixWorld(true);
     return this.projectScreenPoint(group.localToWorld(new THREE.Vector3(...point)));
   }
 

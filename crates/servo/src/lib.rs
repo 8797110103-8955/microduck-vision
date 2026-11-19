@@ -56,8 +56,28 @@ pub struct ServoPositionTargets {
     pub positions: Vec<f64>,
 }
 
+/// Optional body-sensor data owned by a servo/backend implementation.
+///
+/// The servo crate deliberately keeps this independent from the policy crate. A physical bus
+/// may return `None` when no IMU is attached, while a simulation backend can derive the same
+/// frame from its body state. The policy loop decides how the frame enters its observation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServoImuSample {
+    pub gyro: [f64; 3],
+    pub gravity: [f64; 3],
+}
+
 pub trait ServoLoopDriver: Send {
+    /// Sensor workers install this before I/O. Check it between bounded transactions.
+    fn set_read_cancel(&mut self, _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+    /// Slots with actual telemetry. A placeholder may have a display value but is not feedback.
+    fn feedback_validity(&self, ids: &[u8]) -> Vec<bool> {
+        vec![true; ids.len()]
+    }
     fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError>;
+    fn read_imu(&mut self) -> Result<Option<ServoImuSample>, ServoError> {
+        Ok(None)
+    }
     fn write_positions(
         &mut self,
         ids: &[u8],
@@ -66,6 +86,24 @@ pub trait ServoLoopDriver: Send {
     fn set_torque(&mut self, enabled: bool) -> Result<(), ServoError>;
     fn set_gain(&mut self, gain: u16) -> Result<(), ServoError>;
     fn reboot(&mut self, id: u8) -> Result<(), ServoError>;
+
+    /// Advance backend-owned execution without implicitly submitting another target. Physical
+    /// transports normally leave this as a no-op because their firmware owns the clock; simulated
+    /// and embedded adapters override it to advance their deterministic physics/device clock.
+    fn advance_execution(
+        &mut self,
+        _physics_steps: u32,
+        _physics_dt: std::time::Duration,
+    ) -> Result<(), ServoError> {
+        Ok(())
+    }
+
+    /// Reset backend-owned execution state before the next observation is encoded. Physical
+    /// transports may leave this as a no-op; deterministic simulators use it to clear the
+    /// solver, delay queue, torque history and published snapshot synchronously.
+    fn reset_execution(&mut self) -> Result<(), ServoError> {
+        Ok(())
+    }
 }
 
 pub trait ServoDefinitionProvider {

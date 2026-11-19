@@ -166,7 +166,11 @@ impl VirtualBody {
                 expected: self.template.joints.len(),
             });
         }
-        if targets.positions.iter().any(|position| !position.is_finite()) {
+        if targets
+            .positions
+            .iter()
+            .any(|position| !position.is_finite())
+        {
             return Err(BodyError::Dynamics(
                 "target state contains a non-finite value".into(),
             ));

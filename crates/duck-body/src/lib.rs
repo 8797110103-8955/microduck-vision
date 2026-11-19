@@ -17,7 +17,7 @@ mod servo_catalog;
 pub mod types;
 
 pub use action_space::{BodyActionCodec, BodyActionSpace};
-pub use binding::{BodyBinding, JointCalibration};
+pub use binding::{BodyBinding, JointCalibration, apply_pose_zero_positions};
 pub use contract::BodyContractSnapshot;
 pub use dynamics::{
     BodyFeedback, BodyState, BodyTargets, DeterministicDynamics, DynamicsBackend, DynamicsInput,
@@ -252,8 +252,14 @@ mod tests {
         assert_eq!(xl.vin_range, [6.5, 8.2]);
         assert_eq!(xl.delay_steps, [3, 6]);
         assert_eq!(xl.bam_motor, "xl330");
-        assert!((xl.bam_kt - 0.3459739511711113).abs() < 1e-12);
-        assert!((xl.bam_command_delay - 0.010220594809412403).abs() < 1e-12);
+        assert!((xl.bam_vin - 7.4).abs() < 1e-12);
+        assert!((xl.bam_kp - 200.0).abs() < 1e-12);
+        assert!((xl.bam_kt - 0.36601349688984386).abs() < 1e-12);
+        assert!((xl.bam_resistance - 2.8113923539223227).abs() < 1e-12);
+        assert!((xl.bam_armature - 0.0018077432831600838).abs() < 1e-15);
+        assert!((xl.bam_q_offset - 0.0271132870444849).abs() < 1e-12);
+        assert!((xl.bam_friction_base - 0.004771183165566).abs() < 1e-12);
+        assert!((xl.bam_dtheta_stribeck - 2.890372094130307).abs() < 1e-12);
         assert!(xl.supports_fast_sync);
 
         let hd = profiles

@@ -1,12 +1,12 @@
-import { computed, defineComponent, onMounted, onUnmounted, ref, watch } from "vue";
+import * as commands from "../../../generated/types";
+import { computed, defineComponent, onMounted, onScopeDispose, ref, watch } from "vue";
 import { useEventListener, useIntervalFn } from "@vueuse/core";
 import type {
   ActionRecord,
   JointRange,
-  LoopAction,
   PhysicalMachine,
   VirtualMachine,
-} from "../../bridge/types";
+} from "../../../generated/types";
 import { showMessage } from "../../components/message";
 import { ScrollArea } from "../../components/scroll-area";
 import { Select } from "../../components/select";
@@ -18,15 +18,12 @@ import {
   requestServoSelection,
   servoSelectionEvent,
 } from "../../components/viewer-events";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
 export { actionKind, servoModel, SectionHeading } from "./helpers";
 
-const debugServoIndexes = Array.from({ length: 15 }, (_, index) => index + 1);
 const officialServoIds = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
-const formatParameter = (value: number | null, suffix = "") =>
-  value === null ? "—" : `${value.toFixed(3)}${suffix}`;
 
 function unboundVirtualMachines(
   virtualMachines: VirtualMachine[],
@@ -42,6 +39,42 @@ export function bindingConflictsFor(machine: VirtualMachine | undefined) {
   if (!machine) return [];
   const byId = new Map<number, string[]>();
   for (const binding of machine.jointBindings ?? []) {
+    const slots = byId.get(binding.physicalId) ?? [];
+    slots.push(binding.slotId);
+    byId.set(binding.physicalId, slots);
+  }
+  return [...byId]
+    .filter(([, slots]) => slots.length > 1)
+    .map(([id, slots]) => `${id}:${slots.toSorted().join(",")}`)
+    .toSorted();
+}
+
+type BindingDrafts = Record<string, number | null>;
+
+export function bindingConflictsForDrafts(
+  machine: VirtualMachine | undefined,
+  drafts: BindingDrafts,
+) {
+  if (!machine) return [];
+  const bindings = new Map(
+    (machine.jointBindings ?? []).map((binding) => [binding.slotId, binding]),
+  );
+  for (const [slotId, physicalId] of Object.entries(drafts)) {
+    if (physicalId === null) bindings.delete(slotId);
+    else {
+      const current = bindings.get(slotId);
+      bindings.set(slotId, {
+        slotId,
+        physicalId,
+        direction: current?.direction ?? 1,
+        zeroOffsetRad: current?.zeroOffsetRad ?? 0,
+        minRad: current?.minRad ?? null,
+        maxRad: current?.maxRad ?? null,
+      });
+    }
+  }
+  const byId = new Map<number, string[]>();
+  for (const binding of bindings.values()) {
     const slots = byId.get(binding.physicalId) ?? [];
     slots.push(binding.slotId);
     byId.set(binding.physicalId, slots);
@@ -95,29 +128,46 @@ export function defaultDebugVirtualMachineId(
 export const DebugPage = defineComponent(() => {
   const store = useDesktopStore();
   const selectedId = ref<number | null>(null);
-  const secondaryPanel = ref<"binding" | "safety" | "world">("safety");
   const rangeView = ref(false);
+  const manualControl = computed(
+    () => !!store.state.loop?.hasExecution && !store.state.loop.simulation,
+  );
+  const accessBusy = ref(false);
+  const toggleManualControl = async () => {
+    const physical = selectedPhysicalMachine.value;
+    const virtual = selectedMachine.value;
+    if (!physical?.connected || !virtual || accessBusy.value) return;
+    accessBusy.value = true;
+    try {
+      const current = await commands.loopStatus();
+      const input = {
+        virtualMachineId: virtual.id,
+        physicalMachineId: physical.id,
+        access: manualControl.value ? ("read_only" as const) : ("control" as const),
+        policyId: null,
+      };
+      store.state.loop = await (current
+        ? commands.runtimeReconfigure(current.runtimeGeneration, current.configRevision, input)
+        : commands.runtimeOpen(input));
+      store.state.previewLoop = null;
+    } catch (error) {
+      showMessage(error instanceof Error ? error.message : String(error), { type: "warning" });
+    } finally {
+      accessBusy.value = false;
+    }
+  };
   const jointSlots = ref<string[]>([]);
   const jointRanges = ref<JointRange[]>([]);
   const selectedRangeEndpoints = ref<Record<string, "min" | "max">>({});
   const rangeEntryPose = ref<number[] | null>(null);
   const bindingConflictSignature = ref("");
+  const bindingDrafts = ref<BindingDrafts>({});
+  const pendingBindingSlots = ref<string[]>([]);
+  let dismissPendingBindingMessage: (() => void) | undefined;
   let suppressServoSelectionEvent = false;
-  let poseRequestInFlight = false;
-  let posePollingActive = false;
-  const bindingOverrides = ref<Record<string, number>>({});
-  const targetDraft = ref("");
+  let loopRequestInFlight = false;
+  let loopPollingActive = false;
   const worldPositionDraft = ref<[number, number, number]>([0, 0, 0]);
-  const selectedIndex = computed(() =>
-    selectedId.value === null ? 0 : Math.max(0, selectedId.value - 1),
-  );
-  const selectedPosition = computed(
-    () =>
-      store.state.loop?.positions[selectedIndex.value] ??
-      store.state.debugPose?.[selectedIndex.value] ??
-      null,
-  );
-  const selectedTarget = computed(() => store.state.loop?.targets[selectedIndex.value] ?? null);
   const selectedMachine = computed(() =>
     store.state.virtualMachines.find(
       (machine) => machine.id === store.state.selectedVirtualMachine,
@@ -131,9 +181,29 @@ export const DebugPage = defineComponent(() => {
     ),
   );
   const physicalConnected = computed(() => selectedPhysicalMachine.value?.connected === true);
-  const anyTorqueEnabled = computed(
-    () => store.state.loop?.torque ?? selectedPhysicalMachine.value?.torqueEnabled === true,
+  const poseZeroAllowed = computed(
+    () =>
+      physicalConnected.value && !(store.state.loop?.hasExecution && !store.state.loop.simulation),
   );
+  const anyTorqueEnabled = computed(() => selectedPhysicalMachine.value?.torqueEnabled === true);
+  const bindingDraftFor = (slotId: string) =>
+    Object.prototype.hasOwnProperty.call(bindingDrafts.value, slotId)
+      ? bindingDrafts.value[slotId]
+      : undefined;
+  const bindingFor = (slotId: string) => {
+    const machineBinding = debugBindingFor(selectedMachine.value, slotId);
+    const draft = bindingDraftFor(slotId);
+    if (draft === undefined) return machineBinding;
+    if (draft === null) return undefined;
+    return {
+      slotId,
+      physicalId: draft,
+      direction: machineBinding?.direction ?? 1,
+      zeroOffsetRad: machineBinding?.zeroOffsetRad ?? 0,
+      minRad: machineBinding?.minRad ?? null,
+      maxRad: machineBinding?.maxRad ?? null,
+    };
+  };
   const applyDefaultSelection = () => {
     if (store.state.selectedVirtualMachineManual) return;
     const defaultId = defaultDebugVirtualMachineId(
@@ -143,59 +213,131 @@ export const DebugPage = defineComponent(() => {
     if (defaultId) store.state.selectedVirtualMachine = defaultId;
   };
   useEventListener(window, servoSelectionEvent, onServoSelection);
-  const { pause: stopPosePolling, resume: startPosePolling } = useIntervalFn(
-    () => {
-      const machine = selectedPhysicalMachine.value;
-      if (!posePollingActive || !machine?.connected || store.state.loop || poseRequestInFlight)
-        return;
-      if (bindingConflictsFor(selectedMachine.value).length) {
-        checkBindingConflict();
-        return;
-      }
-      poseRequestInFlight = true;
-      void desktopBackend()
-        .physicalMachinePose(machine.id, store.state.selectedVirtualMachine)
-        .then((pose) => {
-          if (posePollingActive) store.state.debugPose = pose;
-        })
-        .catch(() => {
-          if (posePollingActive) checkBindingConflict();
-        })
-        .finally(() => {
-          poseRequestInFlight = false;
-        });
-    },
+  const refreshLoopStatus = async () => {
+    if (!loopPollingActive || !store.state.loop || loopRequestInFlight) return;
+    loopRequestInFlight = true;
+    const machineId = selectedPhysicalMachine.value?.id;
+    const currentLoop = store.state.loop;
+    try {
+      const status = await commands.loopStatus();
+      if (!status) return;
+      const source = status.readSources?.find((candidate) => candidate.id === machineId);
+      const physicalStatus = source
+        ? {
+            ...status,
+            positions: source.positions,
+            sensorFailures: source.health === "offline" ? 1 : 0,
+            lastError: source.lastError,
+          }
+        : status;
+      if (
+        loopPollingActive &&
+        selectedPhysicalMachine.value?.id === machineId &&
+        store.state.loop === currentLoop
+      )
+        store.state.loop = physicalStatus;
+    } catch (error) {
+      if (loopPollingActive) console.warn("读取真机姿态失败", error);
+    } finally {
+      loopRequestInFlight = false;
+    }
+  };
+  const { pause: stopLoopPolling, resume: startLoopPolling } = useIntervalFn(
+    () => void refreshLoopStatus(),
     180,
     { immediate: false },
   );
+  const restartReadLoop = async () => {
+    const machine = selectedPhysicalMachine.value;
+    if (!store.state.loop || !machine?.connected || manualControl.value) return;
+    await closeLoop();
+    await openLoop(machine.id);
+    await refreshLoopStatus();
+  };
+  const refreshVirtualMachineCache = async () => {
+    const machines = await commands.virtualMachines();
+    store.state.virtualMachines = machines;
+    return machines.find((machine) => machine.id === store.state.selectedVirtualMachine);
+  };
+  const announcePendingBindingConflict = (slotId: string, conflicts: string[]) => {
+    dismissPendingBindingMessage?.();
+    dismissPendingBindingMessage = showMessage(
+      `绑定冲突，${slotId}，${conflicts.join(", ")}, 等待其他绑定解决。`,
+      {
+        type: "warning",
+        duration: 4_000,
+      },
+    );
+    bindingConflictSignature.value = conflicts.join("|");
+  };
+  const syncBindingDrafts = async () => {
+    if (!Object.keys(bindingDrafts.value).length) return;
+    const machine = await refreshVirtualMachineCache();
+    if (!machine) return;
+    const conflicts = bindingConflictsForDrafts(machine, bindingDrafts.value);
+    if (conflicts.length) {
+      pendingBindingSlots.value = [
+        ...pendingBindingSlots.value,
+        ...Object.keys(bindingDrafts.value).filter(
+          (slotId) => !pendingBindingSlots.value.includes(slotId),
+        ),
+      ];
+      checkBindingConflict();
+      return;
+    }
+    const drafts = Object.entries(bindingDrafts.value);
+    for (const [slotId, physicalId] of drafts) {
+      const current = machine.jointBindings?.find((binding) => binding.slotId === slotId);
+      if ((current?.physicalId ?? null) === physicalId) continue;
+      await commands.virtualMachineBind({
+        virtualMachineId: machine.id,
+        slotId,
+        physicalId,
+      });
+    }
+    await refreshVirtualMachineCache();
+    bindingDrafts.value = {};
+    pendingBindingSlots.value = [];
+    bindingConflictSignature.value = "";
+    dismissPendingBindingMessage?.();
+    dismissPendingBindingMessage = undefined;
+    await restartReadLoop();
+  };
 
   onMounted(async () => {
-    posePollingActive = true;
+    loopPollingActive = true;
     if (!store.state.catalog.length && !store.state.loading) await load();
-    if (!posePollingActive) return;
-    jointSlots.value = await desktopBackend().officialJointSlots();
-    jointRanges.value = await desktopBackend().officialJointRanges();
-    if (!posePollingActive) return;
+    if (!loopPollingActive) return;
+    jointSlots.value = await commands.officialJointSlots();
+    jointRanges.value = await commands.officialJointRanges();
+    if (!loopPollingActive) return;
     applyDefaultSelection();
-    if (!physicalConnected.value) secondaryPanel.value = "binding";
     checkBindingConflict();
-    startPosePolling();
+    if (selectedPhysicalMachine.value?.connected) {
+      try {
+        await openLoop(selectedPhysicalMachine.value.id);
+        store.state.error = null;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        store.state.error = null;
+        showMessage(`调试读取 loop 启动失败：${message}`, {
+          type: "warning",
+          duration: 6_000,
+        });
+      }
+    }
+    startLoopPolling();
+    void refreshLoopStatus();
   });
-  onUnmounted(() => {
-    stopPosePolling();
-    posePollingActive = false;
-    poseRequestInFlight = false;
+  onScopeDispose(() => {
+    stopLoopPolling();
+    loopPollingActive = false;
+    loopRequestInFlight = false;
+    dismissPendingBindingMessage?.();
+    dismissPendingBindingMessage = undefined;
     store.state.rangePreview = null;
     store.state.debugPose = null;
-  });
-  onUnmounted(() => {
     if (store.state.loop) void closeLoop();
-  });
-  watch(selectedTarget, (value) => {
-    targetDraft.value = value == null ? "" : String(value);
-  });
-  watch(physicalConnected, (connected) => {
-    if (!connected && secondaryPanel.value === "safety") secondaryPanel.value = "binding";
   });
   watch(
     () => selectedMachine.value?.id,
@@ -209,7 +351,7 @@ export const DebugPage = defineComponent(() => {
     const machine = selectedMachine.value;
     if (!machine) return;
     try {
-      const updated = await desktopBackend().setVirtualMachineWorldPosition(machine.id, position);
+      const updated = await commands.virtualMachineSetWorldPosition(machine.id, position);
       const index = store.state.virtualMachines.findIndex((item) => item.id === updated.id);
       if (index >= 0) store.state.virtualMachines[index] = updated;
       store.state.error = null;
@@ -225,106 +367,64 @@ export const DebugPage = defineComponent(() => {
     if (machine) machine.simulation.worldPosition = next;
     void saveWorldPosition(next);
   };
-  const send = () => {
-    if (bindingConflictsFor(selectedMachine.value).length) {
-      checkBindingConflict();
-      return;
-    }
-    void sendTargets((store.state.loop?.targets ?? []).map((v) => v + 0.01));
-  };
-  const move = async (draftValue = targetDraft.value) => {
-    if (bindingConflictsFor(selectedMachine.value).length) {
-      checkBindingConflict();
-      return;
-    }
-    const value = Number(draftValue);
-    if (!Number.isFinite(value)) return;
-    if (!store.state.loop) {
-      const machine = selectedPhysicalMachine.value;
-      const slotId =
-        jointSlots.value[selectedIndex.value] ??
-        (await desktopBackend().officialJointSlots())[selectedIndex.value];
-      if (!machine?.connected || !slotId) return;
-      try {
-        const binding = bindingFor(slotId);
-        const bodyTarget = Math.min(
-          binding?.maxRad ?? Number.POSITIVE_INFINITY,
-          Math.max(binding?.minRad ?? Number.NEGATIVE_INFINITY, value),
-        );
-        const servoTarget =
-          (bodyTarget + (binding?.zeroOffsetRad ?? 0)) * (binding?.direction ?? 1);
-        const torqueMachine = await desktopBackend().setPhysicalMachineTorque(
-          machine.id,
-          true,
-          store.state.selectedVirtualMachine,
-        );
-        const updated = await desktopBackend().writePhysicalMachinePosition({
-          physicalMachineId: machine.id,
-          servoId: binding?.physicalId ?? physicalIdForIndex(selectedIndex.value),
-          positionRad: servoTarget,
-        });
-        const index = store.state.physicalMachines.findIndex((item) => item.id === updated.id);
-        if (index >= 0) store.state.physicalMachines[index] = { ...torqueMachine, ...updated };
-        store.state.error = null;
-      } catch (error) {
-        store.state.error = error instanceof Error ? error.message : String(error);
-      }
-      return;
-    }
-    const loop = store.state.loop;
-    const targets = [...loop.targets];
-    targets[selectedIndex.value] = value;
-    let status = store.state.loop;
-    if (!status.torque && status.phase !== "estop") {
-      status = await sendAction({ kind: "power", on: true });
-    }
-    for (let tickCount = 0; status.phase === "homing" && tickCount < 8; tickCount += 1) {
-      status = await tick();
-    }
-    if (status.phase === "ready" || status.phase === "holding") {
-      await sendTargets(targets);
-      status = store.state.loop;
-      if (status?.phase === "ready" || status?.phase === "holding") {
-        status = await sendAction({ kind: "drive", on: true });
-      }
-    } else if (status.phase === "driving") {
-      await sendTargets(targets);
-      status = store.state.loop;
-    }
-    if (status?.phase === "driving") await tick();
-  };
-  const refresh = async () => {
-    store.state.loop = await desktopBackend().loopStatus();
-  };
   function checkBindingConflict() {
-    const conflicts = bindingConflictsFor(selectedMachine.value);
+    const conflicts = bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value);
     const signature = conflicts.join("|");
     if (!signature) {
       bindingConflictSignature.value = "";
+      dismissPendingBindingMessage?.();
+      dismissPendingBindingMessage = undefined;
       return;
     }
-    rangeView.value = false;
-    secondaryPanel.value = "binding";
     if (bindingConflictSignature.value === signature) return;
     bindingConflictSignature.value = signature;
-    showMessage(`绑定冲突：${conflicts.map((item) => item.replace(":", " → ")).join("；")}`, {
-      type: "warning",
-      duration: 6_000,
-    });
+    dismissPendingBindingMessage?.();
+    dismissPendingBindingMessage = showMessage(
+      `绑定冲突：${conflicts.map((item) => item.replace(":", " → ")).join("；")}`,
+      {
+        type: "warning",
+        duration: 6_000,
+      },
+    );
   }
   watch(
     () => store.state.selectedVirtualMachine,
     () => {
+      bindingDrafts.value = {};
+      pendingBindingSlots.value = [];
+      dismissPendingBindingMessage?.();
+      dismissPendingBindingMessage = undefined;
       bindingConflictSignature.value = "";
       checkBindingConflict();
     },
   );
+  const promptPendingBindingSelection = () => {
+    if (!pendingBindingSlots.value.length) return;
+    dismissPendingBindingMessage?.();
+    const slots = [...pendingBindingSlots.value];
+    dismissPendingBindingMessage = showMessage("仍有绑定冲突待处理", {
+      type: "warning",
+      duration: 0,
+      dismissible: false,
+      action: {
+        label: slots.join("、"),
+        onClick: () => {
+          const index = jointSlots.value.indexOf(slots[0]);
+          if (index >= 0) selectServo(index + 1);
+        },
+      },
+    });
+  };
   const clearServoSelection = () => {
-    if (selectedId.value === null) return;
+    if (selectedId.value === null) {
+      promptPendingBindingSelection();
+      return;
+    }
     selectedId.value = null;
     suppressServoSelectionEvent = true;
     requestServoSelection(null);
     suppressServoSelectionEvent = false;
+    promptPendingBindingSelection();
     checkBindingConflict();
   };
   const selectServo = (id: number) => {
@@ -346,44 +446,18 @@ export const DebugPage = defineComponent(() => {
     if (suppressServoSelectionEvent) return;
     if (!(event instanceof CustomEvent)) return;
     if (event.detail === null) {
-      if (selectedId.value !== null) {
-        selectedId.value = null;
-        checkBindingConflict();
-      }
+      clearServoSelection();
       return;
     }
     if (typeof event.detail !== "number") return;
     selectedId.value = Math.max(1, Math.min(15, event.detail));
     checkBindingConflict();
   }
-  const bindingFor = (slotId: string) => {
-    const binding = debugBindingFor(selectedMachine.value, slotId);
-    const override = bindingOverrides.value[slotId];
-    return (
-      binding ??
-      (override === undefined
-        ? undefined
-        : {
-            slotId,
-            physicalId: override,
-            direction: 1,
-            zeroOffsetRad: 0,
-            minRad: null,
-            maxRad: null,
-          })
-    );
-  };
   const directionFor = (slotId: string) =>
     selectedPhysicalMachine.value?.jointDirections?.find((binding) => binding.slotId === slotId)
       ?.direction ??
     bindingFor(slotId)?.direction ??
     1;
-  const physicalIdForIndex = (index: number) => {
-    const slotId = jointSlots.value[index];
-    return slotId
-      ? (bindingFor(slotId)?.physicalId ?? officialServoIds[index])
-      : officialServoIds[index];
-  };
   const bindingOptionsFor = (index: number) => {
     const officialId = officialServoIds[index];
     const census = selectedPhysicalMachine.value?.census ?? [];
@@ -398,18 +472,18 @@ export const DebugPage = defineComponent(() => {
   const updateBinding = async (slotId: string, value: string) => {
     const virtualMachineId = store.state.selectedVirtualMachine;
     if (!virtualMachineId) return;
-    try {
-      const updated = await desktopBackend().bindVirtualMachine({
-        virtualMachineId,
-        slotId,
-        physicalId: value ? Number(value) : null,
-      });
-      const virtualIndex = store.state.virtualMachines.findIndex((item) => item.id === updated.id);
-      if (virtualIndex >= 0) {
-        store.state.virtualMachines[virtualIndex] = updated;
+    const physicalId = value ? Number(value) : null;
+    bindingDrafts.value = { ...bindingDrafts.value, [slotId]: physicalId };
+    const conflicts = bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value);
+    if (conflicts.length) {
+      if (!pendingBindingSlots.value.includes(slotId)) {
+        pendingBindingSlots.value = [...pendingBindingSlots.value, slotId];
       }
-      if (value) bindingOverrides.value[slotId] = Number(value);
-      else delete bindingOverrides.value[slotId];
+      announcePendingBindingConflict(slotId, conflicts);
+      return;
+    }
+    try {
+      await syncBindingDrafts();
       store.state.error = null;
       checkBindingConflict();
     } catch (error) {
@@ -424,7 +498,7 @@ export const DebugPage = defineComponent(() => {
     const physicalId = bindingFor(slotId)?.physicalId ?? officialServoIds[index];
     if (physicalId === undefined) return;
     try {
-      const updated = await desktopBackend().bindPhysicalMachine({
+      const updated = await commands.physicalMachineBind({
         physicalMachineId: physical.id,
         virtualMachineId,
         slotId,
@@ -435,33 +509,34 @@ export const DebugPage = defineComponent(() => {
         (item) => item.id === updated.id,
       );
       if (physicalIndex >= 0) store.state.physicalMachines[physicalIndex] = updated;
-      store.state.physicalMachines = await desktopBackend().physicalMachines();
+      store.state.physicalMachines = await commands.physicalMachines();
+      await restartReadLoop();
       store.state.error = null;
-    } catch (error) {
-      store.state.error = error instanceof Error ? error.message : String(error);
-    }
-  };
-  const openLogs = async () => {
-    try {
-      await desktopBackend().openLogs();
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
     }
   };
   const setPoseZero = async () => {
     const machine = selectedPhysicalMachine.value;
-    if (!machine?.connected) return;
-    if (bindingConflictsFor(selectedMachine.value).length) {
+    if (!machine?.connected || !poseZeroAllowed.value) return;
+    if (bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value).length) {
       checkBindingConflict();
       return;
     }
     try {
-      const updated = await desktopBackend().setPhysicalMachinePoseZero(
+      const updated = await commands.physicalMachineSetPoseZero(
         machine.id,
         store.state.selectedVirtualMachine,
       );
       const index = store.state.physicalMachines.findIndex((item) => item.id === updated.id);
       if (index >= 0) store.state.physicalMachines[index] = updated;
+      store.state.virtualMachines = await commands.virtualMachines();
+      if (store.state.loop) {
+        await closeLoop();
+        await openLoop(machine.id);
+        await refreshLoopStatus();
+      }
+      store.state.error = null;
       showMessage("已绑定当前姿态为零位", { type: "info" });
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
@@ -469,19 +544,22 @@ export const DebugPage = defineComponent(() => {
   };
   const toggleAllTorque = async () => {
     const machine = selectedPhysicalMachine.value;
-    if (!machine?.connected) return;
-    if (bindingConflictsFor(selectedMachine.value).length) {
+    const virtualMachineId = store.state.selectedVirtualMachine;
+    if (!machine?.connected || !virtualMachineId || !manualControl.value || accessBusy.value)
+      return;
+    if (bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value).length) {
       checkBindingConflict();
       return;
     }
     try {
-      const updated = await desktopBackend().setPhysicalMachineTorque(
+      const updated = await commands.physicalMachineSetTorque(
         machine.id,
-        !machine.torqueEnabled,
-        store.state.selectedVirtualMachine,
+        !anyTorqueEnabled.value,
+        virtualMachineId,
       );
       const index = store.state.physicalMachines.findIndex((item) => item.id === updated.id);
       if (index >= 0) store.state.physicalMachines[index] = updated;
+      await refreshLoopStatus();
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
     }
@@ -494,7 +572,7 @@ export const DebugPage = defineComponent(() => {
     };
   const rangeStateFor = (slotId: string) =>
     store.state.jointRangeStates.find((state) => state.slotId === slotId);
-  const scenePose = () => {
+  const updateRangePreview = () => {
     store.state.rangePreview = jointSlots.value.map((slotId) => {
       const range = rangeFor(slotId);
       const endpoint = selectedRangeEndpoints.value[slotId];
@@ -516,7 +594,7 @@ export const DebugPage = defineComponent(() => {
       ...(store.state.loop?.positions ?? store.state.debugPose ?? Array(15).fill(0)),
     ];
     selectedRangeEndpoints.value = {};
-    store.state.rangePreview = Array(15).fill(0);
+    updateRangePreview();
     rangeView.value = true;
   };
   const selectRangeEndpoint = (slotId: string, endpoint: "min" | "max") => {
@@ -525,8 +603,8 @@ export const DebugPage = defineComponent(() => {
     if (current === endpoint) delete next[slotId];
     else next[slotId] = endpoint;
     selectedRangeEndpoints.value = next;
+    updateRangePreview();
   };
-
   return () => (
     <ScrollArea className={[style.page, style.debugPage].filter(Boolean).join(" ")}>
       <div class={style.debugMachineRow}>
@@ -539,52 +617,125 @@ export const DebugPage = defineComponent(() => {
           ]}
           title={selectedPhysicalMachine.value?.connected ? "实机在线" : "实机离线"}
         />
-        <span
-          class={[rangeView.value ? style.machineTitle : undefined, style.machineViewToggle]}
-          onClick={toggleRangeView}
-        >
-          肢体范围
-        </span>
       </div>
-      <div class={style.systemActions}>
-        {rangeView.value ? (
-          <button type="button" onClick={scenePose}>
-            场景姿态预览
-          </button>
-        ) : (
-          <button type="button" onClick={requestDefaultPose}>
-            还原姿态零位
-          </button>
-        )}
-        <button type="button" onClick={requestDuckFocus}>
+      <div class={style.systemActions} aria-label="调试全局操作">
+        <button
+          type="button"
+          disabled={!physicalConnected.value || accessBusy.value}
+          onClick={() => void toggleManualControl()}
+        >
+          {manualControl.value ? "返回只读" : "切换为手动控制"}
+        </button>
+        <button
+          class={style.poseAction}
+          type="button"
+          disabled={!poseZeroAllowed.value || accessBusy.value}
+          title="读取当前实机姿态，并将它绑定为模拟机的姿态零位"
+          onClick={() => void setPoseZero()}
+        >
+          绑定
+        </button>
+        <button
+          class={style.poseAction}
+          type="button"
+          title="将当前模拟机姿态还原到默认零位"
+          onClick={requestDefaultPose}
+        >
+          还原
+        </button>
+        <button
+          class={style.viewAction}
+          type="button"
+          title="将视图聚焦到当前选中的模拟机"
+          onClick={requestDuckFocus}
+        >
           聚焦
         </button>
-        <button type="button" onClick={requestRestoreDuckView}>
-          回到聚焦前位置
+        <button
+          class={style.viewAction}
+          type="button"
+          title="将视图恢复到聚焦当前模拟机之前的位置"
+          onClick={requestRestoreDuckView}
+        >
+          还原
+        </button>
+        <button
+          class={style.torqueAction}
+          type="button"
+          disabled={!physicalConnected.value || !manualControl.value || accessBusy.value}
+          title="打开或关闭当前实机全部舵机的扭矩输出"
+          onClick={() => void toggleAllTorque()}
+        >
+          {anyTorqueEnabled.value ? "全部力矩关" : "全部力矩开"}
         </button>
       </div>
-      <article class={[style.panelCard, rangeView.value ? style.rangeOnlyCard : undefined]}>
+      <article class={style.panelCard}>
         <div class={style.panelHeader}>
-          <div class={style.panelTabs}>
-            {(
-              [
-                ["safety", "安全状态"],
-                ["binding", "肢体绑定"],
-                ["world", "世界位置"],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                class={secondaryPanel.value === key ? style.active : undefined}
-                type="button"
-                disabled={key === "safety" && !physicalConnected.value}
-                onClick={() => (secondaryPanel.value = key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
+          <button
+            class={style.panelTitleButton}
+            type="button"
+            title={rangeView.value ? "切换到肢体绑定" : "切换到肢体范围"}
+            onClick={toggleRangeView}
+          >
+            {rangeView.value ? "肢体范围" : "肢体绑定"}
+          </button>
         </div>
-        {!rangeView.value && secondaryPanel.value === "binding" && (
+        {rangeView.value ? (
+          <>
+            <div class={style.rangePanel}>
+              <div class={style.rangeHeader}>
+                <span>肢体名</span>
+                <span
+                  class={
+                    store.state.jointRangeStates.some((state) => state.belowMin)
+                      ? style.rangeMinTitle
+                      : undefined
+                  }
+                >
+                  最小角度限制
+                </span>
+                <span
+                  class={
+                    store.state.jointRangeStates.some((state) => state.aboveMax)
+                      ? style.rangeMaxTitle
+                      : undefined
+                  }
+                >
+                  最大角度限制
+                </span>
+              </div>
+              {jointSlots.value.map((slotId) => {
+                const range = rangeFor(slotId);
+                const rangeState = rangeStateFor(slotId);
+                return (
+                  <div class={style.rangeRow}>
+                    <span>{slotId}</span>
+                    <button
+                      type="button"
+                      class={[
+                        selectedRangeEndpoints.value[slotId] === "min" ? style.active : undefined,
+                        rangeState?.belowMin ? style.rangeMinExceeded : undefined,
+                      ]}
+                      onClick={() => selectRangeEndpoint(slotId, "min")}
+                    >
+                      {(range.minRad ?? -Math.PI).toFixed(3)} rad
+                    </button>
+                    <button
+                      type="button"
+                      class={[
+                        selectedRangeEndpoints.value[slotId] === "max" ? style.active : undefined,
+                        rangeState?.aboveMax ? style.rangeMaxExceeded : undefined,
+                      ]}
+                      onClick={() => selectRangeEndpoint(slotId, "max")}
+                    >
+                      {(range.maxRad ?? Math.PI).toFixed(3)} rad
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        ) : (
           <div class={style.bindingList}>
             {jointSlots.value.map((slotId, index) => (
               <div
@@ -643,234 +794,28 @@ export const DebugPage = defineComponent(() => {
             ))}
           </div>
         )}
-        {rangeView.value ? (
-          <div class={style.rangePanel}>
-            <div class={style.rangeHeader}>
-              <span>肢体名</span>
-              <span
-                class={
-                  store.state.jointRangeStates.some((state) => state.belowMin)
-                    ? style.rangeMinTitle
-                    : undefined
-                }
-              >
-                最小角度限制
-              </span>
-              <span
-                class={
-                  store.state.jointRangeStates.some((state) => state.aboveMax)
-                    ? style.rangeMaxTitle
-                    : undefined
-                }
-              >
-                最大角度限制
-              </span>
-            </div>
-            {jointSlots.value.map((slotId) => {
-              const range = rangeFor(slotId);
-              const rangeState = rangeStateFor(slotId);
-              return (
-                <div class={style.rangeRow}>
-                  <span>{slotId}</span>
-                  <button
-                    type="button"
-                    class={[
-                      selectedRangeEndpoints.value[slotId] === "min" ? style.active : undefined,
-                      rangeState?.belowMin ? style.rangeMinExceeded : undefined,
-                    ]}
-                    onClick={() => selectRangeEndpoint(slotId, "min")}
-                  >
-                    {(range.minRad ?? -Math.PI).toFixed(3)} rad
-                  </button>
-                  <button
-                    type="button"
-                    class={[
-                      selectedRangeEndpoints.value[slotId] === "max" ? style.active : undefined,
-                      rangeState?.aboveMax ? style.rangeMaxExceeded : undefined,
-                    ]}
-                    onClick={() => selectRangeEndpoint(slotId, "max")}
-                  >
-                    {(range.maxRad ?? Math.PI).toFixed(3)} rad
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
-        {!rangeView.value && secondaryPanel.value === "world" && (
-          <div class={style.worldPositionPanel}>
-            {(["x", "y", "z"] as const).map((axis, index) => (
-              <div class={style.worldPositionRow}>
-                <span>{axis}</span>
-                <Slider
-                  value={worldPositionDraft.value[index]}
-                  min={-10}
-                  max={10}
-                  step={0.01}
-                  progress={true}
-                  progressCenter={0}
-                  ariaLabel={`${axis} 世界位置`}
-                  onInput={(event) => updateWorldPosition(index, event.value)}
-                />
-              </div>
-            ))}
-          </div>
-        )}
-        {!rangeView.value && secondaryPanel.value === "safety" && (
-          <>
-            <ul class={style.diagnosticList}>
-              <li>
-                <span>控制环 session</span>
-                <b>{store.state.loop?.session ?? "—"}</b>
-              </li>
-              <li>
-                <span>目标数量</span>
-                <b>{store.state.loop?.targets.length ?? 0}</b>
-              </li>
-              <li>
-                <span>传感器连续失败</span>
-                <b>{store.state.loop?.sensorFailures ?? 0}</b>
-              </li>
-              <li
-                class={style.logEntry}
-                role="button"
-                tabindex={0}
-                onClick={() => void openLogs()}
-                onKeydown={(event: KeyboardEvent) => {
-                  if (event.key === "Enter" || event.key === " ") void openLogs();
-                }}
-              >
-                <span>实机日志</span>
-                <b>打开日志</b>
-              </li>
-            </ul>
-          </>
-        )}
       </article>
-      <div
-        class={[style.panelActions, !physicalConnected.value ? style.disabled : undefined]}
-        v-show={!rangeView.value}
-      >
-        <button
-          type="button"
-          disabled={!physicalConnected.value}
-          onClick={() => void setPoseZero()}
-        >
-          绑定姿态零位
-        </button>
-        <button
-          type="button"
-          disabled={!physicalConnected.value}
-          onClick={() => void toggleAllTorque()}
-        >
-          {anyTorqueEnabled.value ? "全部力矩关" : "全部力矩开"}
-        </button>
-      </div>
-      <article
-        hidden={rangeView.value}
-        aria-disabled={!physicalConnected.value}
-        class={[style.panelCard, !physicalConnected.value ? style.disabled : undefined]}
-      >
-        <div class={style.servoToolbar}>
-          <div class={style.servoIdList} aria-label="舵机编号">
-            {debugServoIndexes.map((id) => (
-              <button
-                class={selectedId.value === id ? style.active : undefined}
-                type="button"
-                onClick={() => selectServo(id)}
-              >
-                {physicalIdForIndex(id - 1)}
-              </button>
-            ))}
-          </div>
+      <article class={[style.panelCard, style.worldCard]}>
+        <div class={style.panelHeader}>
+          <strong>世界位置</strong>
         </div>
-        <div class={style.parameterGrid} aria-label="舵机状态">
-          <div>
-            <span>位置</span>
-            <b>{formatParameter(selectedPosition.value, " rad")}</b>
-          </div>
-          <div>
-            <span>速度</span>
-            <b>—</b>
-          </div>
-          <div>
-            <span>负载</span>
-            <b>—</b>
-          </div>
-          <div>
-            <span>电压</span>
-            <b>—</b>
-          </div>
-          <div>
-            <span>温度</span>
-            <b>—</b>
-          </div>
-          <div>
-            <span>电流</span>
-            <b>—</b>
-          </div>
-        </div>
-        <div class={style.controlGroup}>
-          <div class={style.field}>
-            目标位置
-            <div class={style.targetRow}>
+        <div class={style.worldPositionPanel}>
+          {(["x", "y", "z"] as const).map((axis, index) => (
+            <div class={style.worldPositionRow}>
+              <span>{axis}</span>
               <Slider
-                value={Number(targetDraft.value) || 0}
-                min={-Math.PI}
-                max={Math.PI}
-                step={0.001}
+                value={worldPositionDraft.value[index]}
+                min={-10}
+                max={10}
+                step={0.01}
                 progress={true}
                 progressCenter={0}
-                ariaLabel="目标位置"
-                onInput={(event) => {
-                  targetDraft.value = String(event.value);
-                  void move(String(event.value));
-                }}
+                ariaLabel={`${axis} 世界位置`}
+                onInput={(event) => updateWorldPosition(index, event.value)}
               />
             </div>
-          </div>
-          <div class={style.actions}>
-            <button class={style.primary} onClick={() => void move()}>
-              移动
-            </button>
-            <button
-              onClick={() => {
-                if (bindingConflictsFor(selectedMachine.value).length) {
-                  checkBindingConflict();
-                  return;
-                }
-                if (store.state.loop) {
-                  void sendAction({ kind: "power", on: !anyTorqueEnabled.value });
-                } else {
-                  void toggleAllTorque();
-                }
-              }}
-            >
-              {anyTorqueEnabled.value ? "力矩关" : "力矩开"}
-            </button>
-            <button onClick={() => void refresh()}>刷新状态</button>
-          </div>
-          <div class={style.actions}>
-            <button onClick={() => send()}>发送微调目标</button>
-            <button
-              onClick={() => {
-                if (bindingConflictsFor(selectedMachine.value).length) {
-                  checkBindingConflict();
-                  return;
-                }
-                void tick();
-              }}
-            >
-              推进一拍
-            </button>
-            {store.state.loop && (
-              <button class={style.danger} onClick={() => void closeLoop()}>
-                停止控制环
-              </button>
-            )}
-          </div>
+          ))}
         </div>
-        <p class={style.muted}>速度、加速度和实时 telemetry 会在后端提供单舵机读数后恢复。</p>
       </article>
     </ScrollArea>
   );
@@ -889,12 +834,12 @@ export async function load() {
       store.state.autoReconnectEnabled,
       store.state.policies,
     ] = await Promise.all([
-      desktopBackend().servoCatalog(),
-      desktopBackend().virtualMachines(),
-      desktopBackend().physicalMachines(),
-      desktopBackend().actions(),
-      desktopBackend().autoReconnectEnabled(),
-      desktopBackend().policyList(),
+      commands.servoCatalog(),
+      commands.virtualMachines(),
+      commands.physicalMachines(),
+      commands.actions(),
+      commands.autoReconnectEnabled(),
+      commands.policyList(),
     ]);
     store.state.selectedPolicyId =
       store.state.policies.find((policy) => policy.selected)?.id ?? null;
@@ -910,58 +855,34 @@ export async function load() {
 
 export async function createAction(name: string, kind: ActionRecord["kind"] = "pose") {
   const store = useDesktopStore();
-  const action = await desktopBackend().createAction({ name, kind });
+  const action = await commands.actionCreate({ name, kind });
   store.state.actions.push(action);
   return action;
 }
 
 export async function deleteAction(id: string) {
   const store = useDesktopStore();
-  await desktopBackend().deleteAction(id);
+  await commands.actionDelete(id);
   store.state.actions = store.state.actions.filter((action) => action.id !== id);
 }
 
-export async function openLoop(servoIds: number[], physicalMachineId?: string, policyId?: string) {
+export async function openLoop(physicalMachineId: string) {
   const store = useDesktopStore();
   if (!store.state.selectedVirtualMachine) throw new Error("请选择模拟机");
-  store.state.loop = await desktopBackend().loopOpen({
+  store.state.loop = await commands.runtimeOpen({
     virtualMachineId: store.state.selectedVirtualMachine,
-    servoIds,
     physicalMachineId,
-    policyId,
+    access: "read_only",
+    policyId: null,
   });
-  return store.state.loop;
-}
-
-export async function sendAction(action: LoopAction) {
-  const store = useDesktopStore();
-  store.state.loop = await desktopBackend().loopAction(action);
-  return store.state.loop;
-}
-
-export async function sendTargets(targets: number[]) {
-  const store = useDesktopStore();
-  await desktopBackend().loopCommand(targets);
-  store.state.loop = await desktopBackend().loopStatus();
-}
-
-export async function tick() {
-  const store = useDesktopStore();
-  store.state.loop = await desktopBackend().loopTick();
   return store.state.loop;
 }
 
 export async function closeLoop() {
   const store = useDesktopStore();
-  await desktopBackend().loopClose();
-  store.state.loop = null;
+  await commands.runtimeClose(store.state.loop?.runtimeGeneration ?? 0, "readOnlySource");
+  const remaining = await commands.loopStatus();
+  // Releasing the debug source must preserve a physical execution owned by another page.
+  store.state.loop = remaining?.simulation ? null : remaining;
   store.state.jointRangeStates = [];
-}
-
-export async function officialSceneModel() {
-  return desktopBackend().officialSceneModel();
-}
-
-export async function officialSceneFrame(positions: number[]) {
-  return desktopBackend().officialSceneFrame(positions);
 }

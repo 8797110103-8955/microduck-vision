@@ -1,7 +1,8 @@
+import * as commands from "../../../generated/types";
 import { defineComponent, onMounted, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
 export const PolicyPage = defineComponent(() => {
@@ -12,7 +13,7 @@ export const PolicyPage = defineComponent(() => {
 
   const refresh = async () => {
     try {
-      store.state.policies = await desktopBackend().policyList();
+      store.state.policies = await commands.policyList();
       error.value = null;
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
@@ -22,7 +23,7 @@ export const PolicyPage = defineComponent(() => {
   const download = async (id: string) => {
     busy.value = id;
     try {
-      await desktopBackend().policyDownload(id);
+      await commands.policyDownload(id);
       await refresh();
       error.value = null;
     } catch (reason) {

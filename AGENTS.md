@@ -1,4 +1,4 @@
-> Agents keep temporary, project-related files (scratch scripts, logs, notes) in `.agentic/`.
+> Agents keep temporary, project-related files (scratch scripts, logs, notes) in `target/.agentic/`.
 > Record only traps that are easy to fall into, not module layout. File format changes get no compatibility code.
 
 # Project conventions

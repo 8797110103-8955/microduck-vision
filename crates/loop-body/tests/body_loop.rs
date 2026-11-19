@@ -2,9 +2,59 @@ mod support;
 
 use std::time::Duration;
 
-use loop_body::{BodyCommand, BodyLoop, LoopAction, LoopConfig, LoopError, LoopPhase};
+use loop_body::{
+    BodyCommand, BodyLoop, ControllerInput, LoopAction, LoopConfig, LoopController, LoopError,
+    LoopPhase,
+};
 use servo::ServoModel;
 use support::{FakeDriver, binding, loop_with};
+
+struct FixedController {
+    calls: usize,
+}
+
+impl LoopController for FixedController {
+    fn on_loop(&mut self, input: ControllerInput) -> Result<Option<BodyCommand>, LoopError> {
+        assert_eq!(input.sensors.positions.len(), 15);
+        assert_eq!(input.status.phase, LoopPhase::Ready);
+        self.calls += 1;
+        let mut targets = vec![0.0; 15];
+        targets[0] = 0.2;
+        Ok(Some(BodyCommand {
+            session: input.status.session,
+            targets,
+        }))
+    }
+}
+
+#[test]
+fn controller_hook_runs_between_sensor_read_and_backend_write() {
+    let driver = FakeDriver::new(15);
+    let events = driver.event_log();
+    let mut body_loop = BodyLoop::open(
+        binding(ServoModel::Hd1910, 15),
+        Box::new(driver),
+        LoopConfig {
+            homing_ticks: 0,
+            ..LoopConfig::default()
+        },
+    )
+    .unwrap();
+    body_loop.send(LoopAction::Power(true)).unwrap();
+    let mut controller = FixedController { calls: 0 };
+
+    body_loop
+        .tick_with_controller(Duration::from_millis(20), &mut controller)
+        .unwrap();
+
+    assert_eq!(controller.calls, 1);
+    assert_eq!(body_loop.status().phase, LoopPhase::Driving);
+    assert_eq!(body_loop.status().targets[0], 0.2);
+    assert_eq!(
+        &*events.lock().unwrap(),
+        &["torque", "gain", "read", "write"]
+    );
+}
 
 #[test]
 fn power_homing_ready_drive_hold_and_stop_are_explicit() {
@@ -166,6 +216,9 @@ fn virtual_preview_keeps_out_of_range_target_for_scene_feedback() {
     let status = body_loop.status();
     assert_eq!(status.targets[0], 99.0);
     assert!(status.joint_range_states[0].above_max);
+    // Verify the backend received the angle, rather than only checking the cached command.
+    body_loop.tick(Duration::from_millis(20)).unwrap();
+    assert_eq!(body_loop.status().positions[0], 99.0);
 }
 
 #[test]
@@ -188,7 +241,7 @@ fn policy_failure_holds_the_last_safe_target_with_a_diagnostic() {
     body_loop.tick(Duration::from_millis(20)).unwrap();
     body_loop.tick(Duration::from_millis(20)).unwrap();
     body_loop.send(LoopAction::Drive(true)).unwrap();
-    body_loop.report_policy_error("inference failed");
+    body_loop.report_controller_error("inference failed");
     let status = body_loop.status();
     assert_eq!(status.phase, LoopPhase::Holding);
     assert_eq!(status.last_error.as_deref(), Some("inference failed"));

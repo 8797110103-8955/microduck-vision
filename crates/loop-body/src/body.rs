@@ -2,14 +2,11 @@
 
 use std::time::Duration;
 
-use duck_body::{BodyState, BodyTargets, ServoParameterSet, VirtualBody};
-use servo::ServoLoopDriver;
-
 use crate::{
     BodyCommand, JointRangeState, LoopAction, LoopBinding, LoopConfig, LoopError, LoopPhase,
-    LoopStatus,
-    adapter::ServoAdapter, lifecycle, safety,
+    LoopStatus, adapter::ServoAdapter, lifecycle, safety,
 };
+use duck_body::{BodyState, BodyTargets, ServoParameterSet, VirtualBody};
 
 pub struct BodyLoop {
     body: VirtualBody,
@@ -24,13 +21,16 @@ pub struct BodyLoop {
     last_targets: Vec<f64>,
     last_error: Option<String>,
     last_velocities: Vec<f64>,
+    pending_velocities: Option<Vec<f64>>,
+    last_imu: Option<servo::ServoImuSample>,
+    valid: Vec<bool>,
     joint_range_states: Vec<JointRangeState>,
 }
 
 impl BodyLoop {
     pub fn open(
         binding: LoopBinding,
-        driver: Box<dyn ServoLoopDriver>,
+        driver: Box<dyn crate::ControlBackend>,
         config: LoopConfig,
     ) -> Result<Self, LoopError> {
         if config.gain == 0 {
@@ -61,6 +61,9 @@ impl BodyLoop {
             last_targets: vec![0.0; count],
             last_error: None,
             last_velocities: vec![0.0; count],
+            pending_velocities: None,
+            last_imu: None,
+            valid: vec![false; count],
             joint_range_states: template
                 .joints
                 .iter()
@@ -119,6 +122,7 @@ impl BodyLoop {
             }
             LoopAction::Stop => {
                 self.phase = LoopPhase::Stopped;
+                self.command = None;
                 self.adapter.set_torque(false)?;
             }
             LoopAction::Estop => {
@@ -143,14 +147,133 @@ impl BodyLoop {
         Ok(())
     }
 
-    pub fn report_policy_error(&mut self, detail: impl Into<String>) {
+    pub fn report_controller_error(&mut self, detail: impl Into<String>) {
         self.phase = LoopPhase::Holding;
         self.last_error = Some(detail.into());
     }
 
     pub fn tick(&mut self, dt: Duration) -> Result<(), LoopError> {
         self.update_sensors(dt)?;
-        self.apply_targets()
+        self.apply_targets()?;
+        self.advance_execution(self.config.physics_substeps, self.config.physics_dt)
+    }
+
+    /// Run one controller-backed tick through the same lifecycle and backend path used by every
+    /// execution mode. The controller is called after sensors are sampled and before targets are
+    /// applied, so a desktop policy scheduler can switch an already-loaded session for this tick
+    /// without opening a second loop or restarting the backend.
+    pub fn tick_with_controller<C: crate::LoopController>(
+        &mut self,
+        dt: Duration,
+        controller: &mut C,
+    ) -> Result<(), LoopError> {
+        let sensors = self.read_sensors(dt)?;
+        let status = self.status();
+        if !matches!(status.phase, LoopPhase::Ready | LoopPhase::Driving) {
+            self.apply_targets()?;
+            return self.advance_execution(self.config.physics_substeps, self.config.physics_dt);
+        }
+
+        let command = match controller.on_loop(crate::ControllerInput { sensors, status }) {
+            Ok(command) => command,
+            Err(error) => {
+                self.report_controller_error(error.to_string());
+                return Err(error);
+            }
+        };
+        if let Some(command) = command {
+            if self.phase == LoopPhase::Ready {
+                self.send(LoopAction::Drive(true))?;
+            }
+            self.set_command(command)?;
+        }
+        self.apply_targets()?;
+        self.advance_execution(self.config.physics_substeps, self.config.physics_dt)
+    }
+
+    /// Sample the selected backend and return the canonical frame for an injected controller.
+    /// Policy and product code can build a command from this frame while the lifecycle and
+    /// backend ownership remain inside `BodyLoop`.
+    pub fn read_sensors(&mut self, dt: Duration) -> Result<crate::SensorFrame, LoopError> {
+        self.update_sensors(dt)?;
+        Ok(self.sensor_frame())
+    }
+
+    pub fn sensor_frame(&self) -> crate::SensorFrame {
+        let state = self.body.read_state();
+        crate::SensorFrame {
+            valid: self.valid.clone(),
+            positions: state.positions,
+            velocities: self.last_velocities.clone(),
+            imu: self.last_imu,
+        }
+    }
+
+    /// Advance backend execution independently from target submission.
+    pub fn advance_execution(
+        &mut self,
+        physics_steps: u32,
+        physics_dt: Duration,
+    ) -> Result<(), LoopError> {
+        self.adapter.advance_execution(physics_steps, physics_dt)
+    }
+
+    pub fn reset_execution(&mut self) -> Result<(), LoopError> {
+        self.adapter.reset_execution()?;
+        self.command = None;
+        self.pending_velocities = None;
+        self.last_velocities.fill(0.0);
+        self.last_imu = None;
+        self.valid.fill(false);
+        self.sensor_failures = 0;
+        self.last_error = None;
+        let sample = self.adapter.read()?;
+        self.apply_sensor_frame(sample, Duration::ZERO)?;
+        self.last_targets = self.body.read_state().positions;
+        Ok(())
+    }
+
+    pub fn config(&self) -> &LoopConfig {
+        &self.config
+    }
+
+    pub fn servo_ids(&self) -> impl Iterator<Item = u8> + '_ {
+        self.adapter.servo_ids()
+    }
+
+    pub fn set_velocity_observation_delay(&mut self, ticks: u32) -> Result<(), LoopError> {
+        if ticks > 1 {
+            return Err(LoopError::Controller(
+                "only current or one-tick velocity sampling is supported".into(),
+            ));
+        }
+        self.config.velocity_observation_delay_ticks = ticks;
+        self.pending_velocities = None;
+        self.last_velocities.fill(0.0);
+        Ok(())
+    }
+
+    /// Read the current servo state without changing lifecycle, torque, or target outputs.
+    ///
+    /// This is used by the desktop debug view, which must be able to observe a limp robot while
+    /// leaving all actuator writes to its explicit, separate debug commands.
+    pub fn read_sensors_only(&mut self, dt: Duration) -> Result<(), LoopError> {
+        if dt != self.config.period {
+            return Err(LoopError::InvalidTick);
+        }
+        self.tick += 1;
+        let sample = match self.adapter.read() {
+            Ok(sample) => sample,
+            Err(error) => {
+                self.sensor_failures += 1;
+                self.last_error = Some(error.to_string());
+                if self.sensor_failures >= self.config.sensor_failure_limit {
+                    self.phase = LoopPhase::Holding;
+                }
+                return Err(error);
+            }
+        };
+        self.apply_sensor_frame(sample, dt)
     }
 
     pub(crate) fn update_sensors(&mut self, dt: Duration) -> Result<(), LoopError> {
@@ -178,26 +301,48 @@ impl BodyLoop {
                 return Err(error);
             }
         };
+        self.apply_sensor_frame(sample, dt)
+    }
+
+    fn apply_sensor_frame(
+        &mut self,
+        sample: crate::SensorFrame,
+        dt: Duration,
+    ) -> Result<(), LoopError> {
+        if sample.valid.len() != sample.positions.len() {
+            return Err(LoopError::InvalidBackendState {
+                field: "feedback validity",
+            });
+        }
+        self.valid = sample.valid;
         self.sensor_failures = 0;
         self.last_error = None;
-        self.last_velocities = sample.velocities.clone();
+        let current_velocities = sample.velocities;
+        let observed_velocities = if self.config.velocity_observation_delay_ticks == 0 {
+            current_velocities.clone()
+        } else {
+            self.pending_velocities
+                .replace(current_velocities.clone())
+                .unwrap_or_else(|| vec![0.0; current_velocities.len()])
+        };
+        self.last_velocities = observed_velocities;
+        self.last_imu = sample.imu;
         self.body.apply_sensor_state(BodyState {
             positions: sample.positions,
-            velocities: sample.velocities,
+            velocities: current_velocities,
             elapsed: self.body.read_state().elapsed + dt,
         })?;
-
         Ok(())
     }
 
-    pub(crate) fn apply_targets(&mut self) -> Result<(), LoopError> {
+    pub fn apply_targets(&mut self) -> Result<(), LoopError> {
         let positions = self.body.read_state().positions;
 
         let targets = match self.phase {
             // Homing must establish a safe hold, not drive every joint to the numeric zero
-            // frame.  The policy's neutral pose is non-zero for several joints, and a physical
+            // frame.  The controller's neutral pose is non-zero for several joints, and a physical
             // robot may already be in a valid pose when torque is enabled.  Holding the measured
-            // canonical positions avoids an artificial jump before policy inference starts.
+            // canonical positions avoids an artificial jump before controller inference starts.
             LoopPhase::Homing => positions.clone(),
             LoopPhase::Driving => self
                 .command
@@ -264,10 +409,6 @@ impl BodyLoop {
             last_error: self.last_error.clone(),
             joint_range_states: self.joint_range_states.clone(),
         }
-    }
-
-    pub(crate) fn sensor_velocities(&self) -> &[f64] {
-        &self.last_velocities
     }
 
     fn validate_targets(&self, targets: &[f64]) -> Result<(), LoopError> {

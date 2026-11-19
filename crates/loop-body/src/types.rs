@@ -7,6 +7,71 @@ use serde::{Deserialize, Serialize};
 use servo::ServoModel;
 use thiserror::Error;
 
+/// Monotonic logical sample time. The value is deliberately independent of a host `Instant` so
+/// traces and MCU adapters share the same contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SampleTime(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ControlTick(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionInterval {
+    pub control_tick: ControlTick,
+    pub physics_steps: u32,
+    pub physics_dt: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendLifecycleAction {
+    Stop,
+    Reset,
+    Estop,
+    Resume,
+}
+
+/// Timebase used by a backend-owned delay. Keeping this explicit prevents vendor physics steps
+/// from being mistaken for policy control ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelayTimebase {
+    PhysicsStep,
+    ControlTick,
+    WallClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActuatorDelaySpec {
+    pub timebase: DelayTimebase,
+    pub min_steps: u32,
+    pub max_steps: u32,
+}
+
+impl ActuatorDelaySpec {
+    pub const fn physics_steps(min_steps: u32, max_steps: u32) -> Self {
+        Self {
+            timebase: DelayTimebase::PhysicsStep,
+            min_steps,
+            max_steps,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), LoopError> {
+        if self.min_steps > self.max_steps {
+            return Err(LoopError::Controller(format!(
+                "actuator delay minimum {} exceeds maximum {}",
+                self.min_steps, self.max_steps
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Shared backend boundary. The low-level servo API remains available for register and bus
+/// adapters; control code can depend on this marker without knowing a concrete transport.
+pub trait ControlBackend: servo::ServoLoopDriver {}
+
+impl<T: servo::ServoLoopDriver + ?Sized> ControlBackend for T {}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum LoopError {
     #[error("body error: {0}")]
@@ -37,8 +102,12 @@ pub enum LoopError {
     ZeroGain,
     #[error("sensor frame has length {actual}, expected {expected}")]
     SensorLength { actual: usize, expected: usize },
-    #[error("policy error: {0}")]
-    Policy(String),
+    #[error("backend state contains invalid or non-finite {field}")]
+    InvalidBackendState { field: &'static str },
+    #[error("controller requires an IMU sample but the backend reported none")]
+    MissingImu,
+    #[error("controller error: {0}")]
+    Controller(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,11 +126,17 @@ pub enum LoopPhase {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopConfig {
     pub period: Duration,
+    pub physics_dt: Duration,
+    pub physics_substeps: u32,
     /// Startup sensor-hold ticks. Zero skips the physical homing phase, which is useful for a
     /// virtual driver whose initial positions are already known.
     pub homing_ticks: u32,
     pub sensor_failure_limit: u32,
     pub gain: u16,
+    /// Number of control ticks by which joint velocity observations are delayed. Physical
+    /// servo telemetry uses the deployed one-tick sensor path; a virtual backend can set this to
+    /// zero when it advances physics after writing the current controller action.
+    pub velocity_observation_delay_ticks: u32,
     /// Clamp requested body targets before writing to a physical driver. Virtual previews keep
     /// this disabled so the scene can show the requested out-of-range posture while reporting it.
     pub enforce_body_range: bool,
@@ -71,9 +146,12 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             period: Duration::from_millis(20),
+            physics_dt: Duration::from_millis(5),
+            physics_substeps: 4,
             homing_ticks: 5,
             sensor_failure_limit: 3,
             gain: 200,
+            velocity_observation_delay_ticks: 1,
             enforce_body_range: true,
         }
     }
@@ -169,7 +247,7 @@ mod calibration_tests {
         };
         assert_eq!(calibration.physical_ids(), vec![42, 43]);
         let servo = calibration.to_servo_positions(&[0.5, 0.25]);
-        assert!((servo[0] + 0.7).abs() < 1e-9);
+        assert!((servo[0] + 0.3).abs() < 1e-9);
         assert!((servo[1] - 0.15).abs() < 1e-9);
         let body = calibration.to_body_positions(&servo);
         assert!((body[0] - 0.5).abs() < 1e-9);
@@ -193,6 +271,7 @@ mod calibration_tests {
             }],
         };
         assert_eq!(calibration.to_servo_positions(&[1.0]), vec![0.6]);
+        assert_eq!(calibration.to_servo_positions_unchecked(&[1.0]), vec![1.1]);
     }
 }
 
@@ -209,12 +288,49 @@ pub struct BodyCommand {
     pub targets: Vec<f64>,
 }
 
+/// Input delivered to the product controller once per control tick.
+///
+/// The frame is already translated into canonical body order. A controller can choose a policy
+/// session, run inference and return a body command without knowing which backend will execute it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControllerInput {
+    pub sensors: SensorFrame,
+    pub status: LoopStatus,
+}
+
+/// Product controller hook for the single body execution loop.
+///
+/// Returning `None` keeps the loop in its current lifecycle phase and lets it continue its normal
+/// sensor, target and physics handling without an inference result.
+pub trait LoopController {
+    fn on_loop(&mut self, input: ControllerInput) -> Result<Option<BodyCommand>, LoopError>;
+}
+
 /// Canonical sensor frame exposed by the adapter boundary. Values are already
-/// in body order and body coordinates; policy/controller code never sees IDs.
+/// in body order and body coordinates. Controllers never see physical IDs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorFrame {
+    pub valid: Vec<bool>,
     pub positions: Vec<f64>,
     pub velocities: Vec<f64>,
+    pub imu: Option<servo::ServoImuSample>,
+}
+
+/// Canonical state returned by a selected control backend.
+///
+/// Backend implementations may use a physical bus, a local simulation or a transport to
+/// another device. The control core only consumes canonical body-joint values and never sees
+/// physical servo IDs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendState {
+    pub positions: Vec<f64>,
+    pub velocities: Vec<f64>,
+    pub imu: Option<servo::ServoImuSample>,
+    pub sequence: u64,
+    pub sampled_at: SampleTime,
+    pub valid_positions: Vec<bool>,
+    pub valid_velocities: Vec<bool>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

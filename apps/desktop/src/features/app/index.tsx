@@ -1,12 +1,13 @@
-import { computed, defineComponent, onMounted, onUnmounted, ref, shallowRef } from "vue";
+import * as commands from "../../../generated/types";
+import { computed, defineComponent, onScopeDispose, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
-import type { JointRangeState, TrainingProgress } from "../../bridge/types";
+import type { JointRangeState, LoopStatus, TrainingProgress } from "../../../generated/types";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../../../assets/icons/icon.ico";
 import { Message } from "../../components/message";
 import { Titlebar } from "../../components/titlebar";
-import { desktopBackend, useDesktopStore } from "../../store";
+import { useDesktopStore } from "../../store";
 import { load } from "../debug";
 import { HomePage } from "../home";
 import { refreshPhysicalMachines, refreshPhysicalPorts } from "../machines";
@@ -74,7 +75,7 @@ const DesktopTitlebar = defineComponent(() => {
     if (servoPointer?.id === event.pointerId) servoPointer = null;
   };
 
-  onUnmounted(() => {
+  onScopeDispose(() => {
     servoPointer = null;
   });
   useEventListener(appIcon, "click", () => (store.state.tab = "home"));
@@ -180,44 +181,57 @@ export const App = defineComponent(() => {
   let stopPhysicalMachineEvents: (() => void) | undefined;
   let stopTrainingEvents: (() => void) | undefined;
   let stopJointRangeEvents: (() => void) | undefined;
+  let stopLoopStatusEvents: (() => void) | undefined;
   let eventListenerDisposed = false;
 
-  onMounted(() => {
+  {
     const hasTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
-    if (!hasTauriRuntime) return;
-    void listen("physical-machines-changed", () => {
-      void Promise.all([refreshPhysicalMachines(), refreshPhysicalPorts()]).catch((error) => {
-        if (!eventListenerDisposed) console.error("failed to refresh physical machines", error);
+    if (hasTauriRuntime) {
+      void listen("physical-machines-changed", () => {
+        void Promise.all([refreshPhysicalMachines(), refreshPhysicalPorts()]).catch((error) => {
+          if (!eventListenerDisposed) console.error("failed to refresh physical machines", error);
+        });
+      }).then((unlisten) => {
+        if (eventListenerDisposed) unlisten();
+        else stopPhysicalMachineEvents = unlisten;
       });
-    }).then((unlisten) => {
-      if (eventListenerDisposed) unlisten();
-      else stopPhysicalMachineEvents = unlisten;
-    });
-    void listen<TrainingProgress>("training-progress", (event) => {
-      store.state.training = event.payload;
-    }).then((unlisten) => {
-      if (eventListenerDisposed) unlisten();
-      else stopTrainingEvents = unlisten;
-    });
-    void listen<JointRangeState[]>("joint-range-state", (event) => {
-      store.state.jointRangeStates = event.payload;
-    }).then((unlisten) => {
-      if (eventListenerDisposed) unlisten();
-      else stopJointRangeEvents = unlisten;
-    });
-    void desktopBackend()
-      .trainingStatus()
-      .then((progress) => {
-        store.state.training = progress;
-      })
-      .catch(() => undefined);
-  });
+      void listen<TrainingProgress>("training-progress", (event) => {
+        if (!eventListenerDisposed) store.state.training = event.payload;
+      }).then((unlisten) => {
+        if (eventListenerDisposed) unlisten();
+        else stopTrainingEvents = unlisten;
+      });
+      void listen<JointRangeState[]>("joint-range-state", (event) => {
+        if (!eventListenerDisposed) store.state.jointRangeStates = event.payload;
+      }).then((unlisten) => {
+        if (eventListenerDisposed) unlisten();
+        else stopJointRangeEvents = unlisten;
+      });
+      void listen<LoopStatus>("loop-status", (event) => {
+        if (eventListenerDisposed) return;
+        const active = store.state.physicalSyncEnabled ? store.state.loop : store.state.previewLoop;
+        if (!active || event.payload.runtimeGeneration !== active.runtimeGeneration) return;
+        if (store.state.physicalSyncEnabled) store.state.loop = event.payload;
+        else store.state.previewLoop = event.payload;
+      }).then((unlisten) => {
+        if (eventListenerDisposed) unlisten();
+        else stopLoopStatusEvents = unlisten;
+      });
+      void commands
+        .trainingStatus()
+        .then((progress) => {
+          if (!eventListenerDisposed) store.state.training = progress;
+        })
+        .catch(() => undefined);
+    }
+  }
 
-  onUnmounted(() => {
+  onScopeDispose(() => {
     eventListenerDisposed = true;
     stopPhysicalMachineEvents?.();
     stopTrainingEvents?.();
     stopJointRangeEvents?.();
+    stopLoopStatusEvents?.();
   });
   useEventListener(reloadButton, "click", () => void load());
   useEventListener(appShell, "contextmenu", (event: MouseEvent) => event.preventDefault());

@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use loop_body::PolicyTrace;
-use servo::{ServoError, ServoLoopDriver, ServoPositionSample, ServoPositionTargets};
+use crate::backend::policy_runtime::PolicyTrace;
+use loop_body::ControlBackend;
+use servo::{ServoError, ServoImuSample, ServoPositionSample, ServoPositionTargets};
+
+use crate::state::types::JointRangeState;
 
 fn log_directory(config_dir: Option<&Path>) -> PathBuf {
     config_dir
@@ -73,6 +76,29 @@ fn append_handle(handle: &LogHandle, line: &str) {
     }
 }
 
+pub(crate) fn log_joint_range_states(config_dir: Option<&Path>, states: &[JointRangeState]) {
+    let violations = states
+        .iter()
+        .filter(|state| state.below_min || state.above_max)
+        .map(|state| {
+            format!(
+                "{} target={} range=[{},{}] side={}",
+                state.slot_id,
+                state.target_rad,
+                state.min_rad,
+                state.max_rad,
+                if state.below_min { "min" } else { "max" }
+            )
+        })
+        .collect::<Vec<_>>();
+    if !violations.is_empty() {
+        append_control_event(
+            config_dir,
+            format!("joint_range_violation {}", violations.join(" | ")),
+        );
+    }
+}
+
 pub(crate) struct LogWriter {
     config_dir: Option<PathBuf>,
     day: String,
@@ -121,16 +147,14 @@ pub(crate) fn begin_control_loop(
             return None;
         }
     };
-    let result = (|| -> std::io::Result<()> {
-        writeln!(
-            writer.file,
-            "[{}] loop_open machine_id={} machine_name={:?} binding={ids}",
-            timestamp_millis(),
-            machine_id,
-            machine_name,
-            ids = binding_summary
-        )
-    })();
+    let result = writeln!(
+        writer.file,
+        "[{}] loop_open machine_id={} machine_name={:?} binding={ids}",
+        timestamp_millis(),
+        machine_id,
+        machine_name,
+        ids = binding_summary
+    );
     if let Err(error) = result {
         eprintln!("control-loop log initialization failed: {error}");
         return None;
@@ -153,10 +177,15 @@ pub(crate) fn append_policy_trace(config_dir: Option<&Path>, tick: u64, trace: &
         .as_deref()
         .map(|targets| format!("{targets:?}"))
         .unwrap_or_else(|| "none".into());
+    let execution_positions = trace
+        .execution_positions
+        .as_deref()
+        .map(|positions| format!("{positions:?}"))
+        .unwrap_or_else(|| "none".into());
     append_line(
         &current_log_file(config_dir),
         &format!(
-            "policy_trace tick={} phase={:?} stages={:?} imu_source={} imu_gyro={:?} imu_gravity={:?} imu_observation={:?} joint_position_observation={:?} joint_velocity_observation={:?} previous_action_observation={:?} command_twist={:?} command_head={:?} command_body=[{}, {}, {}] observation_len={} action_len={} observation={:?} onnx_action={:?} raw_targets={} body_targets={}",
+            "policy_trace tick={} phase={:?} stages={:?} imu_source={} imu_gyro={:?} imu_gravity={:?} imu_observation={:?} joint_position_observation={:?} joint_velocity_observation={:?} previous_action_observation={:?} command_twist={:?} command_head={:?} command_body=[{}, {}, {}] observation_len={} action_len={} observation={:?} onnx_action={:?} raw_targets={} body_targets={} backend_positions={:?} backend_velocities={:?} execution_positions={} saturation_reason={:?}",
             tick,
             trace.phase,
             trace.stages,
@@ -177,7 +206,11 @@ pub(crate) fn append_policy_trace(config_dir: Option<&Path>, tick: u64, trace: &
             trace.observation,
             trace.action,
             raw_targets,
-            body_targets
+            body_targets,
+            trace.backend_state.positions,
+            trace.backend_state.velocities,
+            execution_positions,
+            trace.saturation_reasons
         ),
     );
 }
@@ -186,15 +219,35 @@ pub(crate) fn append_control_event(config_dir: Option<&Path>, message: impl AsRe
     append_line(&current_log_file(config_dir), message.as_ref());
 }
 
+/// Keep backend failures distinguishable in the trace without making the loop core depend on
+/// transport-specific error types.
+#[cfg(test)]
+pub(crate) fn saturation_reason_for_error(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("register") || error.contains("encode") {
+        "register_encoding"
+    } else if error.contains("speed") || error.contains("velocity") {
+        "velocity_limit"
+    } else if error.contains("range") || error.contains("target") {
+        "body_range_limit"
+    } else if error.contains("delay") || error.contains("transport") {
+        "actuator_delay"
+    } else if error.contains("dynamics") || error.contains("inertia") {
+        "dynamics_limit"
+    } else {
+        "backend_error"
+    }
+}
+
 pub(crate) struct LoggedServoDriver {
-    inner: Box<dyn ServoLoopDriver>,
+    inner: Box<dyn ControlBackend>,
     handle: LogHandle,
     machine_id: String,
 }
 
 impl LoggedServoDriver {
     pub(crate) fn new(
-        inner: Box<dyn ServoLoopDriver>,
+        inner: Box<dyn ControlBackend>,
         handle: LogHandle,
         machine_id: impl Into<String>,
     ) -> Self {
@@ -213,7 +266,20 @@ impl LoggedServoDriver {
     }
 }
 
-impl ServoLoopDriver for LoggedServoDriver {
+impl servo::ServoLoopDriver for LoggedServoDriver {
+    fn set_read_cancel(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        self.inner.set_read_cancel(cancel);
+    }
+    fn feedback_validity(&self, ids: &[u8]) -> Vec<bool> {
+        self.inner.feedback_validity(ids)
+    }
+    fn advance_execution(&mut self, steps: u32, dt: std::time::Duration) -> Result<(), ServoError> {
+        self.inner.advance_execution(steps, dt)
+    }
+
+    fn reset_execution(&mut self) -> Result<(), ServoError> {
+        self.inner.reset_execution()
+    }
     fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
         let result = self.inner.read_positions(ids);
         match &result {
@@ -228,6 +294,19 @@ impl ServoLoopDriver for LoggedServoDriver {
                 }
             }
             Err(error) => self.line(format!("servo_read_error ids={ids:?} error={error}")),
+        }
+        result
+    }
+
+    fn read_imu(&mut self) -> Result<Option<ServoImuSample>, ServoError> {
+        let result = self.inner.read_imu();
+        match &result {
+            Ok(Some(sample)) => self.line(format!(
+                "imu_read gyro={:?} gravity={:?}",
+                sample.gyro, sample.gravity
+            )),
+            Ok(None) => self.line("imu_read unavailable"),
+            Err(error) => self.line(format!("imu_read_error error={error}")),
         }
         result
     }
@@ -282,6 +361,7 @@ impl ServoLoopDriver for LoggedServoDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use servo::ServoLoopDriver;
     use std::time::SystemTime;
 
     struct FakeDriver;
@@ -345,6 +425,106 @@ mod tests {
         assert!(text.contains("servo_read id=2"));
         assert!(text.contains("servo_write id=1 target_rad=0.1"));
         assert!(text.contains("servo_write id=2 target_rad=-0.2"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn policy_trace_log_keeps_backend_and_saturation_diagnostics() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("microduck-policy-log-{suffix}"));
+        let config_dir = root.join("config");
+        let trace = crate::backend::policy_runtime::PolicyTrace {
+            phase: loop_body::LoopPhase::Driving,
+            command: duck_control::obs::Command::default(),
+            imu: duck_control::imu::ImuData::default(),
+            imu_source: "backend",
+            observation: vec![0.0; 61],
+            action: vec![0.0; 14],
+            body_targets: Some(vec![0.2]),
+            raw_targets: Some(vec![0.3]),
+            backend_state: loop_body::BackendState {
+                positions: vec![0.1],
+                velocities: vec![0.4],
+                imu: None,
+                sequence: 4,
+                sampled_at: loop_body::SampleTime(4),
+                valid_positions: vec![true],
+                valid_velocities: vec![true],
+                source: Some("test".into()),
+            },
+            execution_positions: Some(vec![0.15]),
+            saturation_reasons: vec!["target_filter"],
+            stages: vec!["read", "write"],
+        };
+        append_policy_trace(Some(&config_dir), 4, &trace);
+        let text = std::fs::read_to_string(current_log_file(Some(&config_dir))).unwrap();
+        assert!(text.contains("backend_positions=[0.1]"));
+        assert!(text.contains("backend_velocities=[0.4]"));
+        assert!(text.contains("execution_positions=[0.15]"));
+        assert!(text.contains("saturation_reason=[\"target_filter\"]"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn error_diagnostics_keep_transport_causes_distinguishable() {
+        assert_eq!(
+            saturation_reason_for_error("register encode failed"),
+            "register_encoding"
+        );
+        assert_eq!(
+            saturation_reason_for_error("velocity limit"),
+            "velocity_limit"
+        );
+        assert_eq!(
+            saturation_reason_for_error("target out of range"),
+            "body_range_limit"
+        );
+        assert_eq!(
+            saturation_reason_for_error("transport delay"),
+            "actuator_delay"
+        );
+        assert_eq!(
+            saturation_reason_for_error("dynamics inertia"),
+            "dynamics_limit"
+        );
+        assert_eq!(
+            saturation_reason_for_error("serial disconnected"),
+            "backend_error"
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_keeps_each_saturation_source_parseable() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("microduck-diagnostic-log-{suffix}"));
+        let config_dir = root.join("config");
+        for reason in [
+            "body_range_exceeded",
+            "target_filter",
+            "actuator_delay",
+            "dynamics_limit",
+            "body_range_limit",
+            "register_encoding",
+        ] {
+            append_control_event(Some(&config_dir), format!("saturation_reason={reason}"));
+        }
+        let text = std::fs::read_to_string(current_log_file(Some(&config_dir))).unwrap();
+        for reason in [
+            "body_range_exceeded",
+            "target_filter",
+            "actuator_delay",
+            "dynamics_limit",
+            "body_range_limit",
+            "register_encoding",
+        ] {
+            assert!(text.contains(&format!("saturation_reason={reason}")));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

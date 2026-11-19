@@ -14,7 +14,7 @@ import type {
   ServoModelKey,
   SimulationParameters,
   VirtualMachine,
-} from "../../src/bridge/types";
+} from "../../generated/types";
 
 type InvokePayload = unknown;
 
@@ -430,26 +430,72 @@ export class TestBackend {
         return this.actionsList.map((action) => ({ ...action }));
       case "loop_open":
         return this.openLoop(payloadRecord(payload).input);
+      case "runtime_reconfigure":
+        this.status = null;
+        this.previewStatus = null;
+      // The test adapter shares construction after the atomic replacement boundary.
+      case "runtime_open": {
+        const input = payloadRecord(payload).input;
+        if (isRecord(input) && typeof input.physicalMachineId === "string")
+          return this.openLoop(input);
+        if (!isRecord(input)) throw new Error("invalid runtime input");
+        return this.openPreviewLoop(stringValue(input.virtualMachineId, "virtualMachineId"));
+      }
+      case "runtime_command": {
+        const request = payloadRecord(payload).request;
+        if (!isRecord(request)) throw new Error("invalid runtime command");
+        if (request.kind === "input") return this.previewCommand(request.input);
+        if (request.kind === "policy")
+          return this.previewPolicy(stringValue(request.policy_id, "policy_id"));
+        if (request.kind === "resetWorld") {
+          if (!this.previewStatus) throw new Error("preview loop is closed");
+          this.previewStatus = {
+            ...this.previewStatus,
+            world: { position: [0, 0], yaw: 0, distanceM: 0 },
+          };
+          return cloneStatus(this.previewStatus);
+        }
+        if (request.kind === "action") return this.action(request.action);
+        return this.command(request.targets);
+      }
       case "loop_command":
+        return this.command(payloadRecord(payload).targets);
+      case "loop_command_at":
         return this.command(payloadRecord(payload).targets);
       case "loop_policy_command":
         return null;
+      case "loop_policy_command_at":
+        return null;
       case "loop_action":
         return this.action(payloadRecord(payload).action);
+      case "loop_action_at":
+        return this.action(payloadRecord(payload).action);
       case "loop_tick":
+        return this.tick();
+      case "loop_tick_at":
         return this.tick();
       case "loop_status":
         return cloneStatus(this.status);
       case "loop_close":
         this.status = null;
         return null;
+      case "runtime_close":
+        this.status = null;
+        this.previewStatus = null;
+        return null;
       case "preview_loop_open":
         return this.openPreviewLoop(
           stringValue(payloadRecord(payload).virtualMachineId, "virtualMachineId"),
         );
+      case "preview_machine_select":
+        return null;
       case "preview_loop_policy":
         return this.previewPolicy(stringValue(payloadRecord(payload).policyId, "policyId"));
+      case "preview_loop_policy_at":
+        return this.previewPolicy(stringValue(payloadRecord(payload).policyId, "policyId"));
       case "preview_loop_command":
+        return this.previewCommand(payloadRecord(payload).input);
+      case "preview_loop_command_at":
         return this.previewCommand(payloadRecord(payload).input);
       case "preview_loop_reset_world":
         if (!this.previewStatus) throw new Error("preview loop is closed");
@@ -458,9 +504,21 @@ export class TestBackend {
           world: { position: [0, 0], yaw: 0, distanceM: 0 },
         };
         return cloneStatus(this.previewStatus);
+      case "preview_loop_reset_world_at":
+        if (!this.previewStatus) throw new Error("preview loop is closed");
+        this.previewStatus = {
+          ...this.previewStatus,
+          world: { position: [0, 0], yaw: 0, distanceM: 0 },
+        };
+        return cloneStatus(this.previewStatus);
       case "preview_loop_tick":
         return this.previewTick();
+      case "preview_loop_tick_at":
+        return this.previewTick();
       case "preview_loop_close":
+        this.previewStatus = null;
+        return null;
+      case "preview_loop_close_at":
         this.previewStatus = null;
         return null;
       default:
@@ -692,10 +750,15 @@ export class TestBackend {
       return false;
     });
     if (duplicate) throw new Error(`绑定冲突：舵机 ${duplicate.physicalId} 被重复绑定`);
-    const ids = Array.isArray(input.servoIds)
-      ? input.servoIds.filter((id): id is number => typeof id === "number")
-      : [];
+    const ids = Array.from({ length: 15 }, (_, index) => index + 1);
     this.status = {
+      runtimeState: "running",
+      hasExecution: input.access === "control",
+      simulation: null,
+      readSources: [],
+      runtimeGeneration: 1,
+      executionGeneration: 1,
+      configRevision: 1,
       phase: "limp",
       session: 0,
       tick: 0,
@@ -760,6 +823,13 @@ export class TestBackend {
     if (!this.virtual.some((machine) => machine.id === virtualMachineId))
       throw new Error(`unknown virtual machine: ${virtualMachineId}`);
     this.previewStatus = {
+      runtimeState: "running",
+      hasExecution: true,
+      simulation: null,
+      readSources: [],
+      runtimeGeneration: 1,
+      executionGeneration: 1,
+      configRevision: 1,
       phase: "ready",
       session: 1,
       tick: 0,

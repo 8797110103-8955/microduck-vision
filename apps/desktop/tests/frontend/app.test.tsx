@@ -2,11 +2,9 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
-import { createTauriBackend } from "../../src/bridge";
-import { openLoop } from "../../src/features/debug";
 import { disconnectPhysicalMachine } from "../../src/features/machines";
 import { App } from "../../src/features/app";
-import { configureDesktopBackend, useDesktopStore } from "../../src/store";
+import { useDesktopStore } from "../../src/store";
 import { TestBackend } from "../bridge/test-backend";
 import { memoryServoCatalog } from "../fixtures/servoCatalog.fixture";
 
@@ -19,6 +17,7 @@ vi.mock("../../src/features/home/viewer", () => ({
     }
     setFrame() {}
     setGhosts() {}
+    setSelectedDuck() {}
     setWorldPose() {}
     pickDuck() {
       return 1;
@@ -37,7 +36,6 @@ function buttonByText(wrapper: VueWrapper, text: string) {
 async function mountApp(backend: TestBackend) {
   mockWindows("main");
   mockIPC((command, payload) => backend.invoke(command, payload), { shouldMockEvents: true });
-  configureDesktopBackend(createTauriBackend());
   const host = document.createElement("div");
   document.body.append(host);
   const wrapper = mount(App, {
@@ -56,6 +54,7 @@ describe("desktop frontend flow", () => {
 
   afterEach(() => {
     clearMocks();
+    vi.useRealTimers();
   });
 
   it("boots from the frontend, detects and saves hardware, then drives the loop", async () => {
@@ -101,6 +100,7 @@ describe("desktop frontend flow", () => {
     await buttonByText(wrapper, "自动重连").trigger("click");
     await flushPromises();
     expect(store.state.physicalMachines[0].connected).toBe(true);
+    expect(wrapper.get('[aria-label="实机在线"]')).toBeTruthy();
 
     const machineRow = wrapper.find("article");
     await machineRow.find("select").setValue("official-hd1910");
@@ -111,46 +111,122 @@ describe("desktop frontend flow", () => {
     expect(store.state.physicalMachines[0].virtualMachineId).toBe("official-hd1910");
     expect(store.state.physicalMachines[0].onlineServoIds).toEqual([1, 2]);
     expect(store.state.virtualMachines[0].referencedBy).toContain("physical-1");
+    const registerReadsBeforeSync = backend.calls.filter(
+      (call) => call.name === "physical_machine_registers",
+    ).length;
+    await buttonByText(wrapper, "同步实机参数").trigger("click");
+    await flushPromises();
+    expect(backend.calls.filter((call) => call.name === "physical_machine_registers")).toHaveLength(
+      registerReadsBeforeSync + 1,
+    );
+    expect(wrapper.text()).not.toContain("硬件码：");
+    await backend.invoke("virtual_machine_bind", {
+      input: { virtualMachineId: "official-hd1910", slotId: "left_hip_yaw", physicalId: 1 },
+    });
+    store.state.virtualMachines[0].jointBindings = [
+      { slotId: "left_hip_yaw", physicalId: 1, direction: 1, zeroOffsetRad: 0 },
+    ];
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     await buttonByText(wrapper, "调试").trigger("click");
     expect(wrapper.text()).toContain("机器 0");
     expect(wrapper.text()).not.toContain("参数沿用旧版舵机调试面板");
     expect(wrapper.text()).not.toContain("舵机参数");
-    await buttonByText(wrapper, "聚焦").trigger("click");
-    await buttonByText(wrapper, "回到聚焦前位置").trigger("click");
-    await openLoop([1, 2]);
-    await wrapper.vm.$nextTick();
-    const targetInput = wrapper.get("[data-slider] input");
-    await targetInput.setValue("0.5");
-    await targetInput.trigger("blur");
+    await wrapper.get('button[title="将视图聚焦到当前选中的模拟机"]').trigger("click");
+    await wrapper.get('button[title="将视图恢复到聚焦当前模拟机之前的位置"]').trigger("click");
+    expect(wrapper.text()).not.toContain("安全状态");
+    expect(wrapper.text()).not.toContain("目标位置");
+    await wrapper.get('button[title="切换到肢体范围"]').trigger("click");
+    expect(wrapper.text()).not.toContain("场景姿态预览");
+    const rangeRow = wrapper.findAll('[class*="rangeRow"]')[0];
+    await rangeRow.findAll("button")[0].trigger("click");
+    expect(store.state.rangePreview?.[0]).toBeLessThan(0);
+    await wrapper.get('button[title="切换到肢体绑定"]').trigger("click");
+    expect(wrapper.get('button[title="切换到肢体范围"]')).toBeTruthy();
+    const bindingSelects = wrapper.findAll("select");
+    const virtualBindCount = backend.calls.filter(
+      (call) => call.name === "virtual_machine_bind",
+    ).length;
+    await bindingSelects[10].setValue("1");
     await flushPromises();
-    expect(backend.calls.map((call) => call.name)).toContain("loop_action");
-    expect(backend.calls.filter((call) => call.name === "loop_tick")).toHaveLength(6);
-    expect(store.state.loop?.phase).toBe("driving");
-    expect(store.state.loop?.positions[0]).toBe(0.5);
-    await buttonByText(wrapper, "发送微调目标").trigger("click");
+    expect(backend.calls.filter((call) => call.name === "virtual_machine_bind")).toHaveLength(
+      virtualBindCount,
+    );
+    expect(wrapper.text()).toContain("绑定冲突");
+    const bindingRows = wrapper.findAll('[class*="bindingRow"]');
+    await bindingRows[10].trigger("click");
+    await bindingRows[10].trigger("click");
     await flushPromises();
-    expect(store.state.loop?.targets).toEqual([0.51, 0.01]);
-
-    await buttonByText(wrapper, "推进一拍").trigger("click");
+    const pendingConflictButton = wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("right_hip_yaw"));
+    if (!pendingConflictButton) throw new Error("pending conflict button not found");
+    await pendingConflictButton.trigger("click");
+    expect(wrapper.findAll('[class*="activeRow"]')).toHaveLength(1);
+    await bindingSelects[0].setValue("2");
     await flushPromises();
-    expect(store.state.loop?.positions).toEqual([0.51, 0.01]);
-    await buttonByText(wrapper, "停止控制环").trigger("click");
+    expect(backend.calls.filter((call) => call.name === "virtual_machine_bind")).toHaveLength(
+      virtualBindCount + 2,
+    );
+    expect(store.state.virtualMachines[0].jointBindings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ slotId: "left_hip_yaw", physicalId: 2 }),
+        expect.objectContaining({ slotId: "right_hip_yaw", physicalId: 1 }),
+      ]),
+    );
+    const directionButton = wrapper.findAll("button").find((button) => button.text() === "1");
+    if (!directionButton) throw new Error("direction button not found");
+    const loopOpensBeforeDirection = backend.calls.filter(
+      (call) => call.name === "runtime_open",
+    ).length;
+    await directionButton.trigger("click");
     await flushPromises();
-    expect(store.state.loop).toBeNull();
-
-    // Debug controls must continue to work after the loop is closed.  The
-    // direct path enables the selected servo before sending its position
-    // command instead of silently dispatching to the closed loop state.
-    await targetInput.setValue("0.25");
-    await buttonByText(wrapper, "移动").trigger("click");
+    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_bind");
+    expect(backend.calls.filter((call) => call.name === "runtime_open")).toHaveLength(
+      loopOpensBeforeDirection + 1,
+    );
+    expect(store.state.physicalMachines[0].jointDirections?.[0]?.direction).toBe(-1);
+    const loopOpensBeforeZero = backend.calls.filter((call) => call.name === "runtime_open").length;
+    await wrapper
+      .get('button[title="读取当前实机姿态，并将它绑定为模拟机的姿态零位"]')
+      .trigger("click");
+    await flushPromises();
+    expect(backend.calls.filter((call) => call.name === "runtime_open")).toHaveLength(
+      loopOpensBeforeZero + 1,
+    );
+    expect(store.state.virtualMachines[0].jointBindings?.[0]?.zeroOffsetRad).toBe(0);
+    expect(store.state.loop?.positions[0]).toBe(0);
+    expect(store.state.loop?.hasExecution).toBe(false);
+    const poseZeroButton = () =>
+      wrapper.get('button[title="读取当前实机姿态，并将它绑定为模拟机的姿态零位"]');
+    await buttonByText(wrapper, "切换为手动控制").trigger("click");
+    await flushPromises();
+    expect(store.state.loop?.hasExecution).toBe(true);
+    expect(poseZeroButton().attributes("disabled")).toBeDefined();
+    const poseReads = backend.calls.filter(
+      (call) => call.name === "physical_machine_set_pose_zero",
+    ).length;
+    await poseZeroButton().trigger("click");
+    expect(
+      backend.calls.filter((call) => call.name === "physical_machine_set_pose_zero"),
+    ).toHaveLength(poseReads);
+    await buttonByText(wrapper, "返回只读").trigger("click");
+    await flushPromises();
+    expect(store.state.loop?.hasExecution).toBe(false);
+    expect(poseZeroButton().attributes("disabled")).toBeUndefined();
+    expect(buttonByText(wrapper, "全部力矩开").attributes("disabled")).toBeDefined();
+    await buttonByText(wrapper, "切换为手动控制").trigger("click");
+    await flushPromises();
+    await buttonByText(wrapper, "全部力矩开").trigger("click");
     await flushPromises();
     expect(backend.calls.map((call) => call.name)).toContain("physical_machine_set_torque");
-    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_write_position");
-    await buttonByText(wrapper, "力矩关").trigger("click");
-    await flushPromises();
-    expect(backend.calls.map((call) => call.name)).toContain("physical_machine_set_torque");
+    expect(backend.calls.map((call) => call.name)).not.toContain("loop_action");
+    expect(backend.calls.map((call) => call.name)).not.toContain("loop_command");
+    expect(wrapper.text()).not.toContain("发送微调目标");
+    expect(wrapper.text()).not.toContain("推进一拍");
+    expect(wrapper.text()).not.toContain("启动控制环");
+    expect(wrapper.text()).not.toContain("刷新状态");
+    expect(store.state.loop?.phase).toBe("limp");
 
     wrapper.unmount();
     host.remove();
@@ -167,7 +243,7 @@ describe("desktop frontend flow", () => {
     await buttonByText(wrapper, "开启控制环").trigger("click");
     await flushPromises();
     expect(store.state.previewLoop).toMatchObject({ phase: "ready", torque: false });
-    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_open");
+    expect(backend.calls.map((call) => call.name)).toContain("runtime_open");
     await buttonByText(wrapper, "打开日志").trigger("click");
     await flushPromises();
     expect(backend.calls.map((call) => call.name)).toContain("open_logs");
@@ -181,7 +257,7 @@ describe("desktop frontend flow", () => {
     expect((resetWorldButton.element as HTMLButtonElement).disabled).toBe(false);
     await resetWorldButton.trigger("click");
     await flushPromises();
-    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_reset_world");
+    expect(backend.calls.map((call) => call.name)).toContain("runtime_command");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     await buttonByText(wrapper, "策略").trigger("click");
@@ -199,18 +275,18 @@ describe("desktop frontend flow", () => {
     expect(store.state.selectedPolicyId).toBe("alpha-walking");
     expect(backend.calls.map((call) => call.name)).toContain("policy_select");
     expect(store.state.previewLoop?.torque).toBe(true);
-    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_policy");
+    expect(backend.calls.map((call) => call.name)).toContain("runtime_command");
     const speed = wrapper.find("[data-slider] input");
     await speed.setValue("0.2");
     await speed.trigger("blur");
     await flushPromises();
-    expect(backend.calls.map((call) => call.name)).toContain("preview_loop_command");
+    expect(backend.calls.map((call) => call.name)).toContain("runtime_command");
     expect(store.state.previewLoop?.world.distanceM).toBeGreaterThanOrEqual(0);
     await backend.invoke("policy_download", { id: "alpha-stand" });
     await backend.invoke("policy_select", { id: "alpha-stand" });
     const switched = await backend.invoke("preview_loop_policy", { policyId: "alpha-stand" });
     expect(switched).toMatchObject({ torque: true });
-    expect(backend.calls.map((call) => call.name)).not.toContain("preview_loop_close");
+    expect(backend.calls.map((call) => call.name)).not.toContain("runtime_close");
     await buttonByText(wrapper, "停止控制环").trigger("click");
     await flushPromises();
     expect(store.state.previewLoop).toBeNull();
@@ -258,6 +334,10 @@ describe("desktop frontend flow", () => {
     });
     expect(store.state.selectedVirtualMachine).toBe("virtual-2");
     expect(store.state.selectedVirtualMachineManual).toBe(true);
+    expect(store.state.virtualMachines.map((machine) => machine.id)).toEqual([
+      startupMachine.id,
+      "virtual-2",
+    ]);
 
     await buttonByText(wrapper, "调试").trigger("click");
     await flushPromises();

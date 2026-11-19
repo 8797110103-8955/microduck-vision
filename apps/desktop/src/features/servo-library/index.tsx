@@ -1,6 +1,6 @@
 import { computed, defineComponent, shallowRef, type PropType } from "vue";
 import { useEventListener } from "@vueuse/core";
-import type { ServoModelKey } from "../../bridge/types";
+import type { ServoModelKey } from "../../../generated/types";
 import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
