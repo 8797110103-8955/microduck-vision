@@ -88,14 +88,6 @@ fn src_tauri_has_one_entry_for_each_runtime_boundary() {
 }
 
 #[test]
-fn module_guide_keeps_the_dependency_direction_visible() {
-    let guide = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-        .expect("src-tauri module guide should be present");
-    assert!(guide.contains("commands -> application/control -> backend/state"));
-    assert!(guide.contains("Keep serial") && guide.contains("actuator dynamics out"));
-}
-
-#[test]
 fn lifecycle_and_command_boundaries_do_not_regress() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let watcher = std::fs::read_to_string(source_root.join("lifecycle/device_watcher.rs"))

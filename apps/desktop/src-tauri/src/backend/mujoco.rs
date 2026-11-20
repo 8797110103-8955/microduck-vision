@@ -19,31 +19,58 @@ use servo::{
 
 use crate::types::{SceneFrame, SimulationState};
 
-/// Actuator execution settings selected by the simulated servo model.
-///
-/// The policy contract stays shared. These settings describe how a canonical target is turned
-/// into actuator dynamics after the controller has produced it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SimulationActuatorProfile {
-    pub id: &'static str,
+/// Simulator response from canonical targets to motor torque. Delay is in 5 ms physics steps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SimulationActuatorResponse {
     pub delay_steps: [usize; 2],
+    pub position_gain_scale: f64,
+    pub back_emf_scale: f64,
+    pub friction_scale: f64,
+}
+
+impl SimulationActuatorResponse {
+    const XL330: Self = Self {
+        delay_steps: [3, 6],
+        position_gain_scale: 1.0,
+        back_emf_scale: 1.0,
+        friction_scale: 1.0,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SimulationActuatorProfile {
+    pub id: &'static str,
     pub encoder_through_backlash: bool,
+    pub response: SimulationActuatorResponse,
+    pub velstand_response: Option<SimulationActuatorResponse>,
 }
 
 impl SimulationActuatorProfile {
-    pub(crate) fn for_model(model: servo::ServoModel) -> Result<Self, ServoError> {
+    pub(super) fn for_model(model: servo::ServoModel) -> Result<Self, ServoError> {
         match model {
             servo::ServoModel::Xl330M288 => Ok(Self {
                 id: "official-xl330-m6",
-                delay_steps: [3, 6],
                 encoder_through_backlash: true,
+                response: SimulationActuatorResponse::XL330,
+                velstand_response: None,
             }),
             servo::ServoModel::Hd1910 => Ok(Self {
-                id: "hardware-matched-hd1910",
-                // The identified HD1910 command delay is 0.98ms, below one 5ms physics step.
-                // The official XL330 training delay is a separate [3, 6]-step contract.
-                delay_steps: [0, 0],
+                id: "policy-compatible-hd1910",
                 encoder_through_backlash: false,
+                response: SimulationActuatorResponse {
+                    // The identified HD1910 command delay is below one physics step.
+                    delay_steps: [0, 0],
+                    position_gain_scale: 0.075481,
+                    ..SimulationActuatorResponse::XL330
+                },
+                // velstand was trained with delayed actuation. Reduce back EMF and friction
+                // so small targets can drive the gait without relying on high gain alone.
+                velstand_response: Some(SimulationActuatorResponse {
+                    delay_steps: [3, 6],
+                    position_gain_scale: 0.16,
+                    back_emf_scale: 0.6,
+                    friction_scale: 0.5,
+                }),
             }),
             _ => Err(failure("unsupported simulation actuator profile")),
         }
@@ -101,6 +128,7 @@ unsafe extern "C" {
 #[derive(Default)]
 pub(crate) struct SharedSnapshot {
     pub state: Option<SimulationState>,
+    pub(super) actuator_response: Option<SimulationActuatorResponse>,
 }
 pub(crate) type SnapshotHandle = Arc<Mutex<SharedSnapshot>>;
 
@@ -122,7 +150,7 @@ pub(super) struct NativeSimulation {
     profile: ServoProfile,
     targets: Vec<f64>,
     pending: VecDeque<(u64, Vec<f64>)>,
-    delay: [usize; 2],
+    default_response: SimulationActuatorResponse,
     sequence: u64,
     step: u64,
     previous_torque: Vec<f64>,
@@ -207,7 +235,7 @@ impl NativeSimulation {
             targets: template.control.home_pose.clone(),
             profile,
             pending: VecDeque::new(),
-            delay: actuator_profile.delay_steps,
+            default_response: actuator_profile.response,
             sequence: 0,
             step: 0,
             previous_torque: vec![0.0; template.joints.len()],
@@ -310,7 +338,16 @@ impl NativeSimulation {
         self.publish()
     }
 
-    fn step_physics(&mut self) -> Result<(), ServoError> {
+    fn actuator_response(&self) -> Result<SimulationActuatorResponse, ServoError> {
+        Ok(self
+            .snapshot
+            .lock()
+            .map_err(|_| failure("simulation snapshot poisoned"))?
+            .actuator_response
+            .unwrap_or(self.default_response))
+    }
+
+    fn step_physics(&mut self, response: SimulationActuatorResponse) -> Result<(), ServoError> {
         let mut due = None;
         while self.pending.front().is_some_and(|(at, _)| *at <= self.step) {
             due = self.pending.pop_front().map(|(_, t)| t);
@@ -335,11 +372,15 @@ impl NativeSimulation {
                 .passive
                 .filter(|_| self.encoder_through_backlash)
                 .map_or(0.0, |(pq, _)| unsafe { duck_mj_qpos(self.ptr(), pq) });
-            let duty = ((self.targets[slot] - output_q) * p.bam_kp * p.bam_error_gain)
+            let duty = ((self.targets[slot] - output_q)
+                * p.bam_kp
+                * p.bam_error_gain
+                * response.position_gain_scale)
                 .clamp(-p.bam_max_pwm, p.bam_max_pwm);
-            let torque = (vin * duty - p.bam_kt * dq) * p.bam_kt / p.bam_resistance;
+            let velocity_drop = p.bam_kt * dq * response.back_emf_scale;
+            let torque = (vin * duty - velocity_drop) * p.bam_kt / p.bam_resistance;
             self.previous_torque[slot] = torque;
-            let friction = friction_budget(p, motor, external, dq);
+            let friction = friction_budget(p, motor, external, dq) * response.friction_scale;
             self.friction[slot] = friction;
             unsafe {
                 duck_mj_control(
@@ -525,8 +566,8 @@ impl ServoLoopDriver for NativeSimulation {
                 .ok_or_else(|| failure("invalid canonical simulation target ID"))?;
             next[slot] = *target;
         }
-        let span = self.delay[1] - self.delay[0] + 1;
-        let delay = self.delay[0] + self.sequence as usize % span;
+        let [earliest, latest] = self.actuator_response()?.delay_steps;
+        let delay = earliest + self.sequence as usize % (latest - earliest + 1);
         self.sequence += 1;
         // Absolute deadlines; a later command may become due before an older one. In that case
         // the older command is superseded, so it can never overwrite a newer applied target.
@@ -561,8 +602,9 @@ impl ServoLoopDriver for NativeSimulation {
                 "official simulation requires 5ms x 4 physics steps",
             ));
         }
+        let response = self.actuator_response()?;
         for _ in 0..steps {
-            self.step_physics()?;
+            self.step_physics(response)?;
         }
         self.publish()
     }
@@ -608,11 +650,13 @@ mod tests {
         let xl = SimulationActuatorProfile::for_model(servo::ServoModel::Xl330M288).unwrap();
         let hd = SimulationActuatorProfile::for_model(servo::ServoModel::Hd1910).unwrap();
         assert_eq!(xl.id, "official-xl330-m6");
-        assert_eq!(xl.delay_steps, [3, 6]);
+        assert_eq!(xl.response.delay_steps, [3, 6]);
         assert!(xl.encoder_through_backlash);
-        assert_eq!(hd.id, "hardware-matched-hd1910");
-        assert_eq!(hd.delay_steps, [0, 0]);
+        assert_eq!(xl.response.position_gain_scale, 1.0);
+        assert_eq!(hd.id, "policy-compatible-hd1910");
+        assert_eq!(hd.response.delay_steps, [0, 0]);
         assert!(!hd.encoder_through_backlash);
+        assert_eq!(hd.response.position_gain_scale, 0.075481);
     }
 
     #[test]
@@ -648,8 +692,12 @@ mod tests {
                 profile.clone(),
                 SimulationActuatorProfile {
                     id: "test-fixture",
-                    delay_steps: case.delay,
                     encoder_through_backlash: case.encoder_through_backlash,
+                    response: SimulationActuatorResponse {
+                        delay_steps: case.delay,
+                        ..SimulationActuatorResponse::XL330
+                    },
+                    velstand_response: None,
                 },
                 snapshot.clone(),
             )
@@ -748,18 +796,18 @@ mod tests {
             .into_iter()
             .find(|p| p.model == servo::ServoModel::Xl330M288)
             .unwrap();
-        let mut simulation =
-            NativeSimulation::open(
-                &body,
-                profile,
-                SimulationActuatorProfile {
-                    id: "test-fixture",
-                    delay_steps: [3, 6],
-                    encoder_through_backlash: true,
-                },
-                SnapshotHandle::default(),
-            )
-            .unwrap();
+        let mut simulation = NativeSimulation::open(
+            &body,
+            profile,
+            SimulationActuatorProfile {
+                id: "test-fixture",
+                encoder_through_backlash: true,
+                response: SimulationActuatorResponse::XL330,
+                velstand_response: None,
+            },
+            SnapshotHandle::default(),
+        )
+        .unwrap();
         let ids = (1..=15).collect::<Vec<_>>();
         for _ in 0..10 {
             simulation.read_positions(&ids).unwrap();

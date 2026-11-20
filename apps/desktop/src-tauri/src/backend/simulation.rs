@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::mujoco::{
-    NativeSimulation, SharedSnapshot, SimulationActuatorProfile, SnapshotHandle, runtime_version,
+    NativeSimulation, SharedSnapshot, SimulationActuatorProfile, SimulationActuatorResponse,
+    SnapshotHandle, runtime_version,
 };
 use crate::backend::contract::ResolvedContract;
 use crate::backend::policy_runtime::{MicroDuckPolicyRunner, PolicyConfig, PolicyDescriptor};
@@ -56,8 +57,8 @@ pub(crate) fn register_machine(
         .into_iter()
         .find(|profile| profile.model == model)
         .ok_or_else(|| format!("missing servo profile for {model:?}"))?;
-    let actuator_profile = SimulationActuatorProfile::for_model(model)
-        .map_err(|error| error.to_string())?;
+    let actuator_profile =
+        SimulationActuatorProfile::for_model(model).map_err(|error| error.to_string())?;
     let model_key = match model {
         ServoModel::Hd1910 => duck_body::ServoModelKey::Hd1910,
         ServoModel::Xl330M288 => duck_body::ServoModelKey::Xl330,
@@ -85,16 +86,13 @@ pub(crate) fn register_machine(
         "resolved-profile".into(),
         format!("actuator={actuator_profile:?};servo={profile:?}").into_bytes(),
     ));
-    sources.push(("initial-state".into(), format!("home={:?};trunk=[0,0,0.125,1,0,0,0];randomization=disabled;encoder_through_backlash={};delay={:?};dt=0.005;decimation=4", template.control.home_pose, actuator_profile.encoder_through_backlash, actuator_profile.delay_steps).into_bytes()));
+    sources.push(("initial-state".into(), format!("home={:?};trunk=[0,0,0.125,1,0,0,0];randomization=disabled;encoder_through_backlash={};delay={:?};policy_position_gain_scale={};dt=0.005;decimation=4", template.control.home_pose, actuator_profile.encoder_through_backlash, actuator_profile.response.delay_steps, actuator_profile.response.position_gain_scale).into_bytes()));
     let contract = ResolvedContract::with_sources(
         &template.id,
         template.version,
         "none",
         "simulation",
-        format!(
-            "{model:?}:mujoco-3.10.0:{}",
-            actuator_profile.id
-        ),
+        format!("{model:?}:mujoco-3.10.0:{}", actuator_profile.id),
         sources.clone(),
     );
     if registry.describe(machine_id).is_some() {
@@ -188,6 +186,7 @@ pub(crate) struct PreviewMicroDuckPolicyRunner {
     body_version: u32,
     backend_profile: String,
     backend_contract: String,
+    actuator_profile: SimulationActuatorProfile,
 }
 
 impl PreviewMicroDuckPolicyRunner {
@@ -233,12 +232,12 @@ impl PreviewMicroDuckPolicyRunner {
                     .collect(),
             },
         };
-        let actuator_profile = SimulationActuatorProfile::for_model(model)
-            .map_err(|error| error.to_string())?;
+        let actuator_profile =
+            SimulationActuatorProfile::for_model(model).map_err(|error| error.to_string())?;
         append_control_event(
             config_dir,
             format!(
-                "preview_actuator_config backend_kind=simulation implementation=OfficialCompatSimulationBackend model={model:?} actuator_profile={actuator_profile} encoder_through_backlash={encoder_through_backlash} mujoco_binding_version=3.10.0 mujoco_runtime_version={version} scene_path={scene} bam_source_revision=62bd8ce12154340be97e06f7f41a0ca8f116d967 control_dt={control_dt} physics_dt={physics_dt} physics_substeps={substeps} delay_timebase=physics_step delay_schedule=absolute_deadline command_delay_physics_steps={delay_steps:?} observation_delay_ticks=0 enforce_body_range=false imu_source=backend",
+                "preview_actuator_config backend_kind=simulation implementation=OfficialCompatSimulationBackend model={model:?} actuator_profile={actuator_profile} encoder_through_backlash={encoder_through_backlash} policy_position_gain_scale={policy_position_gain_scale} velstand_response={velstand_response:?} mujoco_binding_version=3.10.0 mujoco_runtime_version={version} scene_path={scene} bam_source_revision=62bd8ce12154340be97e06f7f41a0ca8f116d967 control_dt={control_dt} physics_dt={physics_dt} physics_substeps={substeps} delay_timebase=physics_step delay_schedule=absolute_deadline command_delay_physics_steps={delay_steps:?} observation_delay_ticks=0 enforce_body_range=false imu_source=backend",
                 scene = if model == ServoModel::Xl330M288 {
                     "scene_backlash.xml"
                 } else {
@@ -250,7 +249,9 @@ impl PreviewMicroDuckPolicyRunner {
                 substeps = PHYSICS_SUBSTEPS,
                 actuator_profile = actuator_profile.id,
                 encoder_through_backlash = actuator_profile.encoder_through_backlash,
-                delay_steps = actuator_profile.delay_steps
+                policy_position_gain_scale = actuator_profile.response.position_gain_scale,
+                velstand_response = actuator_profile.velstand_response,
+                delay_steps = actuator_profile.response.delay_steps
             ),
         );
         let resolved_contract = ResolvedContract::with_sources(
@@ -315,6 +316,7 @@ impl PreviewMicroDuckPolicyRunner {
         loop_state.set_policy_command(Command::default());
         let mut preview = Self {
             backend_contract,
+            actuator_profile,
             snapshot,
             loop_state,
             input: PreviewInput {
@@ -489,6 +491,7 @@ impl PreviewMicroDuckPolicyRunner {
             ),
         );
         self.loop_state.clear_policy();
+        self.set_simulation_actuator_response(None)?;
         self.policy_command = None;
         self.policy_ticks = 0;
         self.skill_elapsed = Duration::ZERO;
@@ -559,10 +562,23 @@ impl PreviewMicroDuckPolicyRunner {
         self.activate_policy(selection)
     }
 
+    fn set_simulation_actuator_response(
+        &self,
+        response: Option<SimulationActuatorResponse>,
+    ) -> Result<(), String> {
+        self.snapshot
+            .lock()
+            .map_err(|error| error.to_string())?
+            .actuator_response = response;
+        Ok(())
+    }
+
     fn activate_policy(&mut self, selection: PreviewPolicySelection) -> Result<(), String> {
-        self.loop_state
-            .select_policy_with_descriptor(&selection.path, &selection.descriptor, selection.config)
-            .map_err(|error| error.to_string())?;
+        let response_override = self
+            .actuator_profile
+            .velstand_response
+            .filter(|_| selection.descriptor.id == "velstand");
+        let response = response_override.unwrap_or(self.actuator_profile.response);
         let sources = vec![
             (
                 "backend-contract",
@@ -574,7 +590,11 @@ impl PreviewMicroDuckPolicyRunner {
             ),
             (
                 "policy/resolved",
-                format!("{:?};{:?}", selection.descriptor, selection.config).into_bytes(),
+                format!(
+                    "{:?};{:?};actuator_response={response:?}",
+                    selection.descriptor, selection.config
+                )
+                .into_bytes(),
             ),
         ];
         let resolved_contract = ResolvedContract::with_sources(
@@ -585,10 +605,14 @@ impl PreviewMicroDuckPolicyRunner {
             self.backend_profile.clone(),
             sources,
         );
+        self.loop_state
+            .select_policy_with_descriptor(&selection.path, &selection.descriptor, selection.config)
+            .map_err(|error| error.to_string())?;
+        self.set_simulation_actuator_response(response_override)?;
         append_control_event(
             self.config_dir.as_deref(),
             format!(
-                "preview_policy_selected path={:?} config={:?} episodic={} duration_s={:?} contract_hash={}",
+                "preview_policy_selected path={:?} config={:?} episodic={} duration_s={:?} contract_hash={} actuator_response={response:?}",
                 selection.path,
                 selection.config,
                 selection.episodic,
@@ -826,6 +850,79 @@ mod tests {
         assert!(log.contains("delay_timebase=physics_step"));
         assert!(log.contains("servo_read id=1"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires the official ONNX artifact and a dynamic ONNX Runtime"]
+    fn hd1910_velstand_walks_after_standing() {
+        let path = std::env::var_os("MICRODUCK_OFFICIAL_ONNX").unwrap();
+        for idle_ticks in [2, 3, 10, 50, 100, 200] {
+            let mut registry = loop_body::BackendRegistry::default();
+            let mut preview = PreviewMicroDuckPolicyRunner::open(
+                ServoModel::Hd1910,
+                crate::helpers::default_simulation(ServoModelKey::Hd1910),
+                None,
+                "hd1910-velstand",
+                "HD1910 velstand",
+                &mut registry,
+            )
+            .unwrap();
+            preview
+                .activate_policy(PreviewPolicySelection {
+                    path: path.clone().into(),
+                    command: None,
+                    descriptor: PolicyDescriptor {
+                        id: "velstand".into(),
+                        body_id: "official".into(),
+                        body_version: 1,
+                        obs_len: 61,
+                        action_len: 14,
+                        control_hz: 50,
+                        command_encoding: None,
+                        recurrent: None,
+                        action_scale: None,
+                        head_lowpass: None,
+                        legs_lowpass: None,
+                        joint_velocity_delay_ticks: 1,
+                    },
+                    config: PolicyConfig::default(),
+                    episodic: false,
+                    duration: None,
+                })
+                .unwrap();
+
+            for _ in 0..idle_ticks {
+                preview.tick().unwrap();
+            }
+            let start = preview.status().simulation.unwrap().trunk_position;
+            assert!(
+                start[0].hypot(start[1]) < 0.04,
+                "drifted at zero command: {start:?}"
+            );
+            preview.set_input(super::PreviewInput {
+                twist: [0.15, 0.0, 0.0],
+                head: [0.0; 4],
+                body: [0.0; 3],
+                target_distance_m: Some(1.0),
+            });
+            let mut lowest = f64::INFINITY;
+            for _ in 0..250 {
+                let state = preview.tick().unwrap().simulation.unwrap();
+                lowest = lowest.min(state.trunk_position[2]);
+            }
+            let distance = preview.status().simulation.unwrap().trunk_position[0] - start[0];
+            println!(
+                "HD1910: idle_ticks={idle_ticks} forward_m={distance:.3} lowest_trunk_m={lowest:.3}"
+            );
+            assert!(
+                distance > 0.18,
+                "failed to walk after {idle_ticks} idle ticks: {distance} m"
+            );
+            assert!(lowest > 0.10, "trunk fell below 0.10 m");
+
+            preview.begin_standing_transition().unwrap();
+            assert!(preview.snapshot.lock().unwrap().actuator_response.is_none());
+        }
     }
 
     /// Export a product-side trace against the same pinned artifact used by the CPU MuJoCo

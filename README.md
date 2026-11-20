@@ -28,7 +28,22 @@ pnpm dev
 
 ### 演进了哪些部分
 
-- 重实现loop让其完整的运行在电脑端 => https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md
+- 重实现loop
+  - 官方其实有完备的逻辑，但是因为最终运行端不一致分散在不同的代码里
+  - 纯Web版可参考 https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md
+  - 仓库本意是 学习 > 完备的把机器运行起来 -> 单终端MoJoCo跑训练、不同舵机测试、模拟环境看效果、实机接入
+- 能重实现loop的基准
+  - 动力学中影响身体平衡参数并不是所有都进入Token，而是留在loop内
+  - ONNX输入输出本身是稳定的，只要做一层运动学的转义就好
+  - 即：接受官方onnx + 非XL330 电机的鸭子可能抽搐
+
+> 核心是：复现官方onnx + XL330 的运动轨迹数据
+
+### ON MY WAY
+
+> 单终端跑意味着：所有性能极限取决于我自己的显卡 -> 用轨迹数据当老师，尝试些复杂的机械控制方案
+
+- [ ] DeepMimic
 
 ---
 
