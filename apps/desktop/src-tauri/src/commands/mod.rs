@@ -6,6 +6,7 @@
 use tauri_specta::{Builder, collect_commands};
 
 pub(crate) mod actions;
+pub(crate) mod logs;
 pub(crate) mod loop_control;
 pub(crate) mod machines;
 pub(crate) mod policy;
@@ -16,6 +17,14 @@ pub(crate) fn command_builder<R: tauri::Runtime>() -> Builder<R> {
     Builder::<R>::new()
         .disable_serde_phases()
         .commands(collect_commands![
+            logs::recording_list,
+            logs::recording_start,
+            logs::recording_stop,
+            logs::recording_frames,
+            logs::recording_compare,
+            logs::recording_export,
+            logs::diagnostic_tail,
+            logs::frontend_diagnostic,
             scene::servo_catalog,
             scene::official_joint_slots,
             scene::official_joint_ranges,
@@ -46,9 +55,11 @@ pub(crate) fn command_builder<R: tauri::Runtime>() -> Builder<R> {
             machines::physical::physical_machine_rename,
             machines::physical::physical_machine_bind,
             machines::virtual_machine::virtual_machine_bind,
+            machines::virtual_machine::virtual_machine_bindings,
             machines::virtual_machine::virtual_machine_validate_bindings,
             machines::physical::physical_machine_validate_bindings,
             machines::physical::physical_machine_set_pose_zero,
+            machines::physical::physical_machine_center_encoders,
             machines::physical::physical_machine_pose,
             machines::physical::physical_machine_set_torque,
             machines::physical::physical_machine_write_position,
@@ -70,6 +81,7 @@ pub(crate) fn command_builder<R: tauri::Runtime>() -> Builder<R> {
             machines::open_logs,
             loop_control::runtime_open,
             loop_control::runtime_reconfigure,
+            loop_control::runtime_select_body,
             loop_control::preview_machine_select,
             loop_control::runtime_command,
             loop_control::loop_status,

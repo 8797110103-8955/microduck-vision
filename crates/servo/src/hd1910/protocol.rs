@@ -18,6 +18,12 @@ pub struct XdatImage {
 pub const HD1910: FeetechProtocol = FeetechProtocol;
 pub const STS3215: FeetechProtocol = FeetechProtocol;
 
+/// HLS present velocity (address 58), in RPM per signed count.
+/// https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-hls/
+pub const HD1910_VELOCITY_RPM_PER_COUNT: f64 = 0.732;
+pub const HD1910_VELOCITY_RAD_PER_SEC_PER_COUNT: f64 =
+    HD1910_VELOCITY_RPM_PER_COUNT * 2.0 * PI / 60.0;
+
 pub fn protocol_for_model(model: ServoModel) -> Option<FeetechProtocol> {
     matches!(
         model,
@@ -73,13 +79,27 @@ pub fn position_steps_from_rad(model: ServoModel, radians: f64) -> Result<i32, S
     if !radians.is_finite() {
         return Err(ServoError::NonFinitePosition(radians));
     }
-    if !(-PI..=PI).contains(&radians) {
+    if model == ServoModel::Scs0009 && !(-PI..=PI).contains(&radians) {
         return Err(ServoError::RegisterOutOfRange {
             name: "goal_position".into(),
             value: (radians * 1_000_000.0) as i64,
         });
     }
-    Ok((resolution * (PI + radians) / (2.0 * PI)) as i32)
+    // HD/STS feedback is a signed continuous position, including turn count and
+    // hardware homing offset. Preserve it on the way back to goal_position.
+    // Installation travel limits are separate from this register encoding domain.
+    let steps = (resolution * (PI + radians) / (2.0 * PI)).round();
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&steps) {
+        return Err(ServoError::RegisterOutOfRange {
+            name: "goal_position".into(),
+            value: steps as i64,
+        });
+    }
+    let steps = steps as i32;
+    if model != ServoModel::Scs0009 {
+        encode_register("goal_position", i64::from(steps))?;
+    }
+    Ok(steps)
 }
 
 pub fn position_rad_from_steps(model: ServoModel, steps: i32) -> f64 {
@@ -91,8 +111,33 @@ pub fn position_rad_from_steps(model: ServoModel, steps: i32) -> f64 {
     (f64::from(steps) * (2.0 * PI) / resolution) - PI
 }
 
-pub fn velocity_rad_s_from_raw(_model: ServoModel, raw: i16) -> f64 {
-    sts3215::Velocity::from_raw(raw as u16)
+/// Convert signed counts after the register codec has decoded sign-magnitude once.
+pub fn velocity_rad_s_from_counts(model: ServoModel, counts: i16) -> f64 {
+    if model == ServoModel::Hd1910 {
+        // HD uses HLS units. Reusing the STS SDK's fine scale understates actual speed
+        // by ~50x even when the sign has been decoded correctly.
+        return f64::from(counts) * HD1910_VELOCITY_RAD_PER_SEC_PER_COUNT;
+    }
+    // Vendor Velocity::from_raw consumes an unsigned wire word, not a decoded i16.
+    // Casting -1 to u16 would decode it again as -32767 and invent ~50 rad/s.
+    sts3215::Velocity::from_raw(counts.unsigned_abs()).copysign(f64::from(counts))
+}
+
+/// The shared HD1910 live-telemetry decode path, including register sign and units.
+pub fn decode_motion_block(bytes: &[u8]) -> Result<(f64, f64), ServoError> {
+    if bytes.len() != 4 {
+        return Err(ServoError::ShortRead {
+            what: "HD1910 motion block",
+            expected: 4,
+            got: bytes.len(),
+        });
+    }
+    let position = decode_register("present_position", &bytes[..2])? as i32;
+    let velocity = decode_register("present_velocity", &bytes[2..])? as i16;
+    Ok((
+        position_rad_from_steps(ServoModel::Hd1910, position),
+        velocity_rad_s_from_counts(ServoModel::Hd1910, velocity),
+    ))
 }
 
 pub fn current_ma_from_raw(_model: ServoModel, raw: i16) -> f64 {

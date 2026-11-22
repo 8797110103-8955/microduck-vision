@@ -1,7 +1,7 @@
 import * as commands from "../generated/types";
 import { reactive } from "vue";
 import { defineStore } from "pinia";
-import type { JointRangeState, ServoModelKey, WorldState } from "../generated/types";
+import type { PreviewInput, ServoModelKey, WorldState } from "../generated/types";
 
 const selectedServoStorageKey = "microduck.selected-servo";
 const worldCacheStorageKey = "microduck.world-cache";
@@ -63,6 +63,12 @@ function readStoredServo(): ServoModelKey {
 }
 
 export function createDesktopStore() {
+  const previewInput: PreviewInput = {
+    twist: [0.15, 0, 0],
+    head: [0, 0, 0, 0],
+    body: [0, 0, 0],
+    targetDistanceM: null,
+  };
   const state = reactive({
     tab: "home",
     machineView: "simulation",
@@ -80,12 +86,14 @@ export function createDesktopStore() {
     selectedPolicyId: null as string | null,
     actions: [] as Awaited<ReturnType<typeof commands.actions>>,
     loop: null as Awaited<ReturnType<typeof commands.loopStatus>>,
-    jointRangeStates: [] as JointRangeState[],
+    recordingPlayback: null as Awaited<ReturnType<typeof commands.recordingFrames>>[number] | null,
+    teacherDatasetPath: "",
     debugPose: null as number[] | null,
+    debugMappingPending: false,
     rangePreview: null as number[] | null,
-    physicalSyncEnabled: false,
+    requestedPhysicalMachine: null as string | null,
+    previewInput,
     worldCache: readWorldCache(),
-    previewLoop: null as Awaited<ReturnType<typeof commands.loopStatus>>,
     training: null as Awaited<ReturnType<typeof commands.trainingStatus>>,
     selectedVirtualMachine: null as string | null,
     selectedVirtualMachineManual: false,
@@ -93,7 +101,28 @@ export function createDesktopStore() {
     loading: false,
   });
 
-  return { state };
+  function applyLoopStatus(status: NonNullable<typeof state.loop>) {
+    const current = state.loop;
+    if (
+      current &&
+      (status.runtimeGeneration < current.runtimeGeneration ||
+        (status.runtimeGeneration === current.runtimeGeneration &&
+          (status.executionGeneration < current.executionGeneration ||
+            (status.executionGeneration === current.executionGeneration &&
+              (status.configRevision < current.configRevision ||
+                (status.configRevision === current.configRevision &&
+                  status.tick < current.tick))))))
+    )
+      return;
+    state.loop = status;
+    const id = status.activeBody?.virtualMachineId;
+    if (id) {
+      state.worldCache[id] = status.world;
+      persistWorldCache(state.worldCache);
+    }
+  }
+
+  return { state, applyLoopStatus };
 }
 
 export const useDesktopStore = defineStore("desktop", () => {

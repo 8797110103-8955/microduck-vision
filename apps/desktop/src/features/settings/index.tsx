@@ -6,11 +6,13 @@ import { PhysicalMachinesPage } from "../machines";
 import { SimulationPage } from "../simulation";
 import { ServoLibraryPage } from "../servo-library";
 import { PolicyPage } from "../policy";
+import { LogsPage } from "../logs";
 import style from "./style.module.scss";
 
 const tabs = [
   { label: "机器", view: "simulation" as const },
   { label: "策略", view: "policy" as const },
+  { label: "日志", view: "logs" as const },
 ];
 
 export const SettingsPage = defineComponent(() => {
@@ -69,9 +71,9 @@ export const SettingsPage = defineComponent(() => {
               type="button"
               class={
                 (
-                  view === "policy"
-                    ? store.state.machineView === "policy"
-                    : store.state.machineView !== "policy"
+                  view === "simulation"
+                    ? !["policy", "logs"].includes(store.state.machineView)
+                    : store.state.machineView === view
                 )
                   ? style.active
                   : undefined
@@ -88,7 +90,9 @@ export const SettingsPage = defineComponent(() => {
       <section class={style.settingsContent}>
         <ScrollArea fill>
           <div class={style.settingsContentInner}>
-            {store.state.machineView === "policy" ? (
+            {store.state.machineView === "logs" ? (
+              <LogsPage />
+            ) : store.state.machineView === "policy" ? (
               <PolicyPage />
             ) : store.state.machineView === "simulation" ? (
               <SimulationPage />

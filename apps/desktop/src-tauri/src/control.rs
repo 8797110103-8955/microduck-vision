@@ -42,11 +42,28 @@ pub(crate) struct OpenLoopInput {
     pub contract_hash: String,
 }
 
+/// HD1910 mode-4 runtime P read from the connected hardware snapshots. The desktop loop must
+/// use this physical setting; the simulation's BAM gain multipliers are a separate concern.
+const HD1910_RUNTIME_POSITION_GAIN: u16 = 32;
+
+fn loop_config_for_backend(backend_kind: &str) -> LoopConfig {
+    if backend_kind == "physical" {
+        LoopConfig {
+            gain: HD1910_RUNTIME_POSITION_GAIN,
+            ..LoopConfig::default()
+        }
+    } else {
+        LoopConfig::default()
+    }
+}
+
 /// Result of selecting the execution backend for a loop.  The command layer supplies only the
 /// resolved machine mapping; serial ownership and the read-only shared-driver decision stay here.
 pub(crate) struct OpenBackendDriver {
     pub driver: Box<dyn ControlBackend>,
     pub shared_bus: Option<Arc<Mutex<ConnectedBus>>>,
+    pub hd1910_position_domains:
+        std::collections::HashMap<u8, crate::backend::hd1910_body::PositionDomain>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,6 +107,10 @@ pub(crate) fn open_backend_driver(
     active_ids: Vec<Option<u8>>,
     contract: &str,
 ) -> Result<OpenBackendDriver, String> {
+    if access == loop_body::BackendAccess::Control {
+        state.ensure_encoder_calibration_ready(physical_id)?;
+    }
+    let diagnostic_ids = active_ids.iter().flatten().copied().collect::<Vec<_>>();
     let mut registry = state
         .backend_registry
         .lock()
@@ -127,7 +148,7 @@ pub(crate) fn open_backend_driver(
                         servo::ServoError::Bus("physical connection closed".into())
                     })?;
                     Ok(Box::new(PhysicalBackend::new(
-                        bus,
+                        &bus,
                         model,
                         active_ids.clone(),
                     )))
@@ -164,9 +185,55 @@ pub(crate) fn open_backend_driver(
                     driver.generation()
                 ),
             );
+            let mut hd1910_position_domains = std::collections::HashMap::new();
+            if model == servo::ServoModel::Hd1910 {
+                for id in diagnostic_ids {
+                    let snapshot = shared
+                        .lock()
+                        .map_err(|_| "physical bus lock poisoned".to_owned())
+                        .and_then(|mut bus| bus.read_hd1910_configuration(id));
+                    let (event, level, details, failed) = match snapshot {
+                        Ok(registers) => {
+                            if let Some(domain) =
+                                crate::backend::hd1910_body::PositionDomain::from_snapshot(
+                                    &registers,
+                                )
+                            {
+                                hd1910_position_domains.insert(id, domain);
+                            }
+                            (
+                                "servo_configuration_snapshot",
+                                "info",
+                                serde_json::json!({"registers": registers}),
+                                false,
+                            )
+                        }
+                        Err(error) => (
+                            "servo_configuration_snapshot_failed",
+                            "warn",
+                            serde_json::json!({"error": error}),
+                            true,
+                        ),
+                    };
+                    crate::logging::diagnostic(
+                        state.config_dir.as_deref(),
+                        "servo",
+                        level,
+                        event,
+                        serde_json::json!({"duck_id": physical_id, "servo_id": id,
+                            "stage": "backend_open", "access": format!("{access:?}"), "details": details}),
+                    );
+                    // Diagnostic reads are best-effort. Do not repeat a failed/unsupported
+                    // window across the whole bus or alter the control state to obtain it.
+                    if failed {
+                        break;
+                    }
+                }
+            }
             Ok(OpenBackendDriver {
                 driver: Box::new(driver),
                 shared_bus: Some(shared),
+                hd1910_position_domains,
             })
         }
         Err(error) => {
@@ -237,6 +304,7 @@ fn read_only_status(
 ) -> Result<FrontendLoopStatus, String> {
     let mut status = FrontendLoopStatus {
         has_execution: false,
+        active_body: None,
         runtime_state: crate::types::RuntimeState::Running,
         simulation: None,
         read_sources: vec![source.into()],
@@ -334,9 +402,18 @@ pub(crate) fn record_backend_open(state: &DesktopState, backend_kind: &str) -> R
 }
 
 pub(crate) fn open_loop(input: OpenLoopInput) -> Result<MicroDuckPolicyRunner, String> {
+    let loop_config = loop_config_for_backend(input.backend_kind);
     let mut loop_state =
-        MicroDuckPolicyRunner::open(input.binding, input.driver, LoopConfig::default())
+        MicroDuckPolicyRunner::open(input.binding, input.driver, loop_config.clone())
             .map_err(|error| error.to_string())?;
+    let host_velocity_delay_ticks = if input.backend_kind == "physical" {
+        loop_state
+            .use_hardware_velocity_feedback()
+            .map_err(|error| error.to_string())?;
+        0
+    } else {
+        LoopConfig::default().velocity_observation_delay_ticks
+    };
     if let Some((path, config, descriptor)) = input.policy.as_ref() {
         append_control_event(
             input.config_dir.as_deref(),
@@ -359,12 +436,12 @@ pub(crate) fn open_loop(input: OpenLoopInput) -> Result<MicroDuckPolicyRunner, S
         .as_ref()
         .map(|(_, config, _)| *config)
         .unwrap_or_default();
-    let control_dt = LoopConfig::default().period.as_secs_f64();
+    let control_dt = loop_config.period.as_secs_f64();
     let timing = runtime_timing(input.backend_kind, control_dt);
     append_control_event(
         input.config_dir.as_deref(),
         format!(
-            "policy_runtime backend_kind={} backend_profile={} contract_hash={} config={runtime_config:?} observation_dim=61 action_dim=14 control_dt={control_dt} physics_dt={} physics_substeps={} decimation={} delay_timebase={} delay_steps={} observation_delay_ticks=1 imu_source=backend_or_default gain={}",
+            "policy_runtime backend_kind={} backend_profile={} contract_hash={} config={runtime_config:?} observation_dim=61 action_dim=14 control_dt={control_dt} physics_dt={} physics_substeps={} decimation={} delay_timebase={} delay_steps={} observation_delay_ticks={host_velocity_delay_ticks} imu_source=backend_or_default gain={}",
             input.backend_kind,
             input.backend_profile,
             input.contract_hash,
@@ -373,7 +450,7 @@ pub(crate) fn open_loop(input: OpenLoopInput) -> Result<MicroDuckPolicyRunner, S
             timing.decimation,
             timing.delay_timebase,
             timing.delay_steps,
-            LoopConfig::default().gain
+            loop_config.gain
         ),
     );
     Ok(loop_state)
@@ -393,6 +470,7 @@ pub(crate) fn status(state: &DesktopState) -> Result<Option<FrontendLoopStatus>,
     {
         status = Some(FrontendLoopStatus {
             has_execution: false,
+            active_body: None,
             runtime_state: crate::types::RuntimeState::Faulted,
             simulation: None,
             phase: crate::types::LoopPhase::Stopped,
@@ -487,7 +565,7 @@ pub(crate) fn action(
         .physical_mut()?
         .send(action)
         .map_err(|e| e.to_string())?;
-    let mut status = FrontendLoopStatus::from(loop_state.physical()?.status());
+    let mut status = loop_state.snapshot();
     decorate_status(state, &mut status);
     status.world = state.motion.lock().map_err(|e| e.to_string())?.world();
     state.emit_joint_range_states(&status.joint_range_states);
@@ -547,6 +625,9 @@ pub(crate) fn close_locked(state: &DesktopState) -> Result<(), String> {
     let source_only = guard
         .as_ref()
         .is_some_and(|runtime| runtime.is_simulation() && runtime.read_source().is_some());
+    if !source_only {
+        state.recorder.stop("runtime_closed")?;
+    }
     if let Some(source) = guard.as_mut().and_then(|runtime| runtime.read_source_mut())
         && let Err(error) = source.stop()
     {
@@ -603,6 +684,10 @@ pub(crate) fn close_locked(state: &DesktopState) -> Result<(), String> {
         }
     }
     *state.loop_backend_kind.lock().map_err(|e| e.to_string())? = None;
+    *state
+        .loop_virtual_machine_id
+        .lock()
+        .map_err(|e| e.to_string())? = None;
     state
         .execution_gate
         .set_physical_writes_enabled(false)
@@ -637,6 +722,34 @@ pub(crate) fn detach_physical_connection(state: &DesktopState, id: &str) -> Resu
             .runtime_loop
             .lock()
             .map_err(|error| error.to_string())?;
+        if let Some(instance) = runtime.as_mut()
+            && let Ok(execution) = instance.policy_execution_mut()
+            && execution.physical_id() == Some(id)
+        {
+            let stop = execution.stop();
+            state
+                .execution_gate
+                .set_physical_writes_enabled(false)
+                .map_err(|e| e.to_string())?;
+            let error = match &stop {
+                Ok(()) => "真机已断开，可切回模拟机".to_owned(),
+                Err(error) => format!("无法确认真机扭矩已关闭：{error}"),
+            };
+            let mut fault = state.runtime_fault.lock().map_err(|e| e.to_string())?;
+            *fault = Some(match fault.as_ref() {
+                Some(original) => format!("{original}; {error}"),
+                None => error,
+            });
+            drop(fault);
+            state
+                .execution_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            state
+                .config_revision
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            stop?;
+            execution.mark_detached();
+        }
         if let Some(source) = runtime
             .as_mut()
             .and_then(|runtime| runtime.read_source_mut())
@@ -669,7 +782,10 @@ pub(crate) fn detach_physical_connection(state: &DesktopState, id: &str) -> Resu
             if let Some(instance) = runtime.as_mut() {
                 instance.take_source();
             }
-        } else {
+        } else if !runtime
+            .as_ref()
+            .is_some_and(crate::state::RuntimeInstance::has_policy_execution)
+        {
             runtime.take();
         }
         state
@@ -846,5 +962,15 @@ pub(crate) mod tests {
         record_backend_open(&state, "physical").unwrap();
         let error = ensure_backend_available(&state, "simulation").unwrap_err();
         assert!(error.contains("physical"));
+    }
+
+    #[test]
+    fn physical_loop_uses_the_readback_hd1910_runtime_gain_while_simulation_keeps_its_loop_default()
+    {
+        assert_eq!(super::loop_config_for_backend("physical").gain, 32);
+        assert_eq!(
+            super::loop_config_for_backend("simulation").gain,
+            LoopConfig::default().gain
+        );
     }
 }

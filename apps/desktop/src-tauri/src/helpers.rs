@@ -8,6 +8,21 @@ use crate::types::{
     LoopStatus as FrontendLoopStatus, SimulationParameters, WorldState as FrontendWorldState,
 };
 
+pub(crate) fn new_machine_id(kind: &str) -> String {
+    format!("{kind}-{}", uuid::Uuid::new_v4())
+}
+
+pub(crate) fn default_joint_bindings() -> Vec<crate::types::VirtualJointBinding> {
+    duck_control::model::JOINT_NAMES
+        .iter()
+        .zip(duck_control::model::JOINT_IDS)
+        .map(|(slot, id)| crate::types::VirtualJointBinding {
+            slot_id: (*slot).into(),
+            physical_id: id,
+        })
+        .collect()
+}
+
 pub(crate) fn model(key: &ServoModelKey) -> ServoModel {
     match key {
         ServoModelKey::Hd1910 => ServoModel::Hd1910,
@@ -43,6 +58,7 @@ impl From<loop_body::LoopStatus> for FrontendLoopStatus {
     fn from(status: loop_body::LoopStatus) -> Self {
         Self {
             has_execution: true,
+            active_body: None,
             simulation: None,
             runtime_state: crate::types::RuntimeState::Running,
             read_sources: Vec::new(),
@@ -110,6 +126,15 @@ impl From<&loop_body::ReadOnlySource> for crate::types::ReadSourceStatus {
             last_error: source.last_error().map(str::to_owned),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_directory() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("desktop workspace root")
+        .join("target/.agentic/tests")
 }
 
 #[cfg(test)]

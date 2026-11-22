@@ -7,6 +7,8 @@ import type {
   PhysicalServoRegister,
   PolicyEntry,
   ReconnectHint,
+  RecordingInfo,
+  RecordingFrame,
   SceneFrame,
   SceneInfo,
   ServoCatalogEntry,
@@ -85,6 +87,7 @@ const cloneMachine = (machine: PhysicalMachine): PhysicalMachine => ({
   ...machine,
   census: machine.census?.map((servo) => ({ ...servo })),
   reconnectHint: machine.reconnectHint ? { ...machine.reconnectHint } : machine.reconnectHint,
+  jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
   jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
   onlineServoIds: [...machine.onlineServoIds],
 });
@@ -144,8 +147,12 @@ export class TestBackend {
     { servoId: 1, model: "hd1910" },
     { servoId: 2, model: "hd1910" },
   ];
+  readonly servoPositions = new Map<string, Map<number, number>>();
+  private sourceGeneration = 0;
+  private sourceVirtualId: string | null = null;
   private status: LoopStatus | null = null;
   private previewStatus: LoopStatus | null = null;
+  private recordings: RecordingInfo[] = [];
   private previewInput: PreviewTestInput = {
     twist: [0, 0, 0],
     head: [0, 0, 0, 0],
@@ -197,6 +204,73 @@ export class TestBackend {
       return command === "plugin:window|is_maximized" ? false : null;
 
     switch (command) {
+      case "recording_list":
+        return this.recordings.map((record) => ({ ...record }));
+      case "diagnostic_tail":
+        return this.recordings.map((record) =>
+          JSON.stringify({
+            category: "recording",
+            level: "info",
+            recording_id: record.id,
+            event: record.state,
+          }),
+        );
+      case "frontend_diagnostic":
+        return null;
+      case "recording_start": {
+        const status = this.previewStatus ?? this.status;
+        if (!status?.activeBody) throw new Error("请先启动控制环");
+        const id = `recording-test-${this.recordings.length + 1}`;
+        const record: RecordingInfo = {
+          id,
+          appSessionId: "test",
+          duckId: status.activeBody.physicalMachineId ?? status.activeBody.virtualMachineId ?? "",
+          name: stringValue(payloadRecord(payload).name, "name") || id,
+          path: `logs/recordings/${id}`,
+          startedAtMs: Date.now(),
+          endedAtMs: null,
+          state: "recording",
+          frames: 0,
+          droppedFrames: 0,
+          error: null,
+        };
+        this.recordings.push(record);
+        return { ...record };
+      }
+      case "recording_stop": {
+        const record = this.recordings.find((candidate) => candidate.state === "recording");
+        if (!record) return null;
+        record.state = "complete";
+        record.frames = 2;
+        record.endedAtMs = Date.now();
+        return { ...record };
+      }
+      case "recording_frames": {
+        const status = this.previewStatus ?? this.status;
+        if (!status) return [];
+        const window = payloadRecord(payloadRecord(payload).window);
+        const rows: RecordingFrame[] = [0, 1].map((tick) => ({
+          recordingId: String(window.id),
+          duckId: "official-hd1910",
+          segmentId: 1,
+          episodeId: 1,
+          elapsedS: tick * 0.02,
+          controlStartedS: tick * 0.02,
+          status: { ...status, tick },
+          policy: null,
+        }));
+        return rows;
+      }
+      case "recording_compare":
+        return {
+          metrics: [],
+          matchedFrames: 2,
+          unmatchedFrames: 0,
+          path: "logs/recordings/comparison.json",
+          warnings: [],
+        };
+      case "recording_export":
+        return { path: "logs/recordings/teacher-motion", samples: 2, excludedFrames: 0 };
       case "servo_catalog":
         if (this.failCatalog) throw new Error("模拟配置读取失败");
         return this.catalog.map((entry) => ({ ...entry, capabilities: [...entry.capabilities] }));
@@ -327,29 +401,34 @@ export class TestBackend {
       case "physical_machine_bind": {
         const input = payloadRecord(payloadRecord(payload).input);
         const machine = this.machine(stringValue(input.physicalMachineId, "physicalMachineId"));
-        const virtual = this.virtual.find(
-          (entry) => entry.id === (input.virtualMachineId ?? machine.virtualMachineId),
-        );
-        if (!virtual) throw new Error("physical machine is not associated with a virtual machine");
         const slotId = stringValue(input.slotId, "slotId");
-        const bindings = (virtual.jointBindings ?? []).filter(
-          (binding) => binding.slotId !== slotId,
-        );
-        if (input.physicalId != null)
-          bindings.push({
-            slotId,
-            physicalId: Number(input.physicalId),
-            direction: 1,
-            zeroOffsetRad: 0,
-          });
-        virtual.jointBindings = bindings;
-        if (input.direction === 1 || input.direction === -1) {
+        if ((this.previewStatus ?? this.status)?.activeBody?.physicalMachineId === machine.id)
+          throw new Error("请先停止这台实机的控制环，再修改肢体映射或方向");
+        if (input.direction != null) {
           machine.jointDirections = [
             ...(machine.jointDirections ?? []).filter((binding) => binding.slotId !== slotId),
-            { slotId, direction: input.direction },
+            { slotId, direction: Number(input.direction) },
           ];
         }
         return cloneMachine(machine);
+      }
+      case "virtual_machine_bindings": {
+        const value = payloadRecord(payload);
+        const machine = this.virtual.find((entry) => entry.id === value.virtualMachineId);
+        if (!machine) throw new Error("unknown virtual machine");
+        const updates = Array.isArray(value.bindings) ? value.bindings.map(payloadRecord) : [];
+        const bindings = new Map(
+          (machine.jointBindings ?? []).map((binding) => [binding.slotId, binding]),
+        );
+        for (const update of updates) {
+          const slotId = String(update.slotId);
+          if (update.physicalId == null) bindings.delete(slotId);
+          else bindings.set(slotId, { slotId, physicalId: Number(update.physicalId) });
+        }
+        const ids = [...bindings.values()].map((binding) => binding.physicalId);
+        if (new Set(ids).size !== ids.length) throw new Error("duplicate servo ID");
+        machine.jointBindings = [...bindings.values()];
+        return cloneVirtual(machine);
       }
       case "virtual_machine_bind": {
         const input = payloadRecord(payloadRecord(payload).input);
@@ -364,9 +443,9 @@ export class TestBackend {
           bindings.push({
             slotId: String(input.slotId),
             physicalId: Number(input.physicalId),
-            direction: 1,
-            zeroOffsetRad: 0,
           });
+        if (new Set(bindings.map((binding) => binding.physicalId)).size !== bindings.length)
+          throw new Error("duplicate servo ID");
         machine.jointBindings = bindings;
         return cloneVirtual(machine);
       }
@@ -388,27 +467,53 @@ export class TestBackend {
       case "physical_machine_validate_bindings": {
         const id = stringValue(payloadRecord(payload).id, "id");
         const machine = this.machine(id);
-        const virtual = this.virtual.find((entry) => entry.id === machine.virtualMachineId);
-        const bindings = virtual?.jointBindings ?? [];
-        const conflictingIds = bindings
-          .filter((binding, index) =>
-            bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
-          )
-          .map((binding) => binding.physicalId);
-        const validBindings = bindings.filter(
-          (binding) => !conflictingIds.includes(binding.physicalId),
-        );
-        if (virtual) virtual.jointBindings = validBindings;
         return cloneMachine(machine);
+      }
+      case "physical_machine_center_encoders": {
+        const input = payloadRecord(payload);
+        const machine = this.machine(stringValue(input.id, "id"));
+        if (!machine.connected) throw new Error("实机没有可用连接");
+        const virtual = this.virtual.find((entry) => entry.id === input.virtualMachineId);
+        if (!virtual) throw new Error("unknown virtual machine");
+        const positions = this.servoPositions.get(machine.id) ?? new Map<number, number>();
+        const calibratedServoIds: number[] = [];
+        for (const binding of virtual.jointBindings ?? []) {
+          if (!machine.onlineServoIds.includes(binding.physicalId)) continue;
+          const direction =
+            machine.jointDirections?.find((entry) => entry.slotId === binding.slotId)?.direction ??
+            1;
+          const joints = (machine.jointBindings ??= []);
+          let calibration = joints.find((entry) => entry.slotId === binding.slotId);
+          if (!calibration) {
+            calibration = { slotId: binding.slotId, zeroOffsetRad: 0, minRad: null, maxRad: null };
+            joints.push(calibration);
+          }
+          const angle =
+            ((positions.get(binding.physicalId) ?? 0) - (calibration.zeroOffsetRad ?? 0)) *
+            direction;
+          const bodyAngle =
+            ((((angle + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
+          calibration.zeroOffsetRad = -direction * bodyAngle;
+          positions.set(binding.physicalId, 0);
+          calibratedServoIds.push(binding.physicalId);
+        }
+        machine.torqueEnabled = false;
+        this.servoPositions.set(machine.id, positions);
+        return { machine: cloneMachine(machine), calibratedServoIds, error: null };
       }
       case "physical_machine_set_pose_zero": {
         const machine = this.machine(stringValue(payloadRecord(payload).id, "id"));
-        const virtual = this.virtual.find((entry) => entry.id === machine.virtualMachineId);
-        if (!virtual) throw new Error("physical machine is not associated with a virtual machine");
-        virtual.jointBindings = (virtual.jointBindings ?? []).map((binding) => ({
-          ...binding,
-          zeroOffsetRad: 0,
-        }));
+        const virtual = this.virtual.find(
+          (entry) => entry.id === payloadRecord(payload).virtualMachineId,
+        );
+        machine.jointBindings = (virtual?.jointBindings ?? [])
+          .filter((binding) => machine.onlineServoIds.includes(binding.physicalId))
+          .map((binding) => ({
+            slotId: binding.slotId,
+            zeroOffsetRad: this.servoPositions.get(machine.id)?.get(binding.physicalId) ?? 0,
+            minRad: null,
+            maxRad: null,
+          }));
         return cloneMachine(machine);
       }
       case "physical_machine_pose":
@@ -436,23 +541,85 @@ export class TestBackend {
       // The test adapter shares construction after the atomic replacement boundary.
       case "runtime_open": {
         const input = payloadRecord(payload).input;
-        if (isRecord(input) && typeof input.physicalMachineId === "string")
-          return this.openLoop(input);
+        if (isRecord(input) && typeof input.physicalMachineId === "string") {
+          const existing = this.previewStatus ?? this.status;
+          if (
+            input.access === "read_only" &&
+            existing?.activeBody?.physicalMachineId === input.physicalMachineId
+          )
+            return cloneStatus(existing);
+          const physical = this.openLoop(input);
+          if (this.previewStatus && input.access === "read_only") {
+            this.previewStatus = {
+              ...this.previewStatus,
+              readSources: this.status?.readSources ?? [],
+              configRevision: this.previewStatus.configRevision + 1,
+            };
+            return cloneStatus(this.previewStatus);
+          }
+          return physical;
+        }
         if (!isRecord(input)) throw new Error("invalid runtime input");
         return this.openPreviewLoop(stringValue(input.virtualMachineId, "virtualMachineId"));
+      }
+      case "runtime_select_body": {
+        const input = payloadRecord(payload);
+        const current = this.previewStatus;
+        if (
+          !current ||
+          current.runtimeGeneration !== input.generation ||
+          current.executionGeneration !== input.executionGeneration
+        )
+          throw new Error("stale execution generation");
+        const virtualMachineId = stringValue(input.virtualMachineId, "virtualMachineId");
+        const physicalMachineId =
+          typeof input.physicalMachineId === "string" ? input.physicalMachineId : null;
+        if (physicalMachineId && !this.machine(physicalMachineId).connected)
+          throw new Error("真机离线");
+        const positions = physicalMachineId
+          ? (current.readSources.find((source) => source.id === physicalMachineId)?.positions ??
+            Array(15).fill(0.25))
+          : Array(15).fill(0);
+        return cloneStatus(
+          (this.previewStatus = {
+            ...current,
+            activeBody: { virtualMachineId, physicalMachineId },
+            executionGeneration: current.executionGeneration + 1,
+            torque: !!physicalMachineId,
+            phase: physicalMachineId ? "holding" : "ready",
+            readSources: [],
+            configRevision: current.configRevision + 1,
+            positions: [...positions],
+            targets: [...positions],
+            world: { position: [0, 0], yaw: 0, distanceM: 0 },
+          }),
+        );
       }
       case "runtime_command": {
         const request = payloadRecord(payload).request;
         if (!isRecord(request)) throw new Error("invalid runtime command");
         if (request.kind === "input") return this.previewCommand(request.input);
-        if (request.kind === "policy")
-          return this.previewPolicy(stringValue(request.policy_id, "policy_id"));
+        if (request.kind === "policy") {
+          this.previewPolicy(stringValue(request.policy_id, "policy_id"));
+          return this.previewCommand(request.input);
+        }
         if (request.kind === "resetWorld") {
           if (!this.previewStatus) throw new Error("preview loop is closed");
           this.previewStatus = {
             ...this.previewStatus,
             world: { position: [0, 0], yaw: 0, distanceM: 0 },
           };
+          return cloneStatus(this.previewStatus);
+        }
+        if (request.kind === "action" && this.previewStatus) {
+          const action = parseLoopAction(payloadRecord(request.action));
+          if (!action) throw new Error("invalid loop action");
+          if (action.kind === "drive") {
+            this.previewStatus = {
+              ...this.previewStatus,
+              phase: action.on ? "driving" : "holding",
+            };
+          }
           return cloneStatus(this.previewStatus);
         }
         if (request.kind === "action") return this.action(request.action);
@@ -475,12 +642,21 @@ export class TestBackend {
       case "loop_tick_at":
         return this.tick();
       case "loop_status":
-        return cloneStatus(this.status);
+        this.sampleSource();
+        return cloneStatus(this.previewStatus ?? this.status);
       case "loop_close":
         this.status = null;
         return null;
       case "runtime_close":
         this.status = null;
+        if (payloadRecord(payload).scope === "readOnlySource" && this.previewStatus) {
+          this.previewStatus = {
+            ...this.previewStatus,
+            readSources: [],
+            configRevision: this.previewStatus.configRevision + 1,
+          };
+          return null;
+        }
         this.previewStatus = null;
         return null;
       case "preview_loop_open":
@@ -529,6 +705,7 @@ export class TestBackend {
   private sceneModel(): SceneInfo {
     return {
       meshDir: "",
+      defaultFrame: { bodies: [[0, 0, 0, 1, 0, 0, 0]], markers: [] },
       model: {
         bodies: [{ name: "official-duck", geoms: [] }],
         joints: [],
@@ -591,7 +768,7 @@ export class TestBackend {
       onlineServoIds: found.map((servo) => servo.servoId),
       connected: true,
       lastSeen: "刚刚",
-      jointDirections: [],
+      jointBindings: [],
     };
     this.physical.push(machine);
     return cloneMachine(machine);
@@ -737,25 +914,113 @@ export class TestBackend {
     return cloneMachine(machine);
   }
 
+  private sampleSource() {
+    const source = this.status?.readSources[0];
+    if (!source) return;
+    const physicalMachine = this.machine(source.id);
+    const virtual = this.virtual.find((machine) => machine.id === this.sourceVirtualId);
+    const positions = [
+      "left_hip_yaw",
+      "left_hip_roll",
+      "left_hip_pitch",
+      "left_knee",
+      "left_ankle",
+      "neck_pitch",
+      "head_pitch",
+      "head_yaw",
+      "head_roll",
+      "mouth",
+      "right_hip_yaw",
+      "right_hip_roll",
+      "right_hip_pitch",
+      "right_knee",
+      "right_ankle",
+    ].map((slotId) => {
+      const binding = virtual?.jointBindings?.find((entry) => entry.slotId === slotId);
+      if (!binding || !physicalMachine.onlineServoIds.includes(binding.physicalId)) return 0;
+      const calibration = physicalMachine.jointBindings?.find((entry) => entry.slotId === slotId);
+      const raw =
+        this.servoPositions.get(physicalMachine.id)?.get(binding.physicalId) ??
+        calibration?.zeroOffsetRad ??
+        0;
+      const direction =
+        physicalMachine.jointDirections?.find((entry) => entry.slotId === slotId)?.direction ?? 1;
+      return (raw - (calibration?.zeroOffsetRad ?? 0)) * direction;
+    });
+    source.positions = positions;
+    source.sequence += 1;
+    this.status!.positions = positions;
+  }
+
   private openLoop(value: unknown) {
     const input = isRecord(value) ? value : {};
-    const virtualMachine = this.virtual.find(
-      (entry) =>
-        entry.id === (typeof input.virtualMachineId === "string" ? input.virtualMachineId : ""),
-    );
+    const physicalMachine = this.machine(stringValue(input.physicalMachineId, "physicalMachineId"));
+    if (!physicalMachine.connected) throw new Error("真机离线");
+    const virtual = this.virtual.find((machine) => machine.id === input.virtualMachineId);
+    this.sourceVirtualId = virtual?.id ?? null;
     const seen = new Set<number>();
-    const duplicate = virtualMachine?.jointBindings?.find((binding) => {
+    const duplicate = virtual?.jointBindings?.find((binding) => {
       if (seen.has(binding.physicalId)) return true;
       seen.add(binding.physicalId);
       return false;
     });
     if (duplicate) throw new Error(`绑定冲突：舵机 ${duplicate.physicalId} 被重复绑定`);
     const ids = Array.from({ length: 15 }, (_, index) => index + 1);
+    const positions = [
+      "left_hip_yaw",
+      "left_hip_roll",
+      "left_hip_pitch",
+      "left_knee",
+      "left_ankle",
+      "neck_pitch",
+      "head_pitch",
+      "head_yaw",
+      "head_roll",
+      "mouth",
+      "right_hip_yaw",
+      "right_hip_roll",
+      "right_hip_pitch",
+      "right_knee",
+      "right_ankle",
+    ].map((slotId) => {
+      const binding = virtual?.jointBindings?.find((entry) => entry.slotId === slotId);
+      if (!binding || !physicalMachine.onlineServoIds.includes(binding.physicalId)) return 0;
+      const calibration = physicalMachine.jointBindings?.find((entry) => entry.slotId === slotId);
+      const raw =
+        this.servoPositions.get(physicalMachine.id)?.get(binding.physicalId) ??
+        calibration?.zeroOffsetRad ??
+        0;
+      const direction =
+        physicalMachine.jointDirections?.find((entry) => entry.slotId === slotId)?.direction ?? 1;
+      return (raw - (calibration?.zeroOffsetRad ?? 0)) * direction;
+    });
+    this.sourceGeneration += 1;
     this.status = {
       runtimeState: "running",
       hasExecution: input.access === "control",
+      activeBody:
+        input.access === "control"
+          ? { virtualMachineId: null, physicalMachineId: String(input.physicalMachineId) }
+          : null,
       simulation: null,
-      readSources: [],
+      readSources:
+        input.access === "control"
+          ? []
+          : [
+              {
+                id: String(input.physicalMachineId),
+                generation: this.sourceGeneration,
+                sequence: 1,
+                sampledAt: 0,
+                ageMs: 0,
+                health: "fresh",
+                positions,
+                velocities: ids.map(() => 0),
+                validPositions: ids.map(() => true),
+                validVelocities: ids.map(() => true),
+                lastError: null,
+              },
+            ],
       runtimeGeneration: 1,
       executionGeneration: 1,
       configRevision: 1,
@@ -763,7 +1028,7 @@ export class TestBackend {
       session: 0,
       tick: 0,
       torque: false,
-      positions: ids.map(() => 0),
+      positions,
       targets: ids.map(() => 0),
       world: { position: [0, 0], yaw: 0, distanceM: 0 },
       sensorFailures: 0,
@@ -825,6 +1090,7 @@ export class TestBackend {
     this.previewStatus = {
       runtimeState: "running",
       hasExecution: true,
+      activeBody: { virtualMachineId, physicalMachineId: null },
       simulation: null,
       readSources: [],
       runtimeGeneration: 1,
@@ -848,7 +1114,7 @@ export class TestBackend {
     if (!this.previewStatus) throw new Error("preview loop is closed");
     const policy = this.policies.find((entry) => entry.id === id);
     if (!policy?.cached) throw new Error("请先下载这个官方策略");
-    this.previewStatus = { ...this.previewStatus, torque: true, lastError: null };
+    this.previewStatus = { ...this.previewStatus, phase: "driving", torque: true, lastError: null };
     return cloneStatus(this.previewStatus);
   }
 

@@ -15,7 +15,6 @@ use loop_body::{
 use crate::application::policy;
 use crate::backend::contract::ResolvedContract;
 use crate::control;
-use crate::helpers::model;
 use crate::logging::{
     LoggedServoDriver, append_control_event, begin_control_loop, log_joint_range_states,
 };
@@ -109,6 +108,233 @@ pub(crate) fn reconfigure(
     }
 }
 
+pub(crate) fn select_body(
+    state: &DesktopState,
+    generation: u64,
+    execution_generation: u64,
+    virtual_machine_id: String,
+    physical_machine_id: Option<String>,
+) -> Result<FrontendLoopStatus, String> {
+    use std::sync::atomic::Ordering;
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    state.validate_runtime_generation(Some(generation))?;
+    let (old_physical_id, old_virtual_id) = {
+        let mut runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
+        validate_execution_generation(state, execution_generation)?;
+        let runtime = runtime.as_mut().ok_or("runtime is closed")?;
+        let execution = runtime.policy_execution_mut()?;
+        if physical_machine_id.is_some() {
+            state.ensure_runtime_healthy()?;
+        }
+        let old_physical_id = execution.physical_id().map(str::to_owned);
+        let old_virtual_id = execution.virtual_machine_id().to_owned();
+        if !execution.is_detached()
+            && old_physical_id == physical_machine_id
+            && old_virtual_id == virtual_machine_id
+            && state
+                .runtime_fault
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Ok(super::preview::with_runtime_generation(
+                state,
+                runtime.snapshot(),
+            ));
+        }
+        if physical_machine_id.is_some() {
+            if old_physical_id.is_some() {
+                return Err("请先切回模拟机，再选择另一台真机".into());
+            }
+            if old_virtual_id != virtual_machine_id {
+                return Err("请先切换到真机对应的模拟机".into());
+            }
+        }
+        (old_physical_id, old_virtual_id)
+    };
+    let machines = state.virtual_machines.lock().map_err(|e| e.to_string())?;
+    let machine = machines
+        .iter()
+        .find(|machine| machine.id == virtual_machine_id)
+        .cloned()
+        .ok_or("unknown virtual machine")?;
+    let fallback = machines
+        .iter()
+        .find(|machine| machine.id == old_virtual_id)
+        .cloned();
+    drop(machines);
+    let physical_body = if let Some(id) = &physical_machine_id {
+        let body = prepare_physical_body(state, &virtual_machine_id, id, None)?;
+        body.check_feedback(state)?;
+        Some(body)
+    } else {
+        None
+    };
+    // Normal ticks can continue while hardware feedback is checked. Acquisition of this
+    // lock is the handoff boundary, and a fault during preflight invalidates the request.
+    let mut active = state.runtime_loop.lock().map_err(|e| e.to_string())?;
+    validate_execution_generation(state, execution_generation)?;
+    let runtime = active.as_mut().ok_or("runtime is closed")?;
+    if physical_body.is_some()
+        && let Some(source) = runtime.read_source_mut()
+    {
+        source.stop()?;
+        runtime.take_source();
+        if let Some(id) = state
+            .loop_physical_machine_id
+            .lock()
+            .map_err(|e| e.to_string())?
+            .take()
+        {
+            control::restore_shared_physical_bus(state, &id)?;
+        }
+        *state.loop_backend_kind.lock().map_err(|e| e.to_string())? = None;
+    }
+    let execution = runtime.policy_execution_mut()?;
+    execution.action(loop_body::LoopAction::Drive(false))?;
+    let released = execution.release_body(
+        &mut *state.backend_registry.lock().map_err(|e| e.to_string())?,
+        old_physical_id.as_deref().unwrap_or(&old_virtual_id),
+    );
+    state.execution_generation.fetch_add(1, Ordering::AcqRel);
+    state.config_revision.fetch_add(1, Ordering::AcqRel);
+    let result = released.and_then(|()| {
+        if let Some(body) = physical_body {
+            let id = body.physical.id.clone();
+            let profile = format!("{:?}", body.model);
+            let contract = body.contract.hash.clone();
+            let (binding, driver, bus) = body.open(state, loop_body::BackendAccess::Control)?;
+            *state
+                .loop_physical_machine_id
+                .lock()
+                .map_err(|e| e.to_string())? = Some(id.clone());
+            *state.loop_physical_bus.lock().map_err(|e| e.to_string())? = bus;
+            *state
+                .loop_virtual_machine_id
+                .lock()
+                .map_err(|e| e.to_string())? = Some(virtual_machine_id.clone());
+            let mut runner = control::open_loop(control::OpenLoopInput {
+                binding,
+                driver,
+                policy: None,
+                config_dir: state.config_dir.clone(),
+                backend_kind: "physical",
+                backend_profile: profile.clone(),
+                contract_hash: contract.clone(),
+            })?;
+            runner.sample_body().map_err(|e| e.to_string())?;
+            execution.switch_to_physical(id, runner, profile, contract)?;
+            control::record_backend_open(state, "physical")?;
+            execution.action(loop_body::LoopAction::Power(true))?;
+        } else {
+            let next = super::preview::open_body(state, &machine)?;
+            execution.switch_to_simulation(next)?;
+            if let Some(id) = &old_physical_id {
+                control::restore_shared_physical_bus(state, id)?;
+                *state
+                    .loop_physical_machine_id
+                    .lock()
+                    .map_err(|e| e.to_string())? = None;
+            }
+            if old_physical_id.is_some() {
+                *state.loop_backend_kind.lock().map_err(|e| e.to_string())? = None;
+            }
+            state
+                .execution_gate
+                .set_physical_writes_enabled(false)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        // Once the outgoing lease has been released, reopen its simulation on a failed
+        // hardware attach. An attached physical body still owns torque-off and is faulted.
+        state
+            .execution_gate
+            .set_physical_writes_enabled(false)
+            .map_err(|e| e.to_string())?;
+        let recovered = execution.is_detached()
+            && old_physical_id.is_none()
+            && fallback.is_some_and(|machine| {
+                if let Ok(mut id) = state.loop_physical_machine_id.lock()
+                    && let Some(id) = id.take()
+                {
+                    let _ = control::restore_shared_physical_bus(state, &id);
+                }
+                super::preview::open_body(state, &machine)
+                    .and_then(|next| execution.switch_to_simulation(next))
+                    .is_ok()
+            });
+        if !recovered {
+            let error = match execution.stop() {
+                Ok(()) => error,
+                Err(stop) => format!("{error}; stop failed: {stop}"),
+            };
+            *state.runtime_fault.lock().map_err(|e| e.to_string())? = Some(error.clone());
+            return Err(error);
+        }
+        return Err(error);
+    }
+    *state.runtime_fault.lock().map_err(|e| e.to_string())? = None;
+    Ok(super::preview::with_runtime_generation(
+        state,
+        runtime.snapshot(),
+    ))
+}
+
+fn validate_execution_generation(state: &DesktopState, expected: u64) -> Result<(), String> {
+    let current = state.current_execution_generation();
+    if expected != current {
+        return Err(format!(
+            "stale execution generation {expected}, current is {current}"
+        ));
+    }
+    Ok(())
+}
+
+/// Configuration mutations hold the transition lock through persistence and source replacement.
+pub(crate) fn ensure_mapping_editable(
+    state: &DesktopState,
+    virtual_id: &str,
+) -> Result<(), String> {
+    let physical_ids = state
+        .physical_machines
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|machine| {
+            machine.virtual_machine_id.as_deref() == Some(virtual_id)
+                || machine.virtual_machine_id.is_none()
+        })
+        .map(|machine| machine.id.clone())
+        .collect::<Vec<_>>();
+    for id in physical_ids {
+        super::encoder_calibration::ensure_ready(state, &id)?;
+    }
+    let active_body = state
+        .runtime_loop
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .and_then(|runtime| runtime.snapshot().active_body);
+    let bound_virtual = state
+        .loop_virtual_machine_id
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    if active_body.is_some_and(|body| {
+        body.physical_machine_id.is_some()
+            && (body.virtual_machine_id.as_deref() == Some(virtual_id)
+                || bound_virtual.as_deref() == Some(virtual_id))
+    }) {
+        return Err("请先切回模拟机，再修改正在驱动实机的肢体映射".into());
+    }
+    Ok(())
+}
+
 /// Serialize frontend mutations with start/stop before validating their runtime ownership.
 /// The transition lock remains held through the operation, preventing a stale request from
 /// being reinterpreted after a concurrent execution replacement.
@@ -125,19 +351,14 @@ pub(crate) fn command(
         .map_err(|e| e.to_string())?;
     state.validate_runtime_generation(Some(generation))?;
     state.ensure_runtime_healthy()?;
-    let simulation = {
+    let (simulation, managed_policy) = {
         let runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
-        let current_execution = state.current_execution_generation();
-        if execution_generation != current_execution {
-            return Err(format!(
-                "stale execution generation {execution_generation}, current is {current_execution}"
-            ));
-        }
+        validate_execution_generation(state, execution_generation)?;
         let runtime = runtime.as_ref().ok_or("runtime is closed")?;
         if !runtime.has_execution() {
             return Err("runtime is read-only".into());
         }
-        runtime.is_simulation()
+        (runtime.is_simulation(), runtime.has_policy_execution())
     };
     let previous = state
         .command_sequence
@@ -152,7 +373,9 @@ pub(crate) fn command(
         .store(sequence, std::sync::atomic::Ordering::Release);
     use crate::types::RuntimeCommand;
     match request {
-        RuntimeCommand::Input { input } if simulation => super::preview::set_input(state, input),
+        RuntimeCommand::Input { input } if managed_policy => {
+            super::preview::set_input(state, input)
+        }
         RuntimeCommand::Input { input } => {
             control::set_policy_command(
                 state,
@@ -164,12 +387,12 @@ pub(crate) fn command(
             )?;
             control::status(state)?.ok_or_else(|| "runtime is closed".into())
         }
-        RuntimeCommand::Targets { targets } if !simulation => {
+        RuntimeCommand::Targets { targets } if !simulation && !managed_policy => {
             control::set_targets(state, targets)?;
             control::status(state)?.ok_or_else(|| "runtime is closed".into())
         }
-        RuntimeCommand::Policy { policy_id } if simulation => {
-            super::preview::select_policy(state, policy_id)
+        RuntimeCommand::Policy { policy_id, input } if managed_policy => {
+            super::preview::select_policy(state, policy_id, input)
         }
         RuntimeCommand::ResetWorld if simulation => super::preview::reset_world(state),
         RuntimeCommand::Action { action } => {
@@ -182,7 +405,7 @@ pub(crate) fn command(
                     loop_body::LoopAction::Reconnect { session }
                 }
             };
-            if simulation {
+            if managed_policy {
                 super::preview::action(state, action)
             } else {
                 control::action(state, action)
@@ -263,6 +486,7 @@ pub(crate) fn binding_conflict_error(bindings: &[ServoJointBinding]) -> Option<S
     (!conflicts.is_empty()).then(|| format!("绑定冲突：{}", conflicts.join("；")))
 }
 
+#[cfg(test)]
 pub(crate) fn official_servo_bindings(census: &[ServoIdentity]) -> Vec<ServoJointBinding> {
     duck_control::model::JOINT_NAMES
         .iter()
@@ -282,32 +506,36 @@ pub(crate) fn official_servo_bindings(census: &[ServoIdentity]) -> Vec<ServoJoin
 
 pub(crate) fn effective_servo_bindings(
     census: &[ServoIdentity],
-    virtual_bindings: &[ServoJointBinding],
+    virtual_bindings: &[crate::types::VirtualJointBinding],
 ) -> Vec<ServoJointBinding> {
-    let official = official_servo_bindings(census);
     duck_control::model::JOINT_NAMES
         .iter()
         .filter_map(|slot_id| {
-            virtual_bindings
+            let physical_id = virtual_bindings
                 .iter()
                 .find(|binding| binding.slot_id == *slot_id)
-                .or_else(|| official.iter().find(|binding| binding.slot_id == *slot_id))
-                .filter(|binding| {
-                    census
-                        .iter()
-                        .any(|servo| servo.servo_id == binding.physical_id)
+                .map(|binding| binding.physical_id)?;
+            census
+                .iter()
+                .any(|servo| servo.servo_id == physical_id)
+                .then_some(ServoJointBinding {
+                    slot_id: (*slot_id).to_owned(),
+                    physical_id,
+                    direction: 1,
+                    zero_offset_rad: 0.0,
+                    min_rad: None,
+                    max_rad: None,
                 })
-                .cloned()
         })
         .collect()
 }
 
-/// Resolve each slot from its saved binding, falling back to its official ID when unset.
+/// Resolve each slot from the virtual machine's explicit binding.
 /// A slot whose explicitly selected physical ID is not present in the
 /// census stays unmapped so the read-only debug loop can continue with the other joints.
 pub(crate) fn debug_servo_bindings(
     census: &[ServoIdentity],
-    virtual_bindings: &[ServoJointBinding],
+    virtual_bindings: &[crate::types::VirtualJointBinding],
     slots: &[String],
 ) -> Vec<Option<ServoJointBinding>> {
     let bindings = effective_servo_bindings(census, virtual_bindings);
@@ -358,15 +586,45 @@ pub(crate) fn debug_driver_mapping(
 type DebugLoopMapping = (Vec<ServoJointBinding>, Vec<u8>, Vec<Option<u8>>);
 
 pub(crate) fn resolve_physical_loop_mapping(
+    virtual_bindings: &[crate::types::VirtualJointBinding],
     physical: &PhysicalMachine,
-    virtual_bindings: &[ServoJointBinding],
     slots: &[String],
 ) -> Result<DebugLoopMapping, String> {
-    let mut bindings = debug_servo_bindings(&physical.census, virtual_bindings, slots)
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    apply_physical_directions(&mut bindings, physical);
+    // The virtual machine owns the slot -> physical ID relation.  The physical
+    // machine contributes installation direction and calibration by limb name.
+    // A census confirms only that an ID exists, never which limb it operates.
+    let bindings = debug_servo_bindings(
+        &physical
+            .census
+            .iter()
+            .filter(|servo| physical.online_servo_ids.contains(&servo.servo_id))
+            .cloned()
+            .collect::<Vec<_>>(),
+        virtual_bindings,
+        slots,
+    )
+    .into_iter()
+    .flatten()
+    .map(|mut binding| {
+        if let Some(calibration) = physical
+            .joint_bindings
+            .iter()
+            .find(|calibration| calibration.slot_id == binding.slot_id)
+        {
+            binding.zero_offset_rad = calibration.zero_offset_rad;
+            binding.min_rad = calibration.min_rad;
+            binding.max_rad = calibration.max_rad;
+        }
+        if let Some(installation) = physical
+            .joint_directions
+            .iter()
+            .find(|direction| direction.slot_id == binding.slot_id)
+        {
+            binding.direction = installation.direction;
+        }
+        binding
+    })
+    .collect::<Vec<_>>();
     let resolved = slots
         .iter()
         .map(|slot_id| {
@@ -378,21 +636,6 @@ pub(crate) fn resolve_physical_loop_mapping(
         .collect::<Vec<_>>();
     let (driver_ids, active_ids) = debug_driver_mapping(&physical.census, &resolved)?;
     Ok((bindings, driver_ids, active_ids))
-}
-
-pub(crate) fn apply_physical_directions(
-    bindings: &mut [ServoJointBinding],
-    physical: &PhysicalMachine,
-) {
-    for binding in bindings {
-        if let Some(override_direction) = physical
-            .joint_directions
-            .iter()
-            .find(|item| item.slot_id == binding.slot_id)
-        {
-            binding.direction = override_direction.direction;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -407,25 +650,30 @@ pub(crate) fn open(
     open_locked(state, input)
 }
 
-fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoopStatus, String> {
-    let LoopOpenInput {
-        virtual_machine_id,
-        physical_machine_id: requested_physical_id,
-        access,
-        policy_id,
-    } = input;
-    if requested_physical_id.is_empty() {
-        return Err(
-            "physical machine ID is required; simulation uses the simulation runtime entry".into(),
-        );
-    }
-    let access = match (access, policy_id.is_some()) {
-        (crate::types::LoopAccess::ReadOnly, false) => loop_body::BackendAccess::ReadOnly,
-        (crate::types::LoopAccess::Control, _) => loop_body::BackendAccess::Control,
-        (crate::types::LoopAccess::ReadOnly, true) => {
-            return Err("read-only access cannot load a policy".into());
-        }
-    };
+type PolicyLoad = (
+    std::path::PathBuf,
+    crate::backend::policy_runtime::PolicyConfig,
+    crate::backend::policy_runtime::PolicyDescriptor,
+);
+
+struct PhysicalBody {
+    virtual_id: String,
+    physical: PhysicalMachine,
+    binding: LoopBinding,
+    model: servo::ServoModel,
+    mapped_active_ids: Vec<Option<u8>>,
+    binding_summary: String,
+    contract: ResolvedContract,
+    simulation: crate::types::SimulationParameters,
+    simulation_model: servo::ServoModel,
+}
+
+fn prepare_physical_body(
+    state: &DesktopState,
+    virtual_machine_id: &str,
+    requested_physical_id: &str,
+    policy_path: Option<&PolicyLoad>,
+) -> Result<PhysicalBody, String> {
     let machine = state
         .virtual_machines
         .lock()
@@ -434,26 +682,7 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
         .find(|machine| machine.id == virtual_machine_id)
         .cloned()
         .ok_or_else(|| "unknown virtual machine".to_string())?;
-    if policy_id.is_some()
-        && let Some(error) = binding_conflict_error(&machine.joint_bindings)
-    {
-        return Err(error);
-    }
     let template = BodyTemplate::official().map_err(|e| e.to_string())?;
-    let model = model(&machine.servo_model);
-    let policy_path = if let Some(policy_id) = policy_id {
-        let selected = policy::list(state.config_dir.as_deref())?
-            .into_iter()
-            .find(|entry| entry.id == policy_id && entry.cached && entry.selected)
-            .ok_or_else(|| "selected ONNX policy is not downloaded".to_owned())?;
-        let path = policy::selected_path(state.config_dir.as_deref())
-            .ok_or_else(|| format!("selected ONNX policy is unavailable: {}", selected.id))?;
-        let config = policy::runtime_config(state.config_dir.as_deref(), &selected)?;
-        let descriptor = policy::descriptor(state.config_dir.as_deref(), &selected)?;
-        Some((path, config, descriptor))
-    } else {
-        None
-    };
     let physical = state
         .physical_machines
         .lock()
@@ -462,31 +691,23 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
         .find(|physical| physical.id == requested_physical_id)
         .cloned()
         .ok_or_else(|| "unknown physical machine".to_string())?;
-    if !physical.connected
-        || physical
-            .virtual_machine_id
-            .as_deref()
-            .is_some_and(|id| id != machine.id)
-    {
-        return Err("physical machine is not available for this virtual machine".into());
+    if !physical.connected {
+        return Err("physical machine is offline".into());
     }
-    let physical_id = physical.id.clone();
+    let model = super::physical_machine::physical_servo_model(&physical)?;
     let backend_kind = "physical";
-    control::ensure_backend_access(
-        state,
-        backend_kind,
-        access == loop_body::BackendAccess::Control,
-    )?;
     let mut contract_sources = crate::backend::simulation::official_sources()?;
     contract_sources.push((
         "physical/profile".into(),
         format!(
-            "{:?};{:?};{:?};{:?}",
-            machine.servo_model, machine.joint_bindings, physical.joint_directions, physical.census
+            "{model:?};{:?};{:?};{:?}",
+            (&machine.joint_bindings, &physical.joint_bindings),
+            physical.joint_directions,
+            physical.online_servo_ids
         )
         .into_bytes(),
     ));
-    if let Some((path, config, descriptor)) = &policy_path {
+    if let Some((path, config, descriptor)) = policy_path {
         contract_sources.push((
             "policy/onnx".into(),
             std::fs::read(path).map_err(|e| e.to_string())?,
@@ -525,7 +746,21 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
         .map(|slot| slot.id.clone())
         .collect::<Vec<_>>();
     let (saved_bindings, bound_servo_ids, mapped_active_ids) =
-        resolve_physical_loop_mapping(&physical, &machine.joint_bindings, &slot_ids)?;
+        resolve_physical_loop_mapping(&machine.joint_bindings, &physical, &slot_ids)?;
+    crate::logging::diagnostic(
+        state.config_dir.as_deref(),
+        "binding",
+        "info",
+        "body_mapping_resolved",
+        serde_json::json!({"duck_id":physical.id,"virtual_machine_id":machine.id,
+            "virtual_bindings":machine.joint_bindings,"joint_order":slot_ids,
+            "active_servo_ids":mapped_active_ids,"calibrations":saved_bindings,
+            "unmatched_feedback":"mujoco_in_control_invalid_in_read_only",
+            "association":"configured_id_presence_only"}),
+    );
+    if let Some(error) = binding_conflict_error(&saved_bindings) {
+        return Err(error);
+    }
     let calibration = Calibration {
         body_id: template.id.clone(),
         body_version: template.version,
@@ -564,63 +799,326 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
         })
         .collect::<Vec<_>>()
         .join(" | ");
-    let non_identity_calibration = calibration.joints.iter().any(|joint| {
-        joint.direction != 1
-            || joint.zero_offset_rad != 0.0
-            || joint.min_rad.is_some()
-            || joint.max_rad.is_some()
-    });
-    let nonzero_offsets = calibration
-        .joints
-        .iter()
-        .filter(|joint| joint.zero_offset_rad != 0.0)
-        .map(|joint| format!("{}={}", joint.slot_id, joint.zero_offset_rad))
-        .collect::<Vec<_>>();
     let binding = LoopBinding {
         body: BodyRuntimeView::new(template.clone()).map_err(|e| e.to_string())?,
         servos: ServoBinding::all_slots(&template, model),
-        calibration: calibration.clone(),
+        calibration,
     };
-    let loop_physical_id = physical_id.clone();
-    let log_machine_id = physical.id.as_str();
-    let log_machine_name = physical.name.as_str();
-    let log_handle = begin_control_loop(
-        state.config_dir.as_deref(),
-        log_machine_id,
-        log_machine_name,
-        &binding_summary,
-    );
-    append_control_event(
-        state.config_dir.as_deref(),
-        format!(
-            "binding_check servo_model={model:?} physical_driver={} actuator_count={} non_identity_calibration={} zero_offset_frame=raw_servo position_transform=subtract_zero_then_direction velocity_transform=direction_only nonzero_offsets={:?}",
-            true,
-            calibration.joints.len(),
-            non_identity_calibration,
-            nonzero_offsets
-        ),
-    );
-    let mut debug_shared_bus;
-    // Sensor loops share their connection with direct reads. Explicit debug writes use the
-    // application execution gate; a read-only backend session itself never receives writes.
-    let opened_driver = control::open_backend_driver(
-        state,
-        &physical_id,
+    binding
+        .calibration
+        .validate(&template)
+        .map_err(|error| error.to_string())?;
+    Ok(PhysicalBody {
+        virtual_id: machine.id,
+        physical,
+        binding,
         model,
-        access,
         mapped_active_ids,
-        &resolved_contract.hash,
-    )?;
-    debug_shared_bus = opened_driver.shared_bus;
-    let driver: Box<dyn ControlBackend> = if let Some(handle) = log_handle {
-        Box::new(LoggedServoDriver::new(
-            opened_driver.driver,
-            handle,
-            log_machine_id.to_owned(),
-        ))
-    } else {
-        opened_driver.driver
+        binding_summary,
+        contract: resolved_contract,
+        simulation: machine.simulation,
+        simulation_model: crate::helpers::model(&machine.servo_model),
+    })
+}
+
+type OpenedPhysicalBody = (
+    LoopBinding,
+    Box<dyn ControlBackend>,
+    Option<Arc<std::sync::Mutex<crate::backend::control::ConnectedBus>>>,
+);
+
+impl PhysicalBody {
+    fn check_feedback(&self, state: &DesktopState) -> Result<(), String> {
+        let ids = self
+            .mapped_active_ids
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if ids
+            .iter()
+            .any(|id| !self.physical.online_servo_ids.contains(id))
+        {
+            return Err("真机关节绑定的舵机未全部在线".into());
+        }
+        super::physical_io::with_bus_locked(
+            state,
+            &self.physical.id,
+            loop_body::BackendAccess::ReadOnly,
+            |bus| {
+                let positions = bus
+                    .ok_or("实机没有可用连接")?
+                    .read_positions(self.model, &ids)?;
+                if positions.len() != ids.len()
+                    || positions.iter().any(|position| !position.is_finite())
+                {
+                    return Err("真机返回的关节反馈不完整".into());
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn open(
+        self,
+        state: &DesktopState,
+        access: loop_body::BackendAccess,
+    ) -> Result<OpenedPhysicalBody, String> {
+        let Self {
+            virtual_id,
+            physical,
+            mut binding,
+            model,
+            mapped_active_ids,
+            binding_summary,
+            contract,
+            simulation,
+            simulation_model,
+        } = self;
+        // Unmatched limbs keep a MuJoCo actuator. This simulation has its own lease;
+        // it must never select/revoke the application's physical execution owner.
+        let fallback = if access == loop_body::BackendAccess::Control {
+            let mut registry = loop_body::BackendRegistry::default();
+            crate::backend::simulation::register_machine(
+                &mut registry,
+                "unmatched-limbs",
+                simulation_model,
+                &simulation,
+            )?;
+            registry
+                .select("unmatched-limbs")
+                .map_err(|e| e.to_string())?;
+            Some((
+                Box::new(
+                    registry
+                        .open("unmatched-limbs", access)
+                        .map_err(|e| e.to_string())?,
+                ) as Box<dyn ControlBackend>,
+                registry,
+            ))
+        } else {
+            None
+        };
+        let calibration = &binding.calibration;
+        let non_identity_calibration = calibration.joints.iter().any(|joint| {
+            joint.direction != 1
+                || joint.zero_offset_rad != 0.0
+                || joint.min_rad.is_some()
+                || joint.max_rad.is_some()
+        });
+        let nonzero_offsets = calibration
+            .joints
+            .iter()
+            .filter(|joint| joint.zero_offset_rad != 0.0)
+            .map(|joint| format!("{}={}", joint.slot_id, joint.zero_offset_rad))
+            .collect::<Vec<_>>();
+        let log_machine_id = physical.id.as_str();
+        let log_machine_name = physical.name.as_str();
+        let log_handle = begin_control_loop(
+            state.config_dir.as_deref(),
+            log_machine_id,
+            log_machine_name,
+            &binding_summary,
+        );
+        append_control_event(
+            state.config_dir.as_deref(),
+            format!(
+                "binding_check servo_model={model:?} physical_driver={} actuator_count={} non_identity_calibration={} zero_offset_frame=raw_servo position_transform=subtract_zero_then_direction velocity_transform=direction_only nonzero_offsets={:?}",
+                true,
+                calibration.joints.len(),
+                non_identity_calibration,
+                nonzero_offsets
+            ),
+        );
+
+        // Sensor loops share their connection with direct reads. Explicit debug writes use the
+        // application execution gate; a read-only backend session itself never receives writes.
+        let read_only = access == loop_body::BackendAccess::ReadOnly;
+        let raw_ids = physical.online_servo_ids.clone();
+        let active_ids = mapped_active_ids.clone();
+        let driver_ids = if read_only {
+            raw_ids.iter().copied().map(Some).collect()
+        } else {
+            mapped_active_ids
+        };
+        let opened_driver = control::open_backend_driver(
+            state,
+            log_machine_id,
+            model,
+            access,
+            driver_ids,
+            &contract.hash,
+        )?;
+
+        let periodic_ranges = (model == servo::ServoModel::Hd1910).then(|| {
+            let template = binding.body.template();
+            template
+                .actuators
+                .iter()
+                .map(|slot| {
+                    template
+                        .joint_range(&slot.joint)
+                        .expect("validated actuator joint")
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let driver: Box<dyn ControlBackend> = if let Some(handle) = log_handle {
+            let logger =
+                LoggedServoDriver::new(opened_driver.driver, handle, log_machine_id.to_owned());
+            Box::new(if read_only {
+                logger
+            } else {
+                logger.with_calibration(binding.calibration.clone(), periodic_ranges.clone())
+            })
+        } else {
+            opened_driver.driver
+        };
+        if read_only {
+            let virtuals = Arc::clone(&state.virtual_machines);
+            let physicals = Arc::clone(&state.physical_machines);
+            let pending_calibrations = Arc::clone(&state.encoder_calibrations);
+            let revision = Arc::clone(&state.config_revision);
+            let physical_id = physical.id.clone();
+            let slots = binding
+                .calibration
+                .joints
+                .iter()
+                .map(|joint| joint.slot_id.clone())
+                .collect::<Vec<_>>();
+            let mut driver =
+                crate::backend::read_only_body::ReadOnlyBody::new(driver, raw_ids, move || {
+                    let virtual_bindings = virtuals
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .iter()
+                        .find(|machine| machine.id == virtual_id)
+                        .ok_or("unknown virtual machine")?
+                        .joint_bindings
+                        .clone();
+                    let physicals = physicals.lock().map_err(|e| e.to_string())?;
+                    let physical = physicals
+                        .iter()
+                        .find(|machine| machine.id == physical_id)
+                        .ok_or("unknown physical machine")?;
+                    let (bindings, _, _) =
+                        resolve_physical_loop_mapping(&virtual_bindings, physical, &slots)?;
+                    let pending = pending_calibrations.lock().map_err(|e| e.to_string())?;
+                    Ok(slots
+                        .iter()
+                        .map(|slot| {
+                            if super::encoder_calibration::is_pending(&pending, &physical_id, slot)
+                            {
+                                return None;
+                            }
+                            bindings
+                                .iter()
+                                .find(|joint| &joint.slot_id == slot)
+                                .map(|joint| JointCalibration {
+                                    slot_id: joint.slot_id.clone(),
+                                    physical_id: joint.physical_id,
+                                    direction: joint.direction,
+                                    zero_offset_rad: joint.zero_offset_rad,
+                                    min_rad: joint.min_rad,
+                                    max_rad: joint.max_rad,
+                                })
+                        })
+                        .collect())
+                })
+                .with_mapping_revision(move || revision.load(std::sync::atomic::Ordering::Acquire));
+            if let Some(ranges) = periodic_ranges {
+                driver = driver.with_periodic_ranges(ranges);
+            }
+            // The source adapter receives canonical body angles. ID/direction conversion is
+            // resolved from the shared configuration above for every raw sample.
+            for (index, joint) in binding.calibration.joints.iter_mut().enumerate() {
+                joint.physical_id = (index + 1) as u8;
+                joint.direction = 1;
+                joint.zero_offset_rad = 0.0;
+                joint.min_rad = None;
+                joint.max_rad = None;
+            }
+            return Ok((binding, Box::new(driver), opened_driver.shared_bus));
+        }
+        let driver: Box<dyn ControlBackend> = if let Some(ranges) = periodic_ranges {
+            Box::new(crate::backend::hd1910_body::Hd1910Body::new(
+                driver,
+                binding.calibration.clone(),
+                ranges,
+                active_ids.clone(),
+                opened_driver.hd1910_position_domains,
+            ))
+        } else {
+            driver
+        };
+        let driver = match fallback {
+            Some((simulation, registry)) => {
+                Box::new(crate::backend::attached_body::AttachedBody::new(
+                    simulation,
+                    driver,
+                    active_ids,
+                    binding.calibration.clone(),
+                    registry,
+                )) as Box<dyn ControlBackend>
+            }
+            None => driver,
+        };
+        Ok((binding, driver, opened_driver.shared_bus))
+    }
+}
+
+fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoopStatus, String> {
+    let LoopOpenInput {
+        virtual_machine_id,
+        physical_machine_id: requested_physical_id,
+        access,
+        policy_id,
+    } = input;
+    if requested_physical_id.is_empty() {
+        return Err(
+            "physical machine ID is required; simulation uses the simulation runtime entry".into(),
+        );
+    }
+    let access = match (access, policy_id.is_some()) {
+        (crate::types::LoopAccess::ReadOnly, false) => loop_body::BackendAccess::ReadOnly,
+        (crate::types::LoopAccess::Control, _) => loop_body::BackendAccess::Control,
+        (crate::types::LoopAccess::ReadOnly, true) => {
+            return Err("read-only access cannot load a policy".into());
+        }
     };
+    let policy_path = if let Some(policy_id) = policy_id {
+        let selected = policy::list(state.config_dir.as_deref())?
+            .into_iter()
+            .find(|entry| entry.id == policy_id && entry.cached && entry.selected)
+            .ok_or_else(|| "selected ONNX policy is not downloaded".to_owned())?;
+        let path = policy::selected_path(state.config_dir.as_deref())
+            .ok_or_else(|| format!("selected ONNX policy is unavailable: {}", selected.id))?;
+        let config = policy::runtime_config(state.config_dir.as_deref(), &selected)?;
+        let descriptor = policy::descriptor(state.config_dir.as_deref(), &selected)?;
+        Some((path, config, descriptor))
+    } else {
+        None
+    };
+    control::ensure_backend_access(
+        state,
+        "physical",
+        access == loop_body::BackendAccess::Control,
+    )?;
+    let body = prepare_physical_body(
+        state,
+        &virtual_machine_id,
+        &requested_physical_id,
+        policy_path.as_ref(),
+    )?;
+    let physical_id = body.physical.id.clone();
+    let binding_summary = body.binding_summary.clone();
+    let backend_kind = "physical";
+    let backend_profile = format!("{:?}", body.model);
+    let contract_hash = body.contract.hash.clone();
+    let (binding, driver, mut debug_shared_bus) = body.open(state, access)?;
     let (runtime_instance, mut status) = if access == loop_body::BackendAccess::Control {
         let body_loop = match control::open_loop(control::OpenLoopInput {
             binding,
@@ -628,8 +1126,8 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
             policy: policy_path.clone(),
             config_dir: state.config_dir.clone(),
             backend_kind,
-            backend_profile: format!("{model:?}"),
-            contract_hash: resolved_contract.hash.clone(),
+            backend_profile,
+            contract_hash,
         }) {
             Ok(loop_state) => loop_state,
             Err(error) => {
@@ -663,8 +1161,17 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
                 cache_capacity: 1,
             })
             .map_err(|error| error.to_string())?;
+        crate::logging::diagnostic(
+            state.config_dir.as_deref(),
+            "binding",
+            "info",
+            "read_source_started",
+            serde_json::json!({"duck_id":physical_id,"source_generation":source.generation(),
+                "joint_order":duck_control::model::JOINT_NAMES,"binding_summary":binding_summary}),
+        );
         let status = FrontendLoopStatus {
             has_execution: false,
+            active_body: None,
             runtime_state: crate::types::RuntimeState::Running,
             simulation: None,
             read_sources: vec![(&source).into()],
@@ -698,8 +1205,12 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
     *state
         .loop_physical_machine_id
         .lock()
-        .map_err(|e| e.to_string())? = Some(loop_physical_id);
+        .map_err(|e| e.to_string())? = Some(physical_id);
     *state.loop_physical_bus.lock().map_err(|e| e.to_string())? = debug_shared_bus;
+    *state
+        .loop_virtual_machine_id
+        .lock()
+        .map_err(|e| e.to_string())? = Some(virtual_machine_id);
     let mut runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
     let instance = match (runtime.take(), runtime_instance) {
         (Some(mut existing), mut next) if existing.is_simulation() && !next.has_execution() => {
@@ -725,7 +1236,7 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
     status.config_revision = state.current_config_revision();
     state.start_loop_clock()?;
     control::record_backend_open(state, backend_kind)?;
-    Ok(status)
+    control::status(state)?.ok_or_else(|| "runtime is closed".into())
 }
 
 #[cfg(test)]
@@ -748,6 +1259,163 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_faulted_execution_can_return_to_sampling_without_rearming_physical_control() {
+        let state = DesktopState::default();
+        let before = open_simulation(&state);
+        let virtual_id = before.active_body.unwrap().virtual_machine_id.unwrap();
+        *state.runtime_fault.lock().unwrap() = Some("goal_position cannot encode".into());
+        let after = super::select_body(
+            &state,
+            before.runtime_generation,
+            before.execution_generation,
+            virtual_id,
+            None,
+        )
+        .unwrap();
+        assert!(state.runtime_fault.lock().unwrap().is_none());
+        assert!(after.active_body.unwrap().physical_machine_id.is_none());
+        assert!(after.execution_generation > before.execution_generation);
+        assert_eq!(after.phase, crate::types::LoopPhase::Ready);
+    }
+
+    #[test]
+    fn body_handoff_isolates_feedback_and_releases_physical_control_without_restarting_runtime() {
+        use loop_body::{BackendAccess, BackendDescriptor, BackendKind};
+        use std::sync::{Arc, Mutex};
+
+        let state = DesktopState::default();
+        let id = state.virtual_machines.lock().unwrap()[0].id.clone();
+        let placement = crate::types::WorldState {
+            position: [1.4, -0.6],
+            yaw: 0.9,
+            distance_m: 2.0,
+        };
+        state.world_placements.remember(&id, placement);
+        let initial = open_simulation(&state);
+        assert_eq!(initial.world.position, placement.position);
+        let virtual_id = initial.active_body.unwrap().virtual_machine_id.unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut active = state.runtime_loop.lock().unwrap();
+        let runtime = active.as_mut().unwrap();
+        runtime.clock_tick(None).unwrap();
+        let runner = runtime.policy_execution_mut().unwrap();
+        let mut registry = state.backend_registry.lock().unwrap();
+        runner.release_body(&mut registry, &virtual_id).unwrap();
+        let fake_events = Arc::clone(&events);
+        registry
+            .register(
+                BackendDescriptor {
+                    id: "test-physical".into(),
+                    kind: BackendKind::Physical,
+                    supports_control: true,
+                    contract: "test".into(),
+                },
+                move || {
+                    Ok(Box::new(crate::control::tests::ReadOnlyDriver {
+                        positions: vec![0.25; 15],
+                        events: Arc::clone(&fake_events),
+                    }))
+                },
+            )
+            .unwrap();
+        registry.select("test-physical").unwrap();
+        let driver = registry
+            .open("test-physical", BackendAccess::Control)
+            .unwrap();
+        drop(registry);
+        state
+            .execution_gate
+            .set_physical_writes_enabled(true)
+            .unwrap();
+        let template = BodyTemplate::official().unwrap();
+        let binding = loop_body::LoopBinding {
+            body: loop_body::BodyRuntimeView::new(template.clone()).unwrap(),
+            servos: loop_body::ServoBinding::all_slots(&template, servo::ServoModel::Hd1910),
+            calibration: loop_body::Calibration {
+                body_id: template.id.clone(),
+                body_version: template.version,
+                joints: template
+                    .actuators
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slot)| loop_body::JointCalibration {
+                        slot_id: slot.id.clone(),
+                        physical_id: (index + 1) as u8,
+                        direction: 1,
+                        zero_offset_rad: 0.0,
+                        min_rad: None,
+                        max_rad: None,
+                    })
+                    .collect(),
+            },
+        };
+        let mut next = crate::backend::policy_runtime::MicroDuckPolicyRunner::open(
+            binding,
+            Box::new(driver),
+            loop_body::LoopConfig::default(),
+        )
+        .unwrap();
+        next.sample_body().unwrap();
+        runner
+            .switch_to_physical("test-physical".into(), next, "test".into(), "test".into())
+            .unwrap();
+        runner.action(loop_body::LoopAction::Power(true)).unwrap();
+        runner.stop().unwrap();
+        let stopped_events = events.lock().unwrap().len();
+        runner.stop().unwrap();
+        assert_eq!(
+            events.lock().unwrap().len(),
+            stopped_events,
+            "a confirmed torque-off must not touch a subsequently disappearing bus"
+        );
+        runner.action(loop_body::LoopAction::Power(true)).unwrap();
+        runner.stop().unwrap();
+        assert!(
+            events.lock().unwrap().len() > stopped_events,
+            "arming again requires a new torque-off confirmation"
+        );
+        runner.action(loop_body::LoopAction::Power(true)).unwrap();
+        let physical = runtime.clock_tick(None).unwrap();
+        assert_eq!(
+            physical.active_body.unwrap().physical_machine_id.as_deref(),
+            Some("test-physical")
+        );
+        assert_eq!(physical.positions, vec![0.25; 15]);
+        assert_eq!(physical.world.position, placement.position);
+        assert_eq!(physical.world.yaw, placement.yaw);
+        assert!(physical.simulation.is_none());
+        drop(active);
+
+        let simulation = super::select_body(
+            &state,
+            initial.runtime_generation,
+            initial.execution_generation,
+            virtual_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(simulation.world.position, placement.position);
+        assert_eq!(simulation.world.yaw, placement.yaw);
+        assert_eq!(simulation.world.distance_m, placement.distance_m);
+        assert_eq!(initial.runtime_generation, simulation.runtime_generation);
+        assert!(initial.execution_generation < simulation.execution_generation);
+        assert_eq!(simulation.tick, physical.tick);
+        assert!(
+            simulation
+                .active_body
+                .unwrap()
+                .physical_machine_id
+                .is_none()
+        );
+        assert_eq!(events.lock().unwrap().last(), Some(&"torque"));
+        let mut active = state.runtime_loop.lock().unwrap();
+        let simulation = active.as_mut().unwrap().clock_tick(None).unwrap();
+        assert!(simulation.simulation.is_some());
+        assert_ne!(simulation.positions, vec![0.25; 15]);
+        assert!(state.execution_gate.physical_write().is_err());
     }
 
     #[test]
@@ -1015,14 +1683,18 @@ mod tests {
             name: "测试实机".into(),
             usb_port: "COM-test".into(),
             machine_code: "test".into(),
-            census: vec![],
+            census: vec![ServoIdentity {
+                servo_id: 20,
+                model: "hd1910".into(),
+            }],
             reconnect_hint: None,
             virtual_machine_id: Some(virtual_machine_id.clone()),
             online_servo_ids: vec![],
             connected: true,
             last_seen: None,
             torque_enabled: false,
-            joint_directions: vec![],
+            joint_directions: Vec::new(),
+            joint_bindings: vec![],
         };
         state
             .physical_machines
@@ -1079,10 +1751,16 @@ mod tests {
             connected: true,
             last_seen: None,
             torque_enabled: false,
-            joint_directions: vec![],
+            joint_directions: Vec::new(),
+            joint_bindings: vec![],
         };
+        let virtual_bindings = vec![crate::types::VirtualJointBinding {
+            slot_id: slots[0].clone(),
+            physical_id: duck_control::model::JOINT_IDS[0],
+        }];
         let (_, driver_ids, active_ids) =
-            resolve_physical_loop_mapping(&physical, &[], &slots).expect("partial mapping");
+            resolve_physical_loop_mapping(&virtual_bindings, &physical, &slots)
+                .expect("partial mapping");
         assert_eq!(driver_ids.len(), slots.len());
         assert_eq!(active_ids.iter().filter(|id| id.is_some()).count(), 1);
         assert_eq!(
@@ -1092,22 +1770,302 @@ mod tests {
     }
 
     #[test]
+    fn knee_direction_reaches_read_only_feedback_and_the_official_3d_pose() {
+        use crate::types::{ServoJointCalibration, ServoJointDirection};
+        use std::sync::{Arc, Mutex};
+
+        let state = DesktopState::default();
+        let virtual_id = state.virtual_machines.lock().unwrap()[0].id.clone();
+        let slots = BodyTemplate::official().unwrap().actuators;
+        state.virtual_machines.lock().unwrap()[0].joint_bindings = slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| crate::types::VirtualJointBinding {
+                slot_id: slot.id.clone(),
+                physical_id: (index + 1) as u8,
+            })
+            .collect();
+        let physical = PhysicalMachine {
+            id: "knee-test".into(),
+            name: "test".into(),
+            usb_port: "test".into(),
+            machine_code: "test".into(),
+            reconnect_hint: None,
+            virtual_machine_id: Some(virtual_id.clone()),
+            connected: true,
+            census: (1..=15)
+                .map(|servo_id| ServoIdentity {
+                    servo_id,
+                    model: "hd1910".into(),
+                })
+                .collect(),
+            online_servo_ids: (1..=15).collect(),
+            last_seen: None,
+            torque_enabled: false,
+            joint_directions: vec![ServoJointDirection {
+                slot_id: "left_knee".into(),
+                direction: 1,
+            }],
+            joint_bindings: slots
+                .iter()
+                .map(|slot| ServoJointCalibration {
+                    slot_id: slot.id.clone(),
+
+                    zero_offset_rad: if slot.id == "left_knee" {
+                        2.8194566881338083
+                    } else {
+                        0.0
+                    },
+                    min_rad: None,
+                    max_rad: None,
+                })
+                .collect(),
+        };
+        let mut other = physical.clone();
+        other.id = "other-duck".into();
+        state
+            .physical_machines
+            .lock()
+            .unwrap()
+            .extend([physical, other]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut raw = vec![0.0; 15];
+        raw[3] = 3.9592044135328397;
+        let scene = duck_body::OfficialScene::from_path(
+            &crate::backend::mujoco::resource_directory()
+                .unwrap()
+                .join("robot_walk.xml"),
+        )
+        .unwrap();
+        let knee_body = scene
+            .model()
+            .joints
+            .iter()
+            .find(|joint| joint.name == "left_knee")
+            .unwrap()
+            .body as usize;
+        let hip_body = scene
+            .model()
+            .joints
+            .iter()
+            .find(|joint| joint.name == "left_hip_pitch")
+            .unwrap()
+            .body as usize;
+        let mut frames = Vec::new();
+        for direction in [1, -1, 1] {
+            crate::application::binding::physical_machine_bind(
+                &state,
+                crate::types::PhysicalMachineBindingInput {
+                    physical_machine_id: "knee-test".into(),
+
+                    slot_id: "left_knee".into(),
+
+                    direction,
+                },
+            )
+            .unwrap();
+            let body =
+                super::prepare_physical_body(&state, &virtual_id, "knee-test", None).unwrap();
+            let mut source = loop_body::ReadOnlySource::open(
+                body.binding,
+                Box::new(crate::control::tests::ReadOnlyDriver {
+                    positions: raw.clone(),
+                    events: events.clone(),
+                }),
+            );
+            let feedback = source.read().unwrap();
+            let status: crate::types::ReadSourceStatus = (&source).into();
+            assert_eq!(status.positions, feedback.positions);
+            assert!(
+                (status.positions[3] - 1.1397477253990314 * f64::from(direction)).abs() < 1e-12
+            );
+            frames.push(scene.frame(&status.positions).unwrap());
+        }
+        assert_ne!(frames[0].bodies[knee_body], frames[1].bodies[knee_body]);
+        assert_eq!(frames[0].bodies[knee_body], frames[2].bodies[knee_body]);
+        assert_eq!(frames[0].bodies[hip_body], frames[1].bodies[hip_body]);
+        assert!(events.lock().unwrap().iter().all(|event| *event == "read"));
+        assert_eq!(
+            state.physical_machines.lock().unwrap()[1].joint_directions[0].direction,
+            1
+        );
+
+        // A physical executor must never keep an old mapping behind a newly saved value.
+        let body = super::prepare_physical_body(&state, &virtual_id, "knee-test", None).unwrap();
+        let execution = crate::backend::policy_runtime::MicroDuckPolicyRunner::open(
+            body.binding,
+            Box::new(crate::control::tests::ReadOnlyDriver {
+                positions: raw,
+                events: events.clone(),
+            }),
+            loop_body::LoopConfig::default(),
+        )
+        .unwrap();
+        *state.runtime_loop.lock().unwrap() = Some(
+            crate::state::RuntimeInstance::physical_execution(execution, "knee-test".into()),
+        );
+        *state.loop_physical_machine_id.lock().unwrap() = Some("knee-test".into());
+        let rejected = crate::application::binding::physical_machine_bind(
+            &state,
+            crate::types::PhysicalMachineBindingInput {
+                physical_machine_id: "knee-test".into(),
+
+                slot_id: "left_knee".into(),
+
+                direction: -1,
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.contains("请先停止"));
+        assert_eq!(
+            state.physical_machines.lock().unwrap()[0].joint_directions[0].direction,
+            1
+        );
+    }
+
+    #[test]
+    fn virtual_mapping_combines_limb_calibration_without_using_census_order() {
+        let physical = PhysicalMachine {
+            id: "physical-test".into(),
+            name: "test".into(),
+            usb_port: "test".into(),
+            machine_code: "test".into(),
+            census: [7, 20]
+                .into_iter()
+                .map(|servo_id| ServoIdentity {
+                    servo_id,
+                    model: "hd1910".into(),
+                })
+                .collect(),
+            reconnect_hint: None,
+            virtual_machine_id: None,
+            online_servo_ids: vec![7, 20],
+            connected: true,
+            last_seen: None,
+            torque_enabled: false,
+            joint_directions: vec![crate::types::ServoJointDirection {
+                slot_id: "left_hip_yaw".into(),
+                direction: -1,
+            }],
+            joint_bindings: vec![crate::types::ServoJointCalibration {
+                slot_id: "left_hip_yaw".into(),
+
+                zero_offset_rad: 0.5,
+                min_rad: None,
+                max_rad: None,
+            }],
+        };
+        let virtual_bindings = vec![crate::types::VirtualJointBinding {
+            slot_id: "left_hip_yaw".into(),
+            physical_id: 7,
+        }];
+        let (resolved, ids, _) =
+            resolve_physical_loop_mapping(&virtual_bindings, &physical, &["left_hip_yaw".into()])
+                .unwrap();
+        assert_eq!(ids, [7]);
+        let calibration = loop_body::Calibration {
+            body_id: "official".into(),
+            body_version: 1,
+            joints: resolved
+                .iter()
+                .map(|binding| loop_body::JointCalibration {
+                    slot_id: binding.slot_id.clone(),
+                    physical_id: binding.physical_id,
+                    direction: binding.direction,
+                    zero_offset_rad: binding.zero_offset_rad,
+                    min_rad: binding.min_rad,
+                    max_rad: binding.max_rad,
+                })
+                .collect(),
+        };
+        assert!((calibration.to_body_positions(&[0.7])[0] + 0.2).abs() < 1e-12);
+        assert_eq!(calibration.to_body_velocities(&[0.4]), [-0.4]);
+        assert!((calibration.to_servo_positions(&[-0.2])[0] - 0.7).abs() < 1e-12);
+    }
+
+    #[test]
+    fn merged_mapping_uses_virtual_ids_and_physical_direction() {
+        let mut physical = PhysicalMachine {
+            id: "physical-merge".into(),
+            name: "merge".into(),
+            usb_port: "test".into(),
+            machine_code: "test".into(),
+            census: vec![
+                ServoIdentity {
+                    servo_id: 7,
+                    model: "hd1910".into(),
+                },
+                ServoIdentity {
+                    servo_id: 8,
+                    model: "hd1910".into(),
+                },
+            ],
+            reconnect_hint: None,
+            virtual_machine_id: Some("virtual-merge".into()),
+            online_servo_ids: vec![7, 8],
+            connected: true,
+            last_seen: None,
+            torque_enabled: false,
+            joint_directions: vec![crate::types::ServoJointDirection {
+                slot_id: "left_knee".into(),
+                direction: -1,
+            }],
+            // Physical calibration belongs to the limb regardless of its current bus ID.
+            joint_bindings: vec![crate::types::ServoJointCalibration {
+                slot_id: "left_knee".into(),
+
+                zero_offset_rad: 1.5,
+                min_rad: None,
+                max_rad: None,
+            }],
+        };
+        let virtual_bindings = vec![crate::types::VirtualJointBinding {
+            slot_id: "left_knee".into(),
+            physical_id: 7,
+        }];
+        let (resolved, ids, _) =
+            resolve_physical_loop_mapping(&virtual_bindings, &physical, &["left_knee".into()])
+                .unwrap();
+        assert_eq!(ids, [7]);
+        assert_eq!(resolved[0].physical_id, 7);
+        assert_eq!(resolved[0].direction, -1);
+        assert_eq!(resolved[0].zero_offset_rad, 1.5);
+        physical.census.reverse();
+        let (reordered, reordered_ids, _) =
+            resolve_physical_loop_mapping(&virtual_bindings, &physical, &["left_knee".into()])
+                .unwrap();
+        assert_eq!(reordered, resolved);
+        assert_eq!(reordered_ids, ids);
+        // Neither an offline configured ID nor a different online ID implies another limb.
+        physical.online_servo_ids = vec![8];
+        let (unmatched, _, active) =
+            resolve_physical_loop_mapping(&virtual_bindings, &physical, &["left_knee".into()])
+                .unwrap();
+        assert!(unmatched.is_empty());
+        assert_eq!(active, [None]);
+    }
+
+    #[test]
     fn custom_ids_keep_calibration_without_requiring_the_official_id_in_census() {
         let census = vec![ServoIdentity {
             servo_id: 7,
             model: "hd1910".into(),
         }];
-        let binding = crate::types::ServoJointBinding {
+        let binding = crate::types::VirtualJointBinding {
             slot_id: "left_hip_yaw".into(),
             physical_id: 7,
-            direction: -1,
-            zero_offset_rad: 2.7,
-            min_rad: Some(-0.5),
-            max_rad: Some(0.7),
+        };
+        let expected = crate::types::ServoJointBinding {
+            slot_id: "left_hip_yaw".into(),
+            physical_id: 7,
+            direction: 1,
+            zero_offset_rad: 0.0,
+            min_rad: None,
+            max_rad: None,
         };
         assert_eq!(
             super::effective_servo_bindings(&census, std::slice::from_ref(&binding)),
-            vec![binding]
+            vec![expected]
         );
     }
     #[test]

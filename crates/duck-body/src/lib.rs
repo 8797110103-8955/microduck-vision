@@ -261,6 +261,9 @@ mod tests {
         assert!((xl.bam_friction_base - 0.004771183165566).abs() < 1e-12);
         assert!((xl.bam_dtheta_stribeck - 2.890372094130307).abs() < 1e-12);
         assert!(xl.supports_fast_sync);
+        assert_eq!(xl.drive_delay_steps, [3, 6]);
+        assert!(xl.drive_encoder_through_backlash);
+        assert!((xl.drive_position_gain_scale() - 1.0).abs() < 1e-12);
 
         let hd = profiles
             .iter()
@@ -276,6 +279,14 @@ mod tests {
         assert!((hd.bam_command_delay - 0.0009781055842204172).abs() < 1e-12);
         assert!(!hd.supports_fast_sync);
         assert!(hd.register_count > 0);
+        assert_eq!(hd.drive_delay_steps, [0, 0]);
+        assert!(!hd.drive_encoder_through_backlash);
+        assert!(
+            (hd.drive_position_gain_scale()
+                - xl.bam_position_stiffness() / hd.bam_position_stiffness())
+            .abs()
+                < 1e-12
+        );
     }
 
     #[test]

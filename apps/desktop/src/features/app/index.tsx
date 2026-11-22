@@ -2,7 +2,7 @@ import * as commands from "../../../generated/types";
 import { computed, defineComponent, onScopeDispose, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
-import type { JointRangeState, LoopStatus, TrainingProgress } from "../../../generated/types";
+import type { LoopStatus, TrainingProgress } from "../../../generated/types";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../../../assets/icons/icon.ico";
 import { Message } from "../../components/message";
@@ -180,9 +180,24 @@ export const App = defineComponent(() => {
   const appShell = shallowRef<HTMLDivElement>();
   let stopPhysicalMachineEvents: (() => void) | undefined;
   let stopTrainingEvents: (() => void) | undefined;
-  let stopJointRangeEvents: (() => void) | undefined;
   let stopLoopStatusEvents: (() => void) | undefined;
   let eventListenerDisposed = false;
+  useEventListener(window, "error", (event: ErrorEvent) => {
+    void commands
+      .frontendDiagnostic(
+        event.error instanceof Error ? (event.error.stack ?? event.error.message) : event.message,
+      )
+      .catch(() => undefined);
+  });
+  useEventListener(window, "unhandledrejection", (event: PromiseRejectionEvent) => {
+    void commands
+      .frontendDiagnostic(
+        event.reason instanceof Error
+          ? (event.reason.stack ?? event.reason.message)
+          : String(event.reason),
+      )
+      .catch(() => undefined);
+  });
 
   {
     const hasTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
@@ -201,22 +216,20 @@ export const App = defineComponent(() => {
         if (eventListenerDisposed) unlisten();
         else stopTrainingEvents = unlisten;
       });
-      void listen<JointRangeState[]>("joint-range-state", (event) => {
-        if (!eventListenerDisposed) store.state.jointRangeStates = event.payload;
-      }).then((unlisten) => {
-        if (eventListenerDisposed) unlisten();
-        else stopJointRangeEvents = unlisten;
-      });
       void listen<LoopStatus>("loop-status", (event) => {
         if (eventListenerDisposed) return;
-        const active = store.state.physicalSyncEnabled ? store.state.loop : store.state.previewLoop;
-        if (!active || event.payload.runtimeGeneration !== active.runtimeGeneration) return;
-        if (store.state.physicalSyncEnabled) store.state.loop = event.payload;
-        else store.state.previewLoop = event.payload;
+        if (event.payload.runtimeGeneration !== store.state.loop?.runtimeGeneration) return;
+        store.applyLoopStatus(event.payload);
       }).then((unlisten) => {
         if (eventListenerDisposed) unlisten();
         else stopLoopStatusEvents = unlisten;
       });
+      void commands
+        .loopStatus()
+        .then((status) => {
+          if (!eventListenerDisposed && status) store.applyLoopStatus(status);
+        })
+        .catch(() => undefined);
       void commands
         .trainingStatus()
         .then((progress) => {
@@ -230,7 +243,6 @@ export const App = defineComponent(() => {
     eventListenerDisposed = true;
     stopPhysicalMachineEvents?.();
     stopTrainingEvents?.();
-    stopJointRangeEvents?.();
     stopLoopStatusEvents?.();
   });
   useEventListener(reloadButton, "click", () => void load());

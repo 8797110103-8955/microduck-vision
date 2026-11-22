@@ -37,8 +37,11 @@ export const TrainingPage = defineComponent(() => {
         virtualMachineId: virtualMachineId.value,
         policyId: policyId.value || null,
         experimentId: experimentId.value.trim() || null,
-        recipe: recipe.value.trim(),
-        teacherMotionProvenance: teacherMotionProvenance.value.trim(),
+        recipe: store.state.teacherDatasetPath ? "recording-behavior-cloning" : recipe.value.trim(),
+        teacherMotionProvenance: store.state.teacherDatasetPath
+          ? `recording-dataset:${store.state.teacherDatasetPath}`
+          : teacherMotionProvenance.value.trim(),
+        datasetPath: store.state.teacherDatasetPath || null,
       });
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
@@ -84,6 +87,17 @@ export const TrainingPage = defineComponent(() => {
       </header>
 
       <div class={style.form}>
+        <label>
+          <span>教师数据集目录（可选）</span>
+          <input
+            value={store.state.teacherDatasetPath}
+            disabled={running.value}
+            onInput={(event) => (store.state.teacherDatasetPath = inputValue(event))}
+          />
+        </label>
+        {store.state.teacherDatasetPath && (
+          <p>将使用导出的观测和教师 action 训练学生策略，并输出 student.pt 与 student.onnx。</p>
+        )}
         <label>
           <span>模拟机</span>
           <Select

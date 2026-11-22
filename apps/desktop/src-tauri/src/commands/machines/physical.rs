@@ -6,6 +6,7 @@
 use super::*;
 use crate::application::binding as binding_service;
 use crate::application::physical_machine as service;
+use crate::types::EncoderCalibrationResult;
 
 #[tauri::command]
 #[specta::specta]
@@ -156,6 +157,16 @@ pub(crate) fn physical_machine_set_pose_zero(
     virtual_machine_id: Option<String>,
 ) -> Result<PhysicalMachine, String> {
     crate::application::debug_machine::set_pose_zero(state.inner(), id, virtual_machine_id)
+}
+
+#[tauri::command(async)]
+#[specta::specta]
+pub(crate) fn physical_machine_center_encoders(
+    state: State<'_, DesktopState>,
+    id: String,
+    virtual_machine_id: Option<String>,
+) -> Result<EncoderCalibrationResult, String> {
+    crate::application::encoder_calibration::center_encoders(state.inner(), id, virtual_machine_id)
 }
 
 #[tauri::command]

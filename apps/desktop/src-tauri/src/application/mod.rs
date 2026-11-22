@@ -7,6 +7,7 @@ pub(crate) mod actions;
 pub(crate) mod binding;
 pub(crate) mod debug_machine;
 pub(crate) mod devices;
+pub(crate) mod encoder_calibration;
 pub(crate) mod loop_service;
 pub(crate) mod physical_io;
 pub(crate) mod physical_machine;

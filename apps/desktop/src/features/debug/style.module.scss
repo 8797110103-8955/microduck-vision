@@ -81,16 +81,6 @@
         background: rgba($green, 0.16);
       }
     }
-
-    .torqueAction {
-      border-color: rgba($orange, 0.6);
-      color: #a44d0b;
-      background: rgba($orange, 0.08);
-
-      &:hover:not(:disabled) {
-        background: rgba($orange, 0.16);
-      }
-    }
   }
 
   .panelActions {

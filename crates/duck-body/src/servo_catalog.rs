@@ -64,6 +64,31 @@ pub struct ServoProfile {
     pub sim_armature: f64,
     pub sim_kp: f64,
     pub sim_force_range: f64,
+    /// Body-level drive correction used by the simulator.  This is deliberately
+    /// separate from the BAM mapping fields above: it describes how the
+    /// physical servo should respond, rather than changing the BAM model.
+    pub drive_target_stiffness: f64,
+    pub drive_back_emf_scale: f64,
+    pub drive_friction_scale: f64,
+    pub drive_delay_steps: [usize; 2],
+    pub drive_encoder_through_backlash: bool,
+}
+
+impl ServoProfile {
+    /// Linearized BAM position stiffness before the simulator-specific drive correction.
+    pub fn bam_position_stiffness(&self) -> f64 {
+        self.bam_vin * self.bam_kt / self.bam_resistance * self.bam_kp * self.bam_error_gain
+    }
+
+    /// Scale the BAM position gain to the body-level target stiffness.
+    pub fn drive_position_gain_scale(&self) -> f64 {
+        let stiffness = self.bam_position_stiffness();
+        if stiffness > 0.0 {
+            self.drive_target_stiffness / stiffness
+        } else {
+            1.0
+        }
+    }
 }
 
 pub fn servo_catalog() -> Vec<ServoCatalogEntry> {
@@ -242,6 +267,11 @@ pub fn servo_profiles() -> Vec<ServoProfile> {
         sim_armature: 0.0018,
         sim_kp: 0.55,
         sim_force_range: 0.96,
+        drive_target_stiffness: 0.0,
+        drive_back_emf_scale: 1.0,
+        drive_friction_scale: 1.0,
+        drive_delay_steps: [0, 0],
+        drive_encoder_through_backlash: false,
     };
 
     let mut profiles = vec![
@@ -279,7 +309,7 @@ pub fn servo_profiles() -> Vec<ServoProfile> {
             true,
             false,
             "STS3215 / HD1910",
-            2.0 * std::f64::consts::PI / 4096.0,
+            servo::hd1910::HD1910_VELOCITY_RAD_PER_SEC_PER_COUNT,
             6.5,
             vec!["acceleration", "goal_position", "goal_time", "goal_speed"],
         ),
@@ -347,6 +377,16 @@ pub fn servo_profiles() -> Vec<ServoProfile> {
     hd.bam_load_friction_external_quad = 0.009999951209775423;
     hd.bam_dtheta_stribeck = 0.716192604078371;
     hd.bam_alpha = 4.248291402139783;
+
+    // Keep the simulator's physical-drive correction in the body definition.
+    // Both models use the XL330 BAM stiffness as their target, so a model with
+    // different electrical gains derives its correction from the same formula.
+    let xl_drive_stiffness = profiles[0].bam_position_stiffness();
+    profiles[0].drive_target_stiffness = xl_drive_stiffness;
+    profiles[0].drive_delay_steps = [3, 6];
+    profiles[0].drive_encoder_through_backlash = true;
+    profiles[1].drive_target_stiffness = xl_drive_stiffness;
+    profiles[1].drive_delay_steps = [0, 0];
 
     profiles
 }

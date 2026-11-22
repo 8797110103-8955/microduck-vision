@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import type { SceneFrame, SceneInfo } from "../../../generated/types";
+import type { SceneFrame, SceneInfo, SimulationState, WorldState } from "../../../generated/types";
 
 const n = (v: number | null | undefined) => v ?? 0;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -43,10 +43,13 @@ export class DuckViewer {
   private ghostSources = new Map<DuckMesh, DuckMesh>();
   private worldPose: [number, number, number] = [0, 0, 0];
   private simulationFrame = false;
+  private simulationPose: [number, number, number] = [0, 0, 0];
+  /** Scene offsets share the simulation's right-handed Z-up basis. */
   private configuredWorldPositions: [number, number, number][] = [];
   private selectedDuckIndex = 0;
+  private machineWorldPoses: (WorldState | undefined)[] = [];
   private static readonly ghostOpacity = 0.55;
-  private readonly baseHeight: number;
+  private baseHeight: number;
   /** Convert the vendor/MuJoCo Z-up frame into the Three.js Y-up frame. */
   private readonly mujocoToThree = new THREE.Quaternion().setFromEuler(
     new THREE.Euler(-Math.PI / 2, 0, 0),
@@ -55,6 +58,8 @@ export class DuckViewer {
   private readonly yawRotation = new THREE.Quaternion();
   private viewRestored = false;
   private defaultFocused = false;
+  private meshesReady = false;
+  private disposed = false;
   private previousFocusedView: ViewState | null = null;
 
   onRender: (() => void) | null = null;
@@ -95,6 +100,9 @@ export class DuckViewer {
     this.root.position.y = this.baseHeight;
     this.scene.add(this.root);
     this.build();
+    // Every machine needs articulation before its first render, including machines that
+    // never receive telemetry. A live frame must never become another duck's rest pose.
+    this.setFrame(info.defaultFrame);
 
     this.resize = new ResizeObserver(() => this.fit());
     this.resize.observe(host);
@@ -138,8 +146,43 @@ export class DuckViewer {
       }
     });
     void Promise.allSettled(pending).then(() => {
-      if (!this.viewRestored) this.focusDuck(true);
+      if (this.disposed) return;
+      this.syncGhostGeometry();
+      this.groundDefaultPose();
+      this.meshesReady = true;
+      this.fit();
     });
+  }
+
+  /** Derive static placement from the official rest meshes, independently of live physics. */
+  private groundDefaultPose() {
+    const basis = new THREE.Matrix4().makeRotationFromQuaternion(this.mujocoToThree);
+    const body = new THREE.Matrix4();
+    const transform = new THREE.Matrix4();
+    const point = new THREE.Vector3();
+    const position = new THREE.Vector3();
+    const rotation = new THREE.Quaternion();
+    const scale = new THREE.Vector3(1, 1, 1);
+    let lowest = Infinity;
+    this.info.defaultFrame.bodies.forEach((pose, index) => {
+      position.set(n(pose[0]), n(pose[1]), n(pose[2]));
+      rotation.set(n(pose[4]), n(pose[5]), n(pose[6]), n(pose[3]));
+      body.compose(position, rotation, scale);
+      for (const mesh of this.meshesByBody[index] ?? []) {
+        mesh.updateMatrix();
+        transform.copy(basis).multiply(body).multiply(mesh.matrix);
+        const vertices = mesh.geometry.getAttribute("position");
+        if (!vertices) continue;
+        for (let vertex = 0; vertex < vertices.count; vertex++) {
+          point.fromBufferAttribute(vertices, vertex).applyMatrix4(transform);
+          lowest = Math.min(lowest, point.y);
+        }
+      }
+    });
+    if (Number.isFinite(lowest)) {
+      this.baseHeight = -lowest;
+      this.applyMachineWorldPositions();
+    }
   }
 
   setFrame(frame: SceneFrame) {
@@ -151,12 +194,18 @@ export class DuckViewer {
       this.restFrame = frame;
       this.ghostBodies.forEach((b) => this.pose(b, frame));
     }
-    if (!this.viewRestored && !this.defaultFocused) this.focusDuck(true);
   }
 
-  /** Native body poses already include trunk translation, attitude and passive hinges.
-   * Apply only the fixed world-basis conversion and the saved display offset. */
-  setSimulationFrame(frame: SceneFrame) {
+  /** Keep native articulation, height and roll/pitch. Map its temporary planar origin
+   * onto the duck's authoritative scene placement exactly once. */
+  setSimulationFrame(simulation: SimulationState) {
+    const frame = simulation.frame;
+    const [w, x, y, z] = simulation.trunkQuaternion.map(n);
+    this.simulationPose = [
+      n(simulation.trunkPosition[0]),
+      n(simulation.trunkPosition[1]),
+      Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)),
+    ];
     this.simulationFrame = true;
     this.applyMachineWorldPositions();
     this.frame = frame;
@@ -212,8 +261,8 @@ export class DuckViewer {
       const size = bounds.getSize(new THREE.Vector3());
       const halfFov = THREE.MathUtils.degToRad(this.camera.fov / 2);
       const verticalDistance = size.y / (2 * Math.tan(halfFov));
-      const horizontalDistance =
-        size.x / (2 * Math.tan(Math.atan(Math.tan(halfFov) * this.camera.aspect)));
+      const availableAspect = this.camera.aspect * (alignLeftHalf ? 0.5 : 1);
+      const horizontalDistance = size.x / (2 * Math.tan(halfFov) * availableAspect);
       const distance = Math.max(verticalDistance, horizontalDistance, size.z / 2) * 1.7;
       this.camera.position.copy(center).add(direction.multiplyScalar(Math.max(distance, 0.2)));
     }
@@ -236,10 +285,9 @@ export class DuckViewer {
 
   setWorldPose(position: [number | null, number | null], yaw: number | null) {
     const x = n(position[0]);
-    const z = n(position[1]);
+    const y = n(position[1]);
     const angle = n(yaw);
-    this.worldPose = [x, z, angle];
-    if (this.simulationFrame) return;
+    this.worldPose = [x, y, angle];
     this.applySelectedWorldPose();
   }
 
@@ -254,24 +302,30 @@ export class DuckViewer {
     const roots = [this.root, ...this.ghosts];
     roots.forEach((root, index) => {
       const [x, y, z] = this.configuredWorldPositions[index] ?? [0, 0, 0];
-      root.position.set(x, this.rootUsesAbsoluteHeight() ? y : this.baseHeight + y, z);
-      this.setRootYaw(root, 0);
+      const world = this.machineWorldPoses[index];
+      root.position.set(x + n(world?.position[0]), this.baseHeight + z, -y - n(world?.position[1]));
+      this.setRootYaw(root, n(world?.yaw));
     });
     this.applySelectedWorldPose();
-  }
-
-  private rootUsesAbsoluteHeight() {
-    return this.simulationFrame;
   }
 
   private applySelectedWorldPose() {
     const root = this.rootForDuck(this.selectedDuckIndex);
     const [x, y, z] = this.configuredWorldPositions[this.selectedDuckIndex] ?? [0, 0, 0];
     if (this.simulationFrame) {
-      root.position.set(x, y, z);
-      this.setRootYaw(root, 0);
+      const [rawX, rawY, rawYaw] = this.simulationPose;
+      const yaw = this.worldPose[2] - rawYaw;
+      const cos = Math.cos(yaw);
+      const sin = Math.sin(yaw);
+      // MuJoCo (x,y,z) -> Three.js (x,z,-y), for positions and rotations alike.
+      root.position.set(
+        x + this.worldPose[0] - (cos * rawX - sin * rawY),
+        z,
+        -y - this.worldPose[1] + (sin * rawX + cos * rawY),
+      );
+      this.setRootYaw(root, yaw);
     } else {
-      root.position.set(x + this.worldPose[0], this.baseHeight + y, z + this.worldPose[1]);
+      root.position.set(x + this.worldPose[0], this.baseHeight + z, -y - this.worldPose[1]);
       this.setRootYaw(root, this.worldPose[2]);
     }
   }
@@ -280,6 +334,11 @@ export class DuckViewer {
     this.configuredWorldPositions = positions.map(
       (position) => [...position] as [number, number, number],
     );
+    this.applyMachineWorldPositions();
+  }
+
+  setMachineWorldPoses(worlds: (WorldState | undefined)[]) {
+    this.machineWorldPoses = worlds;
     this.applyMachineWorldPositions();
   }
 
@@ -338,7 +397,7 @@ export class DuckViewer {
       const root = new THREE.Group();
       this.setRootYaw(root, 0);
       const [x, y, z] = this.configuredWorldPositions[k] ?? [0, 0, 0];
-      root.position.set(x, this.rootUsesAbsoluteHeight() ? y : this.baseHeight + y, z);
+      root.position.set(x, this.baseHeight + z, -y);
       const bodies = this.bodies.map((_, i) => {
         const g = new THREE.Group();
         for (const m of this.meshesByBody[i]) {
@@ -500,6 +559,7 @@ export class DuckViewer {
     this.renderer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    if (this.meshesReady && !this.defaultFocused) this.focusDuck(true, true);
   }
 
   private restoreView = () => {
@@ -542,17 +602,22 @@ export class DuckViewer {
     event.preventDefault();
   };
 
+  private syncGhostGeometry() {
+    for (const [clone, source] of this.ghostSources)
+      if (clone.geometry !== source.geometry) clone.geometry = source.geometry;
+  }
+
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
     // Meshes load asynchronously; ghosts pick up the main duck's geometry once it arrives.
-    for (const [c, src] of this.ghostSources)
-      if (c.geometry !== src.geometry) c.geometry = src.geometry;
+    this.syncGhostGeometry();
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
     this.onRender?.();
   };
 
   dispose() {
+    this.disposed = true;
     this.saveView();
     cancelAnimationFrame(this.raf);
     this.resize.disconnect();

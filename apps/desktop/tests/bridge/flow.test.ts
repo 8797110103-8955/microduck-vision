@@ -79,11 +79,12 @@ describe("desktop to loop data flow", () => {
     await backend.mountPhysicalMachine(physical.id, "official-hd1910");
     await backend.bindPhysicalMachine({
       physicalMachineId: physical.id,
-      virtualMachineId: "official-hd1910",
       slotId: "left_hip_yaw",
-      physicalId: 1,
+      direction: -1,
     });
 
+    expect((await backend.virtualMachines())[0].jointBindings ?? []).toEqual([]);
+    expect((await backend.physicalMachines())[0].jointBindings ?? []).toEqual([]);
     await backend.bindVirtualMachine({
       virtualMachineId: "official-hd1910",
       slotId: "left_hip_yaw",
@@ -93,12 +94,12 @@ describe("desktop to loop data flow", () => {
     expect((await backend.virtualMachines())[0].jointBindings).toEqual([
       expect.objectContaining({ slotId: "left_hip_yaw", physicalId: 20 }),
     ]);
-    expect(await backend.physicalMachines()).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ jointBindings: expect.anything() })]),
-    );
+    expect((await backend.physicalMachines())[0].jointDirections).toEqual([
+      expect.objectContaining({ slotId: "left_hip_yaw", direction: -1 }),
+    ]);
   });
 
-  it("keeps a binding conflict visible until the selected servo is cleared", async () => {
+  it("rejects duplicate virtual IDs without changing physical configuration", async () => {
     const backend = new MemoryBackend(memoryServoCatalog);
     const machine = await backend.savePhysicalMachine({
       census: [
@@ -110,23 +111,33 @@ describe("desktop to loop data flow", () => {
     });
     await backend.mountPhysicalMachine(machine.id, "official-hd1910");
 
-    await backend.bindPhysicalMachine({
-      physicalMachineId: machine.id,
+    await backend.bindVirtualMachine({
       virtualMachineId: "official-hd1910",
       slotId: "left_hip_yaw",
       physicalId: 1,
     });
-    await backend.bindPhysicalMachine({
-      physicalMachineId: machine.id,
+    await expect(
+      backend.bindVirtualMachine({
+        virtualMachineId: "official-hd1910",
+        slotId: "left_hip_roll",
+        physicalId: 1,
+      }),
+    ).rejects.toThrow("duplicate");
+    expect((await backend.virtualMachines())[0].jointBindings).toEqual([
+      { slotId: "left_hip_yaw", physicalId: 1 },
+    ]);
+    expect((await backend.physicalMachines())[0].jointBindings ?? []).toEqual([]);
+    await backend.bindVirtualMachine({
+      virtualMachineId: "official-hd1910",
+      slotId: "left_hip_yaw",
+      physicalId: null,
+    });
+    const updated = await backend.bindVirtualMachine({
       virtualMachineId: "official-hd1910",
       slotId: "left_hip_roll",
       physicalId: 1,
     });
-    expect((await backend.virtualMachines()).at(0)?.jointBindings).toHaveLength(2);
-
-    const cleared = await backend.validatePhysicalMachineBindings(machine.id);
-    expect(cleared).not.toHaveProperty("jointBindings");
-    expect((await backend.virtualMachines()).at(0)?.jointBindings).toEqual([]);
+    expect(updated.jointBindings).toEqual([{ slotId: "left_hip_roll", physicalId: 1 }]);
   });
 
   it("keeps virtual bindings when the physical machine is deleted", async () => {
@@ -183,16 +194,15 @@ describe("desktop to loop data flow", () => {
 
     await load();
     await backend.policyDownload("alpha-walking");
-    app.state.previewLoop = await backend.previewLoopOpen("official-hd1910");
-    for (let index = 0; index < 5; index += 1)
-      app.state.previewLoop = await backend.previewLoopTick();
-    expect(app.state.previewLoop?.phase).toBe("ready");
+    app.state.loop = await backend.previewLoopOpen("official-hd1910");
+    for (let index = 0; index < 5; index += 1) app.state.loop = await backend.previewLoopTick();
+    expect(app.state.loop?.phase).toBe("ready");
 
-    app.state.previewLoop = await backend.previewLoopPolicy("alpha-walking");
-    app.state.previewLoop = await backend.previewLoopTick();
-    expect(app.state.previewLoop?.phase).toBe("driving");
-    expect(app.state.previewLoop?.torque).toBe(true);
-    expect(app.state.loop).toBeNull();
+    app.state.loop = await backend.previewLoopPolicy("alpha-walking");
+    app.state.loop = await backend.previewLoopTick();
+    expect(app.state.loop?.phase).toBe("driving");
+    expect(app.state.loop?.torque).toBe(true);
+    expect(app.state.loop?.activeBody?.physicalMachineId).toBeNull();
     expect(backend.calls.map((call) => call.name)).not.toContain("loopOpen");
   });
 
@@ -234,8 +244,8 @@ describe("desktop to loop data flow", () => {
     const policy = await backend.policyDownload("velstand");
     app.state.policies = await backend.policyList();
     app.state.selectedPolicyId = policy.id;
-    app.state.previewLoop = await backend.previewLoopOpen("official-hd1910");
-    app.state.previewLoop = await backend.previewLoopPolicy(policy.id);
+    app.state.loop = await backend.previewLoopOpen("official-hd1910");
+    app.state.loop = await backend.previewLoopPolicy(policy.id);
     expect(backend.calls.at(-1)).toMatchObject({ name: "previewLoopPolicy", value: "velstand" });
   });
   it("loads servo catalog, selects a virtual machine, drives the loop, and estops", async () => {

@@ -7,6 +7,7 @@ mod control;
 mod helpers;
 mod lifecycle;
 mod logging;
+mod recordings;
 mod state;
 pub use state::types;
 

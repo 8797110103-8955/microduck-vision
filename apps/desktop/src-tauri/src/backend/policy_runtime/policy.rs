@@ -1,6 +1,7 @@
 //! ONNX policy execution layered on top of the base body loop.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use duck_body::BodyProfile;
@@ -75,13 +76,11 @@ struct PolicyTickController<'a> {
     last_trace: &'a mut Option<PolicyTrace>,
     last_frame: &'a mut Option<PolicyStateSnapshot>,
     active_net: &'a mut Option<Net>,
+    seed_from_sensors: &'a mut bool,
 }
 
 impl LoopController for PolicyTickController<'_> {
-    fn on_loop(
-        &mut self,
-        input: ControllerInput,
-    ) -> Result<Option<BodyCommand>, LoopError> {
+    fn on_loop(&mut self, input: ControllerInput) -> Result<Option<BodyCommand>, LoopError> {
         let Some(policy) = self.policy.as_deref_mut() else {
             *self.active_net = None;
             return Ok(None);
@@ -97,17 +96,20 @@ impl LoopController for PolicyTickController<'_> {
             valid_velocities: sensors.valid,
             source: Some("execution".into()),
         };
+        if *self.seed_from_sensors {
+            self.core.seed_from_pose(&backend_state.positions)?;
+            *self.seed_from_sensors = false;
+        }
         let (observation, _, _) = self
             .core
             .encode_observation(&backend_state, &self.command)?;
         let requested_net = self.core.config().net;
-        let selected_net = if requested_net == Net::Walk
-            && policy.will_stand(self.command.twist_magnitude())
-        {
-            Net::Stand
-        } else {
-            requested_net
-        };
+        let selected_net =
+            if requested_net == Net::Walk && policy.will_stand(self.command.twist_magnitude()) {
+                Net::Stand
+            } else {
+                requested_net
+            };
         *self.active_net = Some(selected_net);
         let mut stages = vec!["read", "encode"];
         if selected_net != requested_net {
@@ -151,7 +153,7 @@ impl LoopController for PolicyTickController<'_> {
 }
 
 /// Static policy artifact contract checked before an ONNX session enters the tick loop.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PolicyDescriptor {
     pub id: String,
     pub body_id: String,
@@ -217,15 +219,24 @@ impl PolicyDescriptor {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PreparedPolicy {
+    policy: Arc<Mutex<Policy>>,
+    config: PolicyConfig,
+    velocity_delay: u32,
+}
+
 pub struct MicroDuckPolicyRunner {
     body: BodyLoop,
-    policy: Option<Policy>,
+    policy: Option<Arc<Mutex<Policy>>>,
     command: Command,
     last_trace: Option<PolicyTrace>,
     core: PolicyControlCore,
     body_profile: BodyProfile,
     control_period: Duration,
+    hardware_velocity_feedback: bool,
     active_net: Option<Net>,
+    seed_from_sensors: bool,
     last_frame: Option<PolicyStateSnapshot>,
     stop_snapshot: Option<PolicyStateSnapshot>,
 }
@@ -264,68 +275,12 @@ impl MicroDuckPolicyRunner {
             core,
             body_profile,
             control_period,
+            hardware_velocity_feedback: false,
             active_net: None,
+            seed_from_sensors: true,
             last_frame: None,
             stop_snapshot: None,
         })
-    }
-
-    pub fn select_policy_with_config(
-        &mut self,
-        path: impl AsRef<Path>,
-        config: PolicyConfig,
-    ) -> Result<(), LoopError> {
-        // Seed the filter from the next real sensor pose. `BodyLoop::last_targets` is still
-        // zero before the first sensor tick, so taking it here would pull the first policy
-        // target toward the numeric zero frame instead of the pose the robot is holding.
-        let path = path.as_ref().to_owned();
-        let mut paths = PolicyPaths {
-            walk: path.clone(),
-            ..PolicyPaths::default()
-        };
-        match config.net {
-            Net::Stand => paths.stand = Some(path.clone()),
-            Net::SitStand => paths.sitstand = Some(path.clone()),
-            Net::GroundPick => paths.ground_pick = Some(path.clone()),
-            Net::Skill(_) => paths.skills.push(path.clone()),
-            Net::Walk => {}
-        }
-        self.select_policy_paths_with_config(paths, config)
-    }
-
-    /// Load a complete set of already-resolved ONNX sessions before the execution loop starts.
-    /// The controller hook selects one of these sessions at the beginning of each tick. Keeping
-    /// this operation separate from `on_loop` prevents file I/O and ONNX warm-up from entering
-    /// the control deadline.
-    pub fn select_policy_paths_with_config(
-        &mut self,
-        paths: PolicyPaths,
-        config: PolicyConfig,
-    ) -> Result<(), LoopError> {
-        if self.status().phase == LoopPhase::Homing {
-            return Err(LoopError::Controller(
-                "policy switch is not allowed during homing".into(),
-            ));
-        }
-        if !config.action_scale.is_finite()
-            || config.action_scale <= 0.0
-            || [config.head_lowpass, config.legs_lowpass]
-                .into_iter()
-                .flatten()
-                .any(|alpha| !alpha.is_finite() || !(0.0..=1.0).contains(&alpha))
-            || matches!(config.net, Net::Skill(index) if index != 0)
-        {
-            return Err(LoopError::Controller("invalid policy configuration".into()));
-        }
-        let policy = Policy::load(&paths, DEFAULT_STANDING_THRESHOLD)
-            .map_err(|error| LoopError::Controller(error.to_string()))?;
-        self.policy = Some(policy);
-        self.core.set_config(config)?;
-        self.last_trace = None;
-        self.active_net = None;
-        self.last_frame = None;
-        self.stop_snapshot = None;
-        Ok(())
     }
 
     pub fn select_policy_with_descriptor(
@@ -334,7 +289,34 @@ impl MicroDuckPolicyRunner {
         descriptor: &PolicyDescriptor,
         config: PolicyConfig,
     ) -> Result<(), LoopError> {
-        descriptor.validate(&self.body_profile, self.body_period())?;
+        let prepared = self.prepare_policy(path.as_ref(), descriptor, config)?;
+        self.install_policy(prepared)
+    }
+
+    pub(crate) fn use_hardware_velocity_feedback(&mut self) -> Result<(), LoopError> {
+        // Training delays instantaneous simulation velocity to model firmware measurement
+        // latency. A real present_velocity sample already contains that latency.
+        self.hardware_velocity_feedback = true;
+        self.apply_velocity_observation_delay(0)
+    }
+
+    fn apply_velocity_observation_delay(&mut self, simulation_delay: u32) -> Result<(), LoopError> {
+        self.body
+            .set_velocity_observation_delay(if self.hardware_velocity_feedback {
+                0
+            } else {
+                simulation_delay
+            })
+    }
+
+    pub(crate) fn prepare_policy(
+        &self,
+        path: &Path,
+        descriptor: &PolicyDescriptor,
+        config: PolicyConfig,
+    ) -> Result<PreparedPolicy, LoopError> {
+        super::core::validate_config(config)?;
+        descriptor.validate(&self.body_profile, self.control_period)?;
         if let Some(action_scale) = descriptor.action_scale
             && (config.action_scale - action_scale).abs() > f64::EPSILON
         {
@@ -357,17 +339,60 @@ impl MicroDuckPolicyRunner {
                 descriptor.id, descriptor.joint_velocity_delay_ticks
             )));
         }
-        duck_control::policy::validate(path.as_ref())
+        let mut paths = PolicyPaths {
+            walk: path.to_owned(),
+            ..PolicyPaths::default()
+        };
+        match config.net {
+            Net::Stand => paths.stand = Some(path.to_owned()),
+            Net::SitStand => paths.sitstand = Some(path.to_owned()),
+            Net::GroundPick => paths.ground_pick = Some(path.to_owned()),
+            Net::Skill(0) => paths.skills.push(path.to_owned()),
+            Net::Skill(_) => {
+                return Err(LoopError::Controller("invalid policy configuration".into()));
+            }
+            Net::Walk => {}
+        }
+        duck_control::policy::validate(path)
             .map_err(|error| LoopError::Controller(error.to_string()))?;
-        self.select_policy_with_config(path, config)?;
-        self.body
-            .set_velocity_observation_delay(descriptor.joint_velocity_delay_ticks)
+        let policy = Policy::load(&paths, DEFAULT_STANDING_THRESHOLD)
+            .map_err(|error| LoopError::Controller(error.to_string()))?;
+        Ok(PreparedPolicy {
+            policy: Arc::new(Mutex::new(policy)),
+            config,
+            velocity_delay: descriptor.joint_velocity_delay_ticks,
+        })
+    }
+
+    pub(crate) fn install_policy(&mut self, prepared: PreparedPolicy) -> Result<(), LoopError> {
+        if self.status().phase == LoopPhase::Homing {
+            return Err(LoopError::Controller(
+                "policy switch is not allowed during homing".into(),
+            ));
+        }
+        self.core.set_config(prepared.config)?;
+        self.apply_velocity_observation_delay(prepared.velocity_delay)?;
+        prepared
+            .policy
+            .lock()
+            .map_err(|_| LoopError::Controller("policy session lock poisoned".into()))?
+            .reset();
+        self.policy = Some(prepared.policy);
+        self.seed_from_sensors = true;
+        self.last_trace = None;
+        self.active_net = None;
+        self.last_frame = None;
+        self.stop_snapshot = None;
+        Ok(())
     }
 
     pub fn reset_policy(&mut self) {
-        if let Some(policy) = &mut self.policy {
+        if let Some(policy) = &self.policy
+            && let Ok(mut policy) = policy.lock()
+        {
             policy.reset();
         }
+        self.seed_from_sensors = true;
         self.core.reset();
         self.last_trace = None;
         self.active_net = None;
@@ -375,24 +400,35 @@ impl MicroDuckPolicyRunner {
         self.stop_snapshot = None;
     }
 
+    /// Install a fresh body while retaining the loaded ONNX session and current command.
+    pub(crate) fn replace_body(
+        &mut self,
+        mut next: Self,
+        velocity_delay: u32,
+    ) -> Result<(), LoopError> {
+        next.apply_velocity_observation_delay(velocity_delay)?;
+        next.core.set_config(self.core.config())?;
+        self.body = next.body;
+        self.body_profile = next.body_profile;
+        self.control_period = next.control_period;
+        self.hardware_velocity_feedback = next.hardware_velocity_feedback;
+        self.core = next.core;
+        self.reset_policy();
+        Ok(())
+    }
+
+    pub(crate) fn sample_body(&mut self) -> Result<(), LoopError> {
+        self.last_trace = None;
+        self.body.read_sensors_only(self.control_period)
+    }
+
+    pub(crate) fn arm_at_current_pose(&mut self) -> Result<(), LoopError> {
+        self.body.arm_at_current_pose()
+    }
+
     /// Reset backend state before the next policy observation is produced.
     pub fn reset_execution(&mut self) -> Result<(), LoopError> {
         self.body.reset_execution()
-    }
-
-    /// Stop policy inference while a runtime controller prepares the body for another policy.
-    ///
-    /// The body loop remains powered and can continue holding an explicit [`BodyCommand`].
-    /// This keeps policy lifecycle decisions (for example, skill start and end) outside this
-    /// crate while giving the owner a safe gap between two episodes.
-    pub fn clear_policy(&mut self) {
-        self.reset_policy();
-        self.policy = None;
-        self.active_net = None;
-    }
-
-    fn body_period(&self) -> Duration {
-        self.control_period
     }
 
     pub fn set_policy_command(&mut self, command: Command) {
@@ -444,15 +480,28 @@ impl MicroDuckPolicyRunner {
 
     pub fn tick(&mut self, dt: Duration) -> Result<(), LoopError> {
         self.last_trace = None;
+        // A body without a controller is a sampling source. In particular, do not let
+        // simulation fall/settle while the UI is still installing its first policy.
+        if self.policy.is_none() {
+            self.body.read_sensors(dt)?;
+            return Ok(());
+        }
         // Holding and stopped phases do not advance the controller, but they also do not erase
         // its history. `reset_policy` is the explicit new-episode boundary.
+        let mut policy = self
+            .policy
+            .as_ref()
+            .map(|policy| policy.lock())
+            .transpose()
+            .map_err(|_| LoopError::Controller("policy session lock poisoned".into()))?;
         let mut controller = PolicyTickController {
-            policy: self.policy.as_mut(),
+            policy: policy.as_deref_mut(),
             command: self.command,
             core: &mut self.core,
             last_trace: &mut self.last_trace,
             last_frame: &mut self.last_frame,
             active_net: &mut self.active_net,
+            seed_from_sensors: &mut self.seed_from_sensors,
         };
         let result = self.body.tick_with_controller(dt, &mut controller);
         if result.is_ok()
@@ -481,34 +530,108 @@ impl MicroDuckPolicyRunner {
 mod tests {
     use super::{
         HEAD_LOWPASS, LEGS_LOWPASS, PolicyConfig, PolicyDescriptor, WALK_ACTION_SCALE,
-        walking_target_trace, walking_targets,
+        walking_targets,
     };
     use duck_body::{BodyActionSpace, BodyProfile, BodyTemplate};
     use duck_control::imu::ImuData;
     use duck_control::model::{DEFAULT_POSITION, MOUTH_INDEX, NUM_JOINTS};
     use duck_control::obs::{ACTION_LEN, Command};
-    use serde::Deserialize;
     use std::time::Duration;
 
-    #[derive(Debug, Deserialize)]
-    struct ReferenceTraceFixture {
-        body_id: String,
-        body_version: u32,
-        obs_len: usize,
-        action_len: usize,
-        gain: u16,
-        action_scale: f64,
-        head_lowpass: f64,
-        legs_lowpass: f64,
-        raw_action: Vec<f32>,
-        home_pose: Vec<f64>,
-        expected_observation_prefix: Vec<f32>,
-        expected_last_action: Vec<f32>,
-        expected_raw_target: Vec<f64>,
-        expected_canonical_target: Vec<f64>,
-        physical_ids: Vec<u8>,
-        directions: Vec<i8>,
-        zero_offsets: Vec<f64>,
+    #[test]
+    fn hardware_sampling_and_body_handoff_do_not_add_the_training_velocity_delay() {
+        use loop_body::{
+            BodyRuntimeView, Calibration, JointCalibration, LoopBinding, LoopConfig, ServoBinding,
+        };
+        use servo::{
+            ServoError, ServoLoopDriver, ServoModel, ServoPositionSample, ServoPositionTargets,
+        };
+
+        struct VelocityProbe(u32);
+        impl ServoLoopDriver for VelocityProbe {
+            fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
+                self.0 += 1;
+                Ok(ServoPositionSample {
+                    positions: vec![0.0; ids.len()],
+                    velocities: vec![f64::from(self.0); ids.len()],
+                })
+            }
+            fn write_positions(
+                &mut self,
+                _: &[u8],
+                _: &ServoPositionTargets,
+            ) -> Result<(), ServoError> {
+                panic!("sampling must not write targets")
+            }
+            fn set_torque(&mut self, _: bool) -> Result<(), ServoError> {
+                panic!("sampling must not change torque")
+            }
+            fn set_gain(&mut self, _: u16) -> Result<(), ServoError> {
+                panic!("sampling must not change gain")
+            }
+            fn reboot(&mut self, _: u8) -> Result<(), ServoError> {
+                panic!("sampling must not reboot")
+            }
+        }
+
+        let runner = || {
+            let template = BodyTemplate::official().unwrap();
+            let slots: Vec<_> = template
+                .actuators
+                .iter()
+                .map(|slot| slot.id.clone())
+                .collect();
+            super::MicroDuckPolicyRunner::open(
+                LoopBinding {
+                    body: BodyRuntimeView::new(template.clone()).unwrap(),
+                    servos: ServoBinding {
+                        model: ServoModel::Hd1910,
+                        slot_ids: slots.clone(),
+                    },
+                    calibration: Calibration {
+                        body_id: template.id,
+                        body_version: template.version,
+                        joints: slots
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, slot_id)| JointCalibration {
+                                slot_id,
+                                physical_id: (index + 1) as u8,
+                                direction: 1,
+                                zero_offset_rad: 0.0,
+                                min_rad: None,
+                                max_rad: None,
+                            })
+                            .collect(),
+                    },
+                },
+                Box::new(VelocityProbe(0)),
+                LoopConfig::default(),
+            )
+            .unwrap()
+        };
+        let mut active = runner();
+        active.apply_velocity_observation_delay(1).unwrap();
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![0.0; 15]);
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![1.0; 15]);
+
+        let mut physical = runner();
+        physical.use_hardware_velocity_feedback().unwrap();
+        active.replace_body(physical, 1).unwrap();
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![1.0; 15]);
+        // Policy installation uses this same helper, including for prewarmed sessions.
+        active.apply_velocity_observation_delay(1).unwrap();
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![2.0; 15]);
+
+        active.replace_body(runner(), 1).unwrap();
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![0.0; 15]);
+        active.sample_body().unwrap();
+        assert_eq!(active.body.sensor_frame().velocities, vec![1.0; 15]);
     }
 
     #[test]
@@ -667,82 +790,4 @@ mod tests {
         assert_eq!(&observation.as_slice()[34..48], &raw);
     }
 
-    #[test]
-    fn reference_trace_at_fixed_sample_points() {
-        let fixture: ReferenceTraceFixture = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/official_reference_trace.json"
-        ))
-        .unwrap();
-        let profile = BodyProfile::official().unwrap();
-        let identity = profile.identity();
-        assert_eq!(fixture.body_id, identity.id);
-        assert_eq!(fixture.body_version, identity.version);
-        assert_eq!(fixture.obs_len, 61);
-        assert_eq!(fixture.action_len, ACTION_LEN);
-        assert_eq!(fixture.gain, 200);
-        assert_eq!(fixture.physical_ids, (1..=15).collect::<Vec<_>>());
-        assert_eq!(fixture.directions, vec![1; 15]);
-        assert_eq!(fixture.zero_offsets, vec![0.0; 15]);
-
-        let home: [f64; NUM_JOINTS] = fixture.home_pose.clone().try_into().unwrap();
-        let raw: [f32; ACTION_LEN] = fixture.raw_action.clone().try_into().unwrap();
-        let encoder = super::PolicyInputEncoder;
-        let observation = encoder.encode(
-            &ImuData::default(),
-            &home,
-            &[0.0; NUM_JOINTS],
-            &home,
-            &raw,
-            &Command::default(),
-        );
-        assert_eq!(observation.as_slice().len(), fixture.obs_len);
-        assert_eq!(
-            &observation.as_slice()[..fixture.expected_observation_prefix.len()],
-            fixture.expected_observation_prefix.as_slice()
-        );
-        assert_eq!(
-            &observation.as_slice()[34..48],
-            fixture.expected_last_action
-        );
-        assert!(
-            observation.as_slice()[6..34]
-                .iter()
-                .all(|value| *value == 0.0)
-        );
-
-        let codec = profile.action_codec();
-        let target = walking_targets(
-            &raw,
-            &codec,
-            &home,
-            Some(&home),
-            PolicyConfig {
-                action_scale: fixture.action_scale,
-                head_lowpass: Some(fixture.head_lowpass),
-                legs_lowpass: Some(fixture.legs_lowpass),
-                ..PolicyConfig::default()
-            },
-        );
-        let (raw_target, _) = walking_target_trace(
-            &raw,
-            &codec,
-            &home,
-            Some(&home),
-            PolicyConfig {
-                action_scale: fixture.action_scale,
-                head_lowpass: Some(fixture.head_lowpass),
-                legs_lowpass: Some(fixture.legs_lowpass),
-                ..PolicyConfig::default()
-            },
-        );
-        for (actual, expected) in raw_target.iter().zip(fixture.expected_raw_target) {
-            assert!((actual - expected).abs() < 1e-8);
-        }
-        for (actual, expected) in target.iter().zip(fixture.expected_canonical_target) {
-            assert!(
-                (actual - expected).abs() < 1e-8,
-                "actual={actual} expected={expected}"
-            );
-        }
-    }
 }

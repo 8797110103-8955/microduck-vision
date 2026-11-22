@@ -5,7 +5,7 @@
 //! applied by the shared loop-body adapter before this backend is asked to write positions.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use servo::{ServoLoopDriver, ServoModel, ServoPositionSample, ServoPositionTargets};
 
@@ -13,7 +13,7 @@ use super::control::ConnectedBus;
 
 /// Physical execution backend that can safely represent a partial body-to-servo mapping.
 pub(crate) struct PhysicalBackend {
-    bus: Arc<Mutex<ConnectedBus>>,
+    bus: Weak<Mutex<ConnectedBus>>,
     model: ServoModel,
     active_ids: Vec<Option<u8>>,
     read_cancel: Option<Arc<AtomicBool>>,
@@ -21,16 +21,22 @@ pub(crate) struct PhysicalBackend {
 
 impl PhysicalBackend {
     pub(crate) fn new(
-        bus: Arc<Mutex<ConnectedBus>>,
+        bus: &Arc<Mutex<ConnectedBus>>,
         model: ServoModel,
         active_ids: Vec<Option<u8>>,
     ) -> Self {
         Self {
-            bus,
+            bus: Arc::downgrade(bus),
             model,
             active_ids,
             read_cancel: None,
         }
+    }
+
+    fn bus(&self) -> Result<Arc<Mutex<ConnectedBus>>, servo::ServoError> {
+        self.bus
+            .upgrade()
+            .ok_or_else(|| servo::ServoError::Bus("physical connection closed".into()))
     }
 }
 
@@ -52,8 +58,8 @@ impl ServoLoopDriver for PhysicalBackend {
                 got: ids.len(),
             });
         }
-        let mut bus = self
-            .bus
+        let connection = self.bus()?;
+        let mut bus = connection
             .lock()
             .map_err(|_| servo::ServoError::Bus("physical bus lock poisoned".into()))?;
         let active_ids = self
@@ -62,7 +68,12 @@ impl ServoLoopDriver for PhysicalBackend {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        let active_samples = if let Some(cancel) = &self.read_cancel {
+        let active_samples = if active_ids.is_empty() {
+            ServoPositionSample {
+                positions: vec![],
+                velocities: vec![],
+            }
+        } else if let Some(cancel) = &self.read_cancel {
             // A source worker may stop after the current bounded bus transaction, rather
             // than waiting for every remaining servo in a multi-joint read.
             let mut samples = ServoPositionSample {
@@ -113,8 +124,28 @@ impl ServoLoopDriver for PhysicalBackend {
                 got: ids.len(),
             });
         }
-        let mut bus = self
-            .bus
+        for (id, position) in self.active_ids.iter().zip(&targets.positions) {
+            if let Some(id) = id {
+                let validated = match self.model {
+                    ServoModel::Hd1910 => {
+                        servo::hd1910::position_target_block(*position).map(|_| ())
+                    }
+                    ServoModel::Xl330M288 => servo::xl330::position_raw_from_rad(*position)
+                        .and_then(|raw| {
+                            servo::xl330::encode_register("goal_position", i64::from(raw))
+                        })
+                        .map(|_| ()),
+                    _ => Err(servo::ServoError::NotImplemented(
+                        "physical target encoding",
+                    )),
+                };
+                validated.map_err(|error| {
+                    servo::ServoError::Bus(format!("servo id={id} target_rad={position}: {error}"))
+                })?;
+            }
+        }
+        let connection = self.bus()?;
+        let mut bus = connection
             .lock()
             .map_err(|_| servo::ServoError::Bus("physical bus lock poisoned".into()))?;
         for (id, position) in self.active_ids.iter().zip(&targets.positions) {
@@ -127,8 +158,8 @@ impl ServoLoopDriver for PhysicalBackend {
     }
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), servo::ServoError> {
-        let mut bus = self
-            .bus
+        let connection = self.bus()?;
+        let mut bus = connection
             .lock()
             .map_err(|_| servo::ServoError::Bus("physical bus lock poisoned".into()))?;
         let ids = self
@@ -148,7 +179,7 @@ impl ServoLoopDriver for PhysicalBackend {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        self.bus
+        self.bus()?
             .lock()
             .map_err(|_| servo::ServoError::Bus("physical bus lock poisoned".into()))?
             .set_gain(self.model, &ids, gain)
@@ -161,7 +192,7 @@ impl ServoLoopDriver for PhysicalBackend {
                 "reboot is outside physical execution binding".into(),
             ));
         }
-        self.bus
+        self.bus()?
             .lock()
             .map_err(|_| servo::ServoError::Bus("physical bus lock poisoned".into()))?
             .reboot(id)

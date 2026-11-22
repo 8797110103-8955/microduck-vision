@@ -24,14 +24,46 @@ use tauri::{AppHandle, Emitter, Wry};
 
 use crate::backend::control::ConnectedBus;
 use crate::backend::physical;
-use crate::backend::simulation::PreviewMicroDuckPolicyRunner;
+use crate::backend::policy_runtime::PolicyExecution;
 use crate::helpers::default_simulation;
 use crate::types::{
     ActionKind, ActionRecord, ActionSource, PhysicalMachine, ReconnectHint, ServoIdentity,
-    ServoJointDirection, TrainingProgress, VirtualMachine,
+    ServoJointCalibration, ServoJointDirection, TrainingProgress, VirtualMachine,
 };
 
+fn read_config<T: serde::de::DeserializeOwned>(
+    directory: Option<&Path>,
+    name: &str,
+) -> Result<Option<T>, String> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let path = directory.join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text)
+            .map(Some)
+            .map_err(|error| format!("{}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+pub(crate) fn load_pending_calibrations(
+    config: Option<&Path>,
+) -> Result<Vec<crate::types::PendingCalibration>, String> {
+    let Some(config) = config else {
+        return Ok(Vec::new());
+    };
+    match std::fs::read(config.join("encoder-calibration.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("read encoder calibration recovery: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("read encoder calibration recovery: {error}")),
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedMachineTable {
     #[serde(default)]
     default: Option<String>,
@@ -58,7 +90,7 @@ struct PersistedRobotTable {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedPhysicalMachine {
     id: String,
     name: String,
@@ -67,17 +99,19 @@ struct PersistedPhysicalMachine {
     virtual_machine_id: Option<String>,
     #[serde(default)]
     joint_directions: Vec<ServoJointDirection>,
+    #[serde(default)]
+    joint_bindings: Vec<ServoJointCalibration>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedServoIdentity {
     servo_id: u8,
     model: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedReconnectHint {
     port_name: String,
     vid: Option<u16>,
@@ -111,6 +145,7 @@ impl From<&PhysicalMachine> for PersistedPhysicalMachine {
                 }),
             virtual_machine_id: machine.virtual_machine_id.clone(),
             joint_directions: machine.joint_directions.clone(),
+            joint_bindings: machine.joint_bindings.clone(),
         }
     }
 }
@@ -158,26 +193,31 @@ impl From<PersistedPhysicalMachine> for PhysicalMachine {
                 .into_iter()
                 .filter(|binding| matches!(binding.direction, -1 | 1))
                 .collect(),
+            joint_bindings: machine.joint_bindings,
         }
     }
 }
 
 pub(crate) struct DesktopState {
+    pub(crate) recorder: Arc<crate::recordings::Recorder>,
     pub(crate) backend_registry: Mutex<BackendRegistry>,
     pub(crate) execution_gate: ExecutionGate,
     pub(crate) execution_transition: Mutex<()>,
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) auto_mount_enabled: Mutex<bool>,
     pub(crate) auto_reconnect_enabled: Mutex<bool>,
-    pub(crate) virtual_machines: Mutex<Vec<VirtualMachine>>,
-    pub(crate) physical_machines: Mutex<Vec<PhysicalMachine>>,
+    pub(crate) virtual_machines: Arc<Mutex<Vec<VirtualMachine>>>,
+    pub(crate) physical_machines: Arc<Mutex<Vec<PhysicalMachine>>>,
+    pub(crate) encoder_calibrations: Arc<Mutex<Vec<crate::types::PendingCalibration>>>,
     pub(crate) runtime_loop: Arc<Mutex<Option<RuntimeInstance>>>,
+    pub(crate) world_placements: Arc<crate::backend::policy_runtime::world::WorldPlacements>,
     /// Backend identity is latched for the lifetime of an open loop so a running loop cannot
     /// silently switch between physical and simulation execution.
     pub(crate) loop_backend_kind: Mutex<Option<String>>,
     /// The physical bus is moved into `MicroDuckPolicyRunner` while a hardware loop runs.  Remember which
     /// machine owns it so `loop_close` can reopen the bus for the debug panel.
     pub(crate) loop_physical_machine_id: Mutex<Option<String>>,
+    pub(crate) loop_virtual_machine_id: Mutex<Option<String>>,
     /// Debug loops keep the connected bus behind a shared lock so direct debug commands can
     /// operate on the same serial connection while the loop samples positions.
     pub(crate) loop_physical_bus: Mutex<Option<Arc<Mutex<ConnectedBus>>>>,
@@ -210,29 +250,43 @@ impl Default for DesktopState {
 
 impl DesktopState {
     pub(crate) fn new(config_dir: Option<PathBuf>) -> Self {
-        let persisted_machines = config_dir.as_ref().and_then(|dir| {
-            std::fs::read_to_string(dir.join("machines.toml"))
-                .ok()
-                .and_then(|text| toml::from_str::<PersistedMachineTable>(&text).ok())
-        });
-        let persisted_robots = config_dir.as_ref().and_then(|dir| {
-            std::fs::read_to_string(dir.join("robots.toml"))
-                .ok()
-                .and_then(|text| toml::from_str::<PersistedRobotTable>(&text).ok())
-        });
+        Self::try_new(config_dir).expect("read desktop configuration")
+    }
+
+    pub(crate) fn ensure_encoder_calibration_ready(&self, physical: &str) -> Result<(), String> {
+        if self
+            .encoder_calibrations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|entry| entry.physical_id == physical)
+        {
+            return Err(
+                "这台实机有未完成的编码器校准；请在调试页再次执行编码器中位校准以恢复，当前不能驱动"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn try_new(config_dir: Option<PathBuf>) -> Result<Self, String> {
+        let persisted_machines =
+            read_config::<PersistedMachineTable>(config_dir.as_deref(), "machines.toml")?;
+        let persisted_robots =
+            read_config::<PersistedRobotTable>(config_dir.as_deref(), "robots.toml")?;
         let mut virtual_machines = persisted_machines
             .as_ref()
             .map(|config| config.virtual_machines.clone())
             .unwrap_or_else(|| {
                 vec![VirtualMachine {
-                    id: "official-hd1910".into(),
+                    id: crate::helpers::new_machine_id("virtual"),
                     name: "机器 0".into(),
                     body_id: "official".into(),
                     servo_model: ServoModelKey::Hd1910,
                     simulation: default_simulation(ServoModelKey::Hd1910),
                     startup_selected: true,
                     referenced_by: Vec::new(),
-                    joint_bindings: Vec::new(),
+                    joint_bindings: crate::helpers::default_joint_bindings(),
                 }]
             });
         let auto_mount_enabled = persisted_machines
@@ -260,18 +314,28 @@ impl DesktopState {
         Self::rebuild_references(&mut virtual_machines, &physical_machines);
         let backend_registry = BackendRegistry::default();
         let execution_gate = backend_registry.gate();
-        Self {
+        Ok(Self {
             backend_registry: Mutex::new(backend_registry),
             execution_gate,
             execution_transition: Mutex::new(()),
+            encoder_calibrations: Arc::new(Mutex::new(
+                load_pending_calibrations(config_dir.as_deref())?,
+            )),
+            world_placements: Arc::new(
+                crate::backend::policy_runtime::world::WorldPlacements::load(
+                    config_dir.as_deref(),
+                )?,
+            ),
             config_dir,
             auto_mount_enabled: Mutex::new(auto_mount_enabled),
             auto_reconnect_enabled: Mutex::new(auto_reconnect_enabled),
-            virtual_machines: Mutex::new(virtual_machines),
-            physical_machines: Mutex::new(physical_machines),
+            virtual_machines: Arc::new(Mutex::new(virtual_machines)),
+            physical_machines: Arc::new(Mutex::new(physical_machines)),
             runtime_loop: Arc::new(Mutex::new(None)),
+            recorder: Arc::new(crate::recordings::Recorder::default()),
             loop_backend_kind: Mutex::new(None),
             loop_physical_machine_id: Mutex::new(None),
+            loop_virtual_machine_id: Mutex::new(None),
             loop_physical_bus: Mutex::new(None),
             motion: Mutex::new(MotionTracker::default()),
             loop_clock_stop: Arc::new(AtomicBool::new(true)),
@@ -302,7 +366,7 @@ impl DesktopState {
             training_progress: Mutex::new(None),
             training_stop_requested: Mutex::new(false),
             app_handle: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     pub(crate) fn set_app_handle(&self, app: AppHandle<Wry>) {
@@ -319,8 +383,11 @@ impl DesktopState {
         }
     }
 
-    pub(crate) fn load(config_dir: PathBuf) -> Self {
-        Self::new(Some(config_dir.join("config")))
+    pub(crate) fn load(config_dir: PathBuf) -> Result<Self, String> {
+        let state = Self::try_new(Some(config_dir.join("config")))?;
+        // Persist a newly created default machine's generated identity before exposing it.
+        state.persist()?;
+        Ok(state)
     }
 
     fn rebuild_references(
@@ -342,16 +409,16 @@ impl DesktopState {
     }
 
     pub(crate) fn persist(&self) -> Result<(), String> {
+        self.persist_virtual_machines()?;
+        self.persist_physical_machines()
+    }
+
+    pub(crate) fn persist_virtual_machines(&self) -> Result<(), String> {
         let Some(dir) = &self.config_dir else {
             return Ok(());
         };
         let virtual_machines = self
             .virtual_machines
-            .lock()
-            .map_err(|error| error.to_string())?
-            .clone();
-        let physical_machines = self
-            .physical_machines
             .lock()
             .map_err(|error| error.to_string())?
             .clone();
@@ -363,7 +430,9 @@ impl DesktopState {
             .auto_reconnect_enabled
             .lock()
             .map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(dir).map_err(|error| {
+            format!("create configuration directory {}: {error}", dir.display())
+        })?;
         let default = virtual_machines
             .iter()
             .find(|machine| machine.startup_selected)
@@ -375,12 +444,43 @@ impl DesktopState {
             virtual_machines,
         })
         .map_err(|error| error.to_string())?;
-        let robots = toml::to_string_pretty(&PersistedRobotTable {
-            physical_machines: physical_machines.iter().map(Into::into).collect(),
+        let path = dir.join("machines.toml");
+        std::fs::write(&path, machines).map_err(|error| {
+            format!(
+                "write virtual machine configuration {}: {error}",
+                path.display()
+            )
         })
-        .map_err(|error| error.to_string())?;
-        std::fs::write(dir.join("machines.toml"), machines).map_err(|error| error.to_string())?;
-        std::fs::write(dir.join("robots.toml"), robots).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn persist_physical_machines(&self) -> Result<(), String> {
+        let Some(dir) = &self.config_dir else {
+            return Ok(());
+        };
+        let machines = self.physical_machines.lock().map_err(|e| e.to_string())?;
+        let robots = toml::to_string_pretty(&PersistedRobotTable {
+            physical_machines: machines.iter().map(Into::into).collect(),
+        })
+        .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(dir).map_err(|error| {
+            format!("create configuration directory {}: {error}", dir.display())
+        })?;
+        let path = dir.join("robots.toml");
+        let temporary = dir.join("robots.tmp.toml");
+        let write = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(robots.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path)
+        })();
+        write.map_err(|error| {
+            format!(
+                "write physical machine configuration {}: {error}",
+                path.display()
+            )
+        })
     }
 
     pub(crate) fn start_loop_clock(&self) -> Result<(), String> {
@@ -412,6 +512,7 @@ impl DesktopState {
         let fault = Arc::clone(&self.runtime_fault);
         let gate = self.execution_gate.clone();
         let config_dir = self.config_dir.clone();
+        let recorder = Arc::clone(&self.recorder);
         *thread = Some(std::thread::spawn(move || {
             let period = Duration::from_millis(20);
             let mut deadline = std::time::Instant::now();
@@ -419,6 +520,17 @@ impl DesktopState {
                 if let Ok(mut guard) = runtime.lock()
                     && let Some(instance) = guard.as_mut()
                 {
+                    let tick_started = std::time::Instant::now();
+                    let mut tick_context = instance.snapshot();
+                    tick_context.runtime_generation = generation.load(Ordering::Acquire);
+                    tick_context.execution_generation =
+                        execution_generation.load(Ordering::Acquire);
+                    tick_context.config_revision = revision.load(Ordering::Acquire);
+                    tick_context.tick += 1;
+                    crate::logging::set_context(
+                        config_dir.as_deref(),
+                        recorder.context(&tick_context),
+                    );
                     let existing_fault = fault.lock().ok().and_then(|fault| fault.clone());
                     let mut status = if existing_fault.is_some() {
                         // Keep polling an isolated source cache, but never retry failed execution
@@ -459,28 +571,11 @@ impl DesktopState {
                         status.runtime_state = crate::types::RuntimeState::Faulted;
                         status.last_error = Some(error);
                     }
-                    crate::logging::append_control_event(
-                        config_dir.as_deref(),
-                        format!(
-                            "runtime_tick runtime_generation={} execution_generation={} config_revision={} tick={} sources={:?} simulation={}",
-                            status.runtime_generation,
-                            status.execution_generation,
-                            status.config_revision,
-                            status.tick,
-                            status
-                                .read_sources
-                                .iter()
-                                .map(|source| (
-                                    &source.id,
-                                    source.generation,
-                                    source.sequence,
-                                    &source.health,
-                                    source.age_ms
-                                ))
-                                .collect::<Vec<_>>(),
-                            serde_json::to_string(&status.simulation)
-                                .unwrap_or_else(|_| "null".into())
-                        ),
+                    recorder.capture(
+                        &status,
+                        instance.policy_trace(),
+                        || instance.recording_metadata(),
+                        tick_started,
                     );
                     if let Ok(handle) = app_handle.lock()
                         && let Some(handle) = handle.as_ref()
@@ -571,14 +666,14 @@ impl DesktopState {
 #[allow(clippy::large_enum_variant)]
 enum RuntimeExecution {
     Physical(MicroDuckPolicyRunner),
-    Simulation(PreviewMicroDuckPolicyRunner),
+    Policy(PolicyExecution),
 }
 
 impl loop_body::RuntimeExecutor for RuntimeExecution {
     fn control_tick(&mut self, period: Duration) -> Result<(), String> {
         match self {
             Self::Physical(execution) => execution.tick(period).map_err(|e| e.to_string()),
-            Self::Simulation(execution) => execution.tick().map(|_| ()),
+            Self::Policy(execution) => execution.tick().map(|_| ()),
         }
     }
 
@@ -587,9 +682,7 @@ impl loop_body::RuntimeExecutor for RuntimeExecution {
             Self::Physical(execution) => execution
                 .send(loop_body::LoopAction::Stop)
                 .map_err(|e| e.to_string()),
-            Self::Simulation(execution) => {
-                execution.action(loop_body::LoopAction::Stop).map(|_| ())
-            }
+            Self::Policy(execution) => execution.stop(),
         }
     }
 }
@@ -600,6 +693,19 @@ pub(crate) struct RuntimeInstance {
 }
 
 impl RuntimeInstance {
+    pub(crate) fn policy_trace(&self) -> Option<&crate::backend::policy_runtime::PolicyTrace> {
+        match self.managed.execution()? {
+            RuntimeExecution::Physical(execution) => execution.policy_trace(),
+            RuntimeExecution::Policy(execution) => execution.runner().policy_trace(),
+        }
+    }
+
+    pub(crate) fn recording_metadata(&self) -> serde_json::Value {
+        match self.managed.execution() {
+            Some(RuntimeExecution::Policy(execution)) => execution.recording_metadata(),
+            _ => serde_json::json!({"control":"manual","action_space":"canonical_joint_targets"}),
+        }
+    }
     pub(crate) fn physical_execution(execution: MicroDuckPolicyRunner, id: String) -> Self {
         let control_source = if execution.has_policy() {
             loop_body::ControlSource::Controller
@@ -619,10 +725,7 @@ impl RuntimeInstance {
             ),
         }
     }
-    pub(crate) fn simulation_execution(
-        execution: PreviewMicroDuckPolicyRunner,
-        id: String,
-    ) -> Self {
+    pub(crate) fn simulation_execution(execution: PolicyExecution, id: String) -> Self {
         Self {
             managed: loop_body::RuntimeLoop::from_sessions(
                 loop_body::LoopRuntimeConfig {
@@ -630,7 +733,7 @@ impl RuntimeInstance {
                     control_source: loop_body::ControlSource::Manual,
                     ..Default::default()
                 },
-                Some(RuntimeExecution::Simulation(execution)),
+                Some(RuntimeExecution::Policy(execution)),
                 Vec::new(),
             ),
         }
@@ -668,7 +771,7 @@ impl RuntimeInstance {
     pub(crate) fn is_simulation(&self) -> bool {
         matches!(
             self.managed.execution(),
-            Some(RuntimeExecution::Simulation(_))
+            Some(RuntimeExecution::Policy(execution)) if execution.physical_id().is_none()
         )
     }
     pub(crate) fn has_execution(&self) -> bool {
@@ -696,8 +799,19 @@ impl RuntimeInstance {
     }
     pub(crate) fn snapshot(&self) -> crate::types::LoopStatus {
         let mut status = match self.managed.execution() {
-            Some(RuntimeExecution::Physical(execution)) => execution.status().into(),
-            Some(RuntimeExecution::Simulation(execution)) => execution.status(),
+            Some(RuntimeExecution::Physical(execution)) => {
+                let mut status = crate::types::LoopStatus::from(execution.status());
+                status.active_body = Some(crate::types::ActiveBody {
+                    virtual_machine_id: None,
+                    physical_machine_id: self.managed.config().execution_backend.clone(),
+                });
+                status
+            }
+            Some(RuntimeExecution::Policy(execution)) => {
+                let mut status = execution.status();
+                status.tick = self.managed.tick_index().0;
+                status
+            }
             None => {
                 Self::source_status(self.read_source().expect("pure read runtime owns a source"))
             }
@@ -714,6 +828,7 @@ impl RuntimeInstance {
         let sample = source.latest();
         crate::types::LoopStatus {
             has_execution: false,
+            active_body: None,
             runtime_state: crate::types::RuntimeState::Running,
             simulation: None,
             phase: crate::types::LoopPhase::Holding,
@@ -738,25 +853,34 @@ impl RuntimeInstance {
     }
 
     pub(crate) fn has_policy(&self) -> bool {
-        matches!(self.managed.execution(), Some(RuntimeExecution::Physical(execution)) if execution.has_policy())
+        self.physical().is_ok_and(MicroDuckPolicyRunner::has_policy)
     }
     pub(crate) fn physical(&self) -> Result<&MicroDuckPolicyRunner, String> {
         match self.managed.execution() {
             Some(RuntimeExecution::Physical(execution)) => Ok(execution),
+            Some(RuntimeExecution::Policy(execution)) if execution.physical_id().is_some() => {
+                Ok(execution.runner())
+            }
             _ => Err("active runtime has no physical execution".into()),
         }
     }
     pub(crate) fn physical_mut(&mut self) -> Result<&mut MicroDuckPolicyRunner, String> {
         match self.managed.execution_mut() {
             Some(RuntimeExecution::Physical(execution)) => Ok(execution),
+            Some(RuntimeExecution::Policy(execution)) if execution.physical_id().is_some() => {
+                Ok(execution.runner_mut())
+            }
             _ => Err("active runtime has no physical execution".into()),
         }
     }
-    pub(crate) fn simulation_mut(&mut self) -> Result<&mut PreviewMicroDuckPolicyRunner, String> {
+    pub(crate) fn policy_execution_mut(&mut self) -> Result<&mut PolicyExecution, String> {
         match self.managed.execution_mut() {
-            Some(RuntimeExecution::Simulation(execution)) => Ok(execution),
-            _ => Err("active runtime has no simulation execution".into()),
+            Some(RuntimeExecution::Policy(execution)) => Ok(execution),
+            _ => Err("active runtime has no preview policy execution".into()),
         }
+    }
+    pub(crate) fn has_policy_execution(&self) -> bool {
+        matches!(self.managed.execution(), Some(RuntimeExecution::Policy(_)))
     }
     pub(crate) fn read_source(&self) -> Option<&ReadOnlySource> {
         self.managed.sources().first().map(|(_, source)| source)
@@ -777,13 +901,68 @@ impl Drop for DesktopState {
         {
             let _ = thread.join();
         }
+        let _ = self.recorder.stop("app_shutdown");
+        crate::logging::flush();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_default_identity_survives_reload_and_invalid_files_are_preserved() {
+        let root = crate::helpers::test_directory()
+            .join(crate::helpers::new_machine_id("machine-config-test"));
+        let first = DesktopState::load(root.clone()).unwrap();
+        let id = first.virtual_machines.lock().unwrap()[0].id.clone();
+        assert!(uuid::Uuid::parse_str(id.strip_prefix("virtual-").unwrap()).is_ok());
+        drop(first);
+        let reloaded = DesktopState::load(root.clone()).unwrap();
+        assert_eq!(reloaded.virtual_machines.lock().unwrap()[0].id, id);
+        drop(reloaded);
+        let invalid = "[[robot]\n";
+        std::fs::write(root.join("config/robots.toml"), invalid).unwrap();
+        assert!(DesktopState::load(root.clone()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("config/robots.toml")).unwrap(),
+            invalid
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn physical_direction_configuration_loads_and_round_trips_without_zero_overrides() {
+        let saved: super::PersistedRobotTable = toml::from_str(
+            r#"
+[[robot]]
+id = "physical-test"
+name = "test"
+virtualMachineId = "official-hd1910"
+[[robot.census]]
+servoId = 9
+model = "hd1910"
+[[robot.jointDirections]]
+slotId = "left_hip_yaw"
+direction = -1
+[[robot.jointDirections]]
+slotId = "left_hip_roll"
+direction = 1
+"#,
+        )
+        .unwrap();
+        let physical = PhysicalMachine::from(saved.physical_machines[0].clone());
+        assert_eq!(physical.joint_directions[0].direction, -1);
+        assert_eq!(physical.joint_directions[1].direction, 1);
+        assert!(physical.joint_bindings.is_empty());
+        let encoded = toml::to_string(&super::PersistedPhysicalMachine::from(&physical)).unwrap();
+        let reloaded = PhysicalMachine::from(
+            toml::from_str::<super::PersistedPhysicalMachine>(&encoded).unwrap(),
+        );
+        assert_eq!(physical.joint_directions, reloaded.joint_directions);
+    }
+
     use super::DesktopState;
-    use crate::types::{PhysicalMachine, ReconnectHint, ServoIdentity, ServoJointDirection};
+    use crate::types::{
+        PhysicalMachine, ReconnectHint, ServoIdentity, ServoJointCalibration, ServoJointDirection,
+    };
 
     fn servo(id: u8, model: &str) -> ServoIdentity {
         ServoIdentity {
@@ -794,12 +973,13 @@ mod tests {
 
     #[test]
     fn system_config_round_trips_physical_weak_reference() {
-        let config_dir = std::env::temp_dir().join(format!(
+        let config_dir = crate::helpers::test_directory().join(format!(
             "microduck-vision-system-config-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&config_dir);
         let state = DesktopState::new(Some(config_dir.clone()));
+        let virtual_id = state.virtual_machines.lock().unwrap()[0].id.clone();
         state
             .physical_machines
             .lock()
@@ -817,7 +997,7 @@ mod tests {
                     adapter_serial: Some("adapter-1".into()),
                     product: Some("USB bridge".into()),
                 }),
-                virtual_machine_id: Some("official-hd1910".into()),
+                virtual_machine_id: Some(virtual_id.clone()),
                 online_servo_ids: vec![1],
                 connected: true,
                 last_seen: Some("刚刚".into()),
@@ -826,24 +1006,31 @@ mod tests {
                     slot_id: "left_hip_yaw".into(),
                     direction: -1,
                 }],
+                joint_bindings: vec![ServoJointCalibration {
+                    zero_offset_rad: 0.2,
+                    min_rad: None,
+                    max_rad: None,
+                    slot_id: "left_hip_yaw".into(),
+                }],
             });
         state.virtual_machines.lock().unwrap()[0]
             .simulation
             .world_position = [1.25, -0.4, 2.0];
-        state.virtual_machines.lock().unwrap()[0]
-            .joint_bindings
-            .push(crate::types::ServoJointBinding {
-                slot_id: "left_hip_yaw".into(),
-                physical_id: 1,
-                direction: -1,
-                zero_offset_rad: -0.35,
-                min_rad: None,
-                max_rad: None,
-            });
+        state.virtual_machines.lock().unwrap()[0].joint_bindings[0].physical_id = 1;
+        let mut second = state.physical_machines.lock().unwrap()[0].clone();
+        second.id = "physical-2".into();
+        second.census = vec![servo(7, "hd1910")];
+        second.joint_bindings[0].zero_offset_rad = 1.7;
+        second.joint_directions[0].direction = 1;
+        state.physical_machines.lock().unwrap().push(second);
         state.persist().unwrap();
 
         let loaded = DesktopState::new(Some(config_dir.clone()));
-        let physical = &loaded.physical_machines.lock().unwrap()[0];
+        let physical_machines = loaded.physical_machines.lock().unwrap();
+        let physical = &physical_machines[0];
+        assert_eq!(physical_machines[1].id, "physical-2");
+        assert_eq!(physical_machines[1].joint_bindings[0].zero_offset_rad, 1.7);
+        assert_eq!(physical_machines[1].joint_directions[0].direction, 1);
         assert!(!physical.connected);
         assert_eq!(
             physical
@@ -856,12 +1043,13 @@ mod tests {
         );
         assert_eq!(
             physical.virtual_machine_id.as_deref(),
-            Some("official-hd1910")
+            Some(virtual_id.as_str())
         );
         assert_eq!(physical.joint_directions[0].direction, -1);
+        assert_eq!(physical.joint_bindings[0].zero_offset_rad, 0.2);
         assert_eq!(
             loaded.virtual_machines.lock().unwrap()[0].referenced_by,
-            vec!["physical-1"]
+            vec!["physical-1", "physical-2"]
         );
         assert_eq!(
             loaded.virtual_machines.lock().unwrap()[0]
@@ -870,16 +1058,17 @@ mod tests {
             [1.25, -0.4, 2.0]
         );
         assert_eq!(
-            loaded.virtual_machines.lock().unwrap()[0].joint_bindings[0].zero_offset_rad,
-            -0.35
+            loaded.virtual_machines.lock().unwrap()[0].joint_bindings[0].physical_id,
+            1
         );
         assert!(config_dir.join("machines.toml").is_file());
         let machines_text = std::fs::read_to_string(config_dir.join("machines.toml")).unwrap();
-        assert!(machines_text.contains("auto_mount = true"));
-        assert!(machines_text.contains("auto_reconnect = true"));
+        assert!(machines_text.contains("autoMount = true"));
+        assert!(machines_text.contains("autoReconnect = true"));
         let robots_text = std::fs::read_to_string(config_dir.join("robots.toml")).unwrap();
-        assert!(robots_text.contains("reconnect_hint"));
-        assert!(robots_text.contains("joint_directions"));
+        assert!(robots_text.contains("reconnectHint"));
+        assert!(robots_text.contains("jointBindings"));
+        assert!(robots_text.contains("jointDirections"));
         assert!(!robots_text.contains("machine_code"));
         assert!(!robots_text.contains("connected"));
         let _ = std::fs::remove_dir_all(config_dir);

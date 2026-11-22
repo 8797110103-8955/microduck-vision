@@ -35,7 +35,7 @@ function unboundVirtualMachines(
   return virtualMachines.filter((machine) => !boundVirtualMachineIds.has(machine.id));
 }
 
-export function bindingConflictsFor(machine: VirtualMachine | undefined) {
+export function bindingConflictsFor(machine: Pick<VirtualMachine, "jointBindings"> | undefined) {
   if (!machine) return [];
   const byId = new Map<number, string[]>();
   for (const binding of machine.jointBindings ?? []) {
@@ -52,7 +52,7 @@ export function bindingConflictsFor(machine: VirtualMachine | undefined) {
 type BindingDrafts = Record<string, number | null>;
 
 export function bindingConflictsForDrafts(
-  machine: VirtualMachine | undefined,
+  machine: Pick<VirtualMachine, "jointBindings"> | undefined,
   drafts: BindingDrafts,
 ) {
   if (!machine) return [];
@@ -62,14 +62,9 @@ export function bindingConflictsForDrafts(
   for (const [slotId, physicalId] of Object.entries(drafts)) {
     if (physicalId === null) bindings.delete(slotId);
     else {
-      const current = bindings.get(slotId);
       bindings.set(slotId, {
         slotId,
         physicalId,
-        direction: current?.direction ?? 1,
-        zeroOffsetRad: current?.zeroOffsetRad ?? 0,
-        minRad: current?.minRad ?? null,
-        maxRad: current?.maxRad ?? null,
       });
     }
   }
@@ -105,15 +100,36 @@ export function debugPhysicalMachineFor(
   return index >= 0 ? (unboundPhysicalMachines[index] ?? null) : null;
 }
 
-/**
- * Resolve the body-to-servo mapping used by the debug view and the 3D stage.
- *
- * The simulated machine owns the body-to-servo slot mapping.  A physical
- * machine adds installation-specific direction overrides alongside it.
- */
-export function debugBindingFor(virtualMachine: VirtualMachine | undefined, slotId: string) {
-  const virtualBindings = virtualMachine?.jointBindings ?? [];
-  return virtualBindings.find((binding) => binding.slotId === slotId);
+export function debugBindingFor(
+  machine: Pick<VirtualMachine, "jointBindings"> | undefined,
+  slotId: string,
+) {
+  return machine?.jointBindings?.find((binding) => binding.slotId === slotId);
+}
+
+export function debugBindingMachineFor(
+  virtual: VirtualMachine | undefined,
+  physical: PhysicalMachine | null | undefined,
+) {
+  if (!physical) return virtual;
+  const virtualBindings = virtual?.jointBindings ?? [];
+  return {
+    id: physical.id,
+    jointBindings: virtualBindings.map((binding) => {
+      const calibration = physical.jointBindings?.find(
+        (candidate) => candidate.slotId === binding.slotId,
+      );
+      return {
+        ...binding,
+        zeroOffsetRad: calibration?.zeroOffsetRad ?? 0,
+        minRad: calibration?.minRad ?? null,
+        maxRad: calibration?.maxRad ?? null,
+        direction:
+          physical.jointDirections?.find((direction) => direction.slotId === binding.slotId)
+            ?.direction ?? 1,
+      };
+    }),
+  };
 }
 
 export function defaultDebugVirtualMachineId(
@@ -129,33 +145,17 @@ export const DebugPage = defineComponent(() => {
   const store = useDesktopStore();
   const selectedId = ref<number | null>(null);
   const rangeView = ref(false);
-  const manualControl = computed(
-    () => !!store.state.loop?.hasExecution && !store.state.loop.simulation,
+  const bindingBusy = ref(false);
+  watch(
+    bindingBusy,
+    (pending) => {
+      store.state.debugMappingPending = pending;
+    },
+    { flush: "sync" },
   );
-  const accessBusy = ref(false);
-  const toggleManualControl = async () => {
-    const physical = selectedPhysicalMachine.value;
-    const virtual = selectedMachine.value;
-    if (!physical?.connected || !virtual || accessBusy.value) return;
-    accessBusy.value = true;
-    try {
-      const current = await commands.loopStatus();
-      const input = {
-        virtualMachineId: virtual.id,
-        physicalMachineId: physical.id,
-        access: manualControl.value ? ("read_only" as const) : ("control" as const),
-        policyId: null,
-      };
-      store.state.loop = await (current
-        ? commands.runtimeReconfigure(current.runtimeGeneration, current.configRevision, input)
-        : commands.runtimeOpen(input));
-      store.state.previewLoop = null;
-    } catch (error) {
-      showMessage(error instanceof Error ? error.message : String(error), { type: "warning" });
-    } finally {
-      accessBusy.value = false;
-    }
-  };
+  onScopeDispose(() => {
+    store.state.debugMappingPending = false;
+  });
   const jointSlots = ref<string[]>([]);
   const jointRanges = ref<JointRange[]>([]);
   const selectedRangeEndpoints = ref<Record<string, "min" | "max">>({});
@@ -167,6 +167,10 @@ export const DebugPage = defineComponent(() => {
   let suppressServoSelectionEvent = false;
   let loopRequestInFlight = false;
   let loopPollingActive = false;
+  const readLoopReady = ref(false);
+  let readLoopSync = Promise.resolve();
+  let readLoopVirtualId: string | null = null;
+  let readLoopPhysicalId: string | null = null;
   const worldPositionDraft = ref<[number, number, number]>([0, 0, 0]);
   const selectedMachine = computed(() =>
     store.state.virtualMachines.find(
@@ -180,28 +184,52 @@ export const DebugPage = defineComponent(() => {
       store.state.physicalMachines,
     ),
   );
-  const physicalConnected = computed(() => selectedPhysicalMachine.value?.connected === true);
-  const poseZeroAllowed = computed(
-    () =>
-      physicalConnected.value && !(store.state.loop?.hasExecution && !store.state.loop.simulation),
+  const bindingMachine = computed(() =>
+    debugBindingMachineFor(selectedMachine.value, selectedPhysicalMachine.value),
   );
-  const anyTorqueEnabled = computed(() => selectedPhysicalMachine.value?.torqueEnabled === true);
+  const physicalConnected = computed(() => selectedPhysicalMachine.value?.connected === true);
+  const mappingOwnedByExecution = computed(
+    () =>
+      !!selectedPhysicalMachine.value &&
+      store.state.loop?.activeBody?.physicalMachineId === selectedPhysicalMachine.value.id,
+  );
+  const mappingEditDisabled = computed(() => bindingBusy.value || mappingOwnedByExecution.value);
+  const resumeLivePose = () => {
+    rangeView.value = false;
+    rangeEntryPose.value = null;
+    store.state.rangePreview = null;
+    store.state.debugPose = null;
+  };
+  const poseZeroAllowed = computed(
+    () => physicalConnected.value && !store.state.loop?.activeBody?.physicalMachineId,
+  );
+  const encoderCalibrationAllowed = computed(
+    () =>
+      poseZeroAllowed.value &&
+      selectedPhysicalMachine.value?.census?.some((servo) => servo.model === "hd1910") === true,
+  );
   const bindingDraftFor = (slotId: string) =>
     Object.prototype.hasOwnProperty.call(bindingDrafts.value, slotId)
       ? bindingDrafts.value[slotId]
       : undefined;
   const bindingFor = (slotId: string) => {
-    const machineBinding = debugBindingFor(selectedMachine.value, slotId);
+    const machineBinding = debugBindingFor(bindingMachine.value, slotId);
+    const direction =
+      machineBinding && "direction" in machineBinding ? machineBinding.direction : 1;
+    const zeroOffsetRad =
+      machineBinding && "zeroOffsetRad" in machineBinding ? machineBinding.zeroOffsetRad : 0;
+    const minRad = machineBinding && "minRad" in machineBinding ? machineBinding.minRad : null;
+    const maxRad = machineBinding && "maxRad" in machineBinding ? machineBinding.maxRad : null;
     const draft = bindingDraftFor(slotId);
     if (draft === undefined) return machineBinding;
     if (draft === null) return undefined;
     return {
       slotId,
       physicalId: draft,
-      direction: machineBinding?.direction ?? 1,
-      zeroOffsetRad: machineBinding?.zeroOffsetRad ?? 0,
-      minRad: machineBinding?.minRad ?? null,
-      maxRad: machineBinding?.maxRad ?? null,
+      direction,
+      zeroOffsetRad,
+      minRad,
+      maxRad,
     };
   };
   const applyDefaultSelection = () => {
@@ -221,21 +249,12 @@ export const DebugPage = defineComponent(() => {
     try {
       const status = await commands.loopStatus();
       if (!status) return;
-      const source = status.readSources?.find((candidate) => candidate.id === machineId);
-      const physicalStatus = source
-        ? {
-            ...status,
-            positions: source.positions,
-            sensorFailures: source.health === "offline" ? 1 : 0,
-            lastError: source.lastError,
-          }
-        : status;
       if (
         loopPollingActive &&
         selectedPhysicalMachine.value?.id === machineId &&
-        store.state.loop === currentLoop
+        store.state.loop?.runtimeGeneration === currentLoop.runtimeGeneration
       )
-        store.state.loop = physicalStatus;
+        store.applyLoopStatus(status);
     } catch (error) {
       if (loopPollingActive) console.warn("读取真机姿态失败", error);
     } finally {
@@ -247,18 +266,6 @@ export const DebugPage = defineComponent(() => {
     180,
     { immediate: false },
   );
-  const restartReadLoop = async () => {
-    const machine = selectedPhysicalMachine.value;
-    if (!store.state.loop || !machine?.connected || manualControl.value) return;
-    await closeLoop();
-    await openLoop(machine.id);
-    await refreshLoopStatus();
-  };
-  const refreshVirtualMachineCache = async () => {
-    const machines = await commands.virtualMachines();
-    store.state.virtualMachines = machines;
-    return machines.find((machine) => machine.id === store.state.selectedVirtualMachine);
-  };
   const announcePendingBindingConflict = (slotId: string, conflicts: string[]) => {
     dismissPendingBindingMessage?.();
     dismissPendingBindingMessage = showMessage(
@@ -272,8 +279,9 @@ export const DebugPage = defineComponent(() => {
   };
   const syncBindingDrafts = async () => {
     if (!Object.keys(bindingDrafts.value).length) return;
-    const machine = await refreshVirtualMachineCache();
-    if (!machine) return;
+    const virtual = selectedMachine.value;
+    const machine = bindingMachine.value;
+    if (!machine || !virtual) return;
     const conflicts = bindingConflictsForDrafts(machine, bindingDrafts.value);
     if (conflicts.length) {
       pendingBindingSlots.value = [
@@ -286,22 +294,17 @@ export const DebugPage = defineComponent(() => {
       return;
     }
     const drafts = Object.entries(bindingDrafts.value);
-    for (const [slotId, physicalId] of drafts) {
-      const current = machine.jointBindings?.find((binding) => binding.slotId === slotId);
-      if ((current?.physicalId ?? null) === physicalId) continue;
-      await commands.virtualMachineBind({
-        virtualMachineId: machine.id,
-        slotId,
-        physicalId,
-      });
-    }
-    await refreshVirtualMachineCache();
+    const updated = await commands.virtualMachineBindings(
+      virtual.id,
+      drafts.map(([slotId, physicalId]) => ({ slotId, physicalId })),
+    );
+    const index = store.state.virtualMachines.findIndex((entry) => entry.id === updated.id);
+    if (index >= 0) store.state.virtualMachines[index] = updated;
     bindingDrafts.value = {};
     pendingBindingSlots.value = [];
     bindingConflictSignature.value = "";
     dismissPendingBindingMessage?.();
     dismissPendingBindingMessage = undefined;
-    await restartReadLoop();
   };
 
   onMounted(async () => {
@@ -313,22 +316,48 @@ export const DebugPage = defineComponent(() => {
     if (!loopPollingActive) return;
     applyDefaultSelection();
     checkBindingConflict();
-    if (selectedPhysicalMachine.value?.connected) {
-      try {
-        await openLoop(selectedPhysicalMachine.value.id);
-        store.state.error = null;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        store.state.error = null;
-        showMessage(`调试读取 loop 启动失败：${message}`, {
-          type: "warning",
-          duration: 6_000,
-        });
-      }
-    }
+    readLoopReady.value = true;
     startLoopPolling();
     void refreshLoopStatus();
   });
+  const reportReadLoopError = (error: unknown) => {
+    if (!loopPollingActive) return;
+    const message = error instanceof Error ? error.message : String(error);
+    showMessage(`调试读取 loop 启动失败：${message}`, { type: "warning", duration: 6_000 });
+  };
+  // Serialize connection/selection changes and disposal so an in-flight open cannot leave
+  // a source behind after the page exits or attach a previous machine after a new one.
+  watch(
+    [
+      readLoopReady,
+      () => selectedMachine.value?.id,
+      () => (selectedPhysicalMachine.value?.connected ? selectedPhysicalMachine.value.id : null),
+    ],
+    () => {
+      readLoopSync = readLoopSync
+        .then(async () => {
+          if (!loopPollingActive || !readLoopReady.value) return;
+          const virtualId = selectedMachine.value?.id ?? null;
+          const physicalId = selectedPhysicalMachine.value?.connected
+            ? selectedPhysicalMachine.value.id
+            : null;
+          if (readLoopPhysicalId === physicalId && readLoopVirtualId === virtualId) return;
+          if (
+            readLoopPhysicalId &&
+            store.state.loop?.readSources.some((source) => source.id === readLoopPhysicalId)
+          ) {
+            await closeLoop();
+          }
+          readLoopPhysicalId = null;
+          readLoopVirtualId = null;
+          if (!physicalId || !virtualId) return;
+          await openLoop(physicalId, virtualId);
+          readLoopPhysicalId = physicalId;
+          readLoopVirtualId = virtualId;
+        })
+        .catch(reportReadLoopError);
+    },
+  );
   onScopeDispose(() => {
     stopLoopPolling();
     loopPollingActive = false;
@@ -337,7 +366,16 @@ export const DebugPage = defineComponent(() => {
     dismissPendingBindingMessage = undefined;
     store.state.rangePreview = null;
     store.state.debugPose = null;
-    if (store.state.loop) void closeLoop();
+    readLoopSync = readLoopSync
+      .then(async () => {
+        if (
+          readLoopPhysicalId &&
+          store.state.loop?.readSources.some((source) => source.id === readLoopPhysicalId)
+        ) {
+          await closeLoop();
+        }
+      })
+      .catch((error) => console.warn("关闭调试读取 loop 失败", error));
   });
   watch(
     () => selectedMachine.value?.id,
@@ -368,7 +406,7 @@ export const DebugPage = defineComponent(() => {
     void saveWorldPosition(next);
   };
   function checkBindingConflict() {
-    const conflicts = bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value);
+    const conflicts = bindingConflictsForDrafts(bindingMachine.value, bindingDrafts.value);
     const signature = conflicts.join("|");
     if (!signature) {
       bindingConflictSignature.value = "";
@@ -388,7 +426,7 @@ export const DebugPage = defineComponent(() => {
     );
   }
   watch(
-    () => store.state.selectedVirtualMachine,
+    () => bindingMachine.value?.id,
     () => {
       bindingDrafts.value = {};
       pendingBindingSlots.value = [];
@@ -453,16 +491,25 @@ export const DebugPage = defineComponent(() => {
     selectedId.value = Math.max(1, Math.min(15, event.detail));
     checkBindingConflict();
   }
-  const directionFor = (slotId: string) =>
-    selectedPhysicalMachine.value?.jointDirections?.find((binding) => binding.slotId === slotId)
-      ?.direction ??
-    bindingFor(slotId)?.direction ??
-    1;
+  const directionFor = (slotId: string) => {
+    const binding = bindingFor(slotId);
+    return (
+      selectedPhysicalMachine.value?.jointDirections?.find(
+        (installation) => installation.slotId === slotId,
+      )?.direction ?? (binding && "direction" in binding ? binding.direction : 1)
+    );
+  };
   const bindingOptionsFor = (index: number) => {
     const officialId = officialServoIds[index];
     const census = selectedPhysicalMachine.value?.census ?? [];
+    const savedId = bindingFor(jointSlots.value[index])?.physicalId;
     return [
       { id: officialId, label: `${officialId} · 官方默认` },
+      ...(savedId !== undefined &&
+      savedId !== officialId &&
+      !census.some((servo) => servo.servoId === savedId)
+        ? [{ id: savedId, label: `${savedId} · 已保存` }]
+        : []),
       ...census
         .filter((servo) => servo.servoId !== officialId)
         .toSorted((a, b) => a.servoId - b.servoId)
@@ -471,10 +518,10 @@ export const DebugPage = defineComponent(() => {
   };
   const updateBinding = async (slotId: string, value: string) => {
     const virtualMachineId = store.state.selectedVirtualMachine;
-    if (!virtualMachineId) return;
+    if (!virtualMachineId || mappingEditDisabled.value) return;
     const physicalId = value ? Number(value) : null;
     bindingDrafts.value = { ...bindingDrafts.value, [slotId]: physicalId };
-    const conflicts = bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value);
+    const conflicts = bindingConflictsForDrafts(bindingMachine.value, bindingDrafts.value);
     if (conflicts.length) {
       if (!pendingBindingSlots.value.includes(slotId)) {
         pendingBindingSlots.value = [...pendingBindingSlots.value, slotId];
@@ -482,86 +529,92 @@ export const DebugPage = defineComponent(() => {
       announcePendingBindingConflict(slotId, conflicts);
       return;
     }
+    bindingBusy.value = true;
     try {
+      resumeLivePose();
       await syncBindingDrafts();
       store.state.error = null;
       checkBindingConflict();
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      bindingBusy.value = false;
     }
   };
   const updateDirection = async (slotId: string, direction: number) => {
     const physical = selectedPhysicalMachine.value;
     const virtualMachineId = store.state.selectedVirtualMachine;
-    if (!physical?.connected || !virtualMachineId) return;
-    const index = jointSlots.value.indexOf(slotId);
-    const physicalId = bindingFor(slotId)?.physicalId ?? officialServoIds[index];
-    if (physicalId === undefined) return;
+    if (!physical?.connected || !virtualMachineId || mappingEditDisabled.value) return;
+    bindingBusy.value = true;
     try {
+      resumeLivePose();
       const updated = await commands.physicalMachineBind({
         physicalMachineId: physical.id,
-        virtualMachineId,
         slotId,
-        physicalId,
         direction,
       });
       const physicalIndex = store.state.physicalMachines.findIndex(
         (item) => item.id === updated.id,
       );
       if (physicalIndex >= 0) store.state.physicalMachines[physicalIndex] = updated;
-      store.state.physicalMachines = await commands.physicalMachines();
-      await restartReadLoop();
       store.state.error = null;
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      bindingBusy.value = false;
     }
   };
   const setPoseZero = async () => {
     const machine = selectedPhysicalMachine.value;
-    if (!machine?.connected || !poseZeroAllowed.value) return;
-    if (bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value).length) {
+    if (!machine?.connected || !poseZeroAllowed.value || bindingBusy.value) return;
+    if (bindingConflictsForDrafts(bindingMachine.value, bindingDrafts.value).length) {
       checkBindingConflict();
       return;
     }
+    bindingBusy.value = true;
     try {
+      resumeLivePose();
       const updated = await commands.physicalMachineSetPoseZero(
         machine.id,
         store.state.selectedVirtualMachine,
       );
       const index = store.state.physicalMachines.findIndex((item) => item.id === updated.id);
       if (index >= 0) store.state.physicalMachines[index] = updated;
-      store.state.virtualMachines = await commands.virtualMachines();
-      if (store.state.loop) {
-        await closeLoop();
-        await openLoop(machine.id);
-        await refreshLoopStatus();
-      }
       store.state.error = null;
       showMessage("已绑定当前姿态为零位", { type: "info" });
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      bindingBusy.value = false;
     }
   };
-  const toggleAllTorque = async () => {
+  const centerEncoders = async () => {
     const machine = selectedPhysicalMachine.value;
-    const virtualMachineId = store.state.selectedVirtualMachine;
-    if (!machine?.connected || !virtualMachineId || !manualControl.value || accessBusy.value)
-      return;
-    if (bindingConflictsForDrafts(selectedMachine.value, bindingDrafts.value).length) {
+    if (!machine || !encoderCalibrationAllowed.value || bindingBusy.value) return;
+    if (bindingConflictsForDrafts(bindingMachine.value, bindingDrafts.value).length) {
       checkBindingConflict();
       return;
     }
+    bindingBusy.value = true;
     try {
-      const updated = await commands.physicalMachineSetTorque(
+      resumeLivePose();
+      const result = await commands.physicalMachineCenterEncoders(
         machine.id,
-        !anyTorqueEnabled.value,
-        virtualMachineId,
+        store.state.selectedVirtualMachine,
       );
-      const index = store.state.physicalMachines.findIndex((item) => item.id === updated.id);
-      if (index >= 0) store.state.physicalMachines[index] = updated;
-      await refreshLoopStatus();
+      const index = store.state.physicalMachines.findIndex((item) => item.id === result.machine.id);
+      if (index >= 0) store.state.physicalMachines[index] = result.machine;
+      store.state.error = result.error;
+      showMessage(
+        result.error
+          ? `已校准 ${result.calibratedServoIds.length} 个电机，后续校准停止：${result.error}`
+          : `已校准 ${result.calibratedServoIds.length} 个电机的编码器中位，保留当前关节姿态`,
+        { type: result.error ? "warning" : "info", duration: 8_000 },
+      );
     } catch (error) {
       store.state.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      bindingBusy.value = false;
     }
   };
   const rangeFor = (slotId: string) =>
@@ -571,7 +624,7 @@ export const DebugPage = defineComponent(() => {
       maxRad: Math.PI,
     };
   const rangeStateFor = (slotId: string) =>
-    store.state.jointRangeStates.find((state) => state.slotId === slotId);
+    store.state.loop?.jointRangeStates.find((state) => state.slotId === slotId);
   const updateRangePreview = () => {
     store.state.rangePreview = jointSlots.value.map((slotId) => {
       const range = rangeFor(slotId);
@@ -591,7 +644,13 @@ export const DebugPage = defineComponent(() => {
       return;
     }
     rangeEntryPose.value = [
-      ...(store.state.loop?.positions ?? store.state.debugPose ?? Array(15).fill(0)),
+      ...(store.state.loop?.readSources.find(
+        (source) => source.id === selectedPhysicalMachine.value?.id,
+      )?.positions ??
+        (store.state.loop?.activeBody?.physicalMachineId
+          ? store.state.loop.positions
+          : store.state.debugPose) ??
+        Array(15).fill(0)),
     ];
     selectedRangeEndpoints.value = {};
     updateRangePreview();
@@ -610,6 +669,7 @@ export const DebugPage = defineComponent(() => {
       <div class={style.debugMachineRow}>
         <span class={style.machineTitle}>{selectedMachine.value?.name ?? "机器"}</span>
         <span>{selectedPhysicalMachine.value?.name ?? "未关联实机"}</span>
+        <span>只读</span>
         <i
           class={[
             style.debugStatusDot,
@@ -620,17 +680,10 @@ export const DebugPage = defineComponent(() => {
       </div>
       <div class={style.systemActions} aria-label="调试全局操作">
         <button
-          type="button"
-          disabled={!physicalConnected.value || accessBusy.value}
-          onClick={() => void toggleManualControl()}
-        >
-          {manualControl.value ? "返回只读" : "切换为手动控制"}
-        </button>
-        <button
           class={style.poseAction}
           type="button"
-          disabled={!poseZeroAllowed.value || accessBusy.value}
-          title="读取当前实机姿态，并将它绑定为模拟机的姿态零位"
+          disabled={!poseZeroAllowed.value || bindingBusy.value}
+          title="将当前实机姿态保存为这台真机的零位"
           onClick={() => void setPoseZero()}
         >
           绑定
@@ -659,17 +712,26 @@ export const DebugPage = defineComponent(() => {
         >
           还原
         </button>
-        <button
-          class={style.torqueAction}
-          type="button"
-          disabled={!physicalConnected.value || !manualControl.value || accessBusy.value}
-          title="打开或关闭当前实机全部舵机的扭矩输出"
-          onClick={() => void toggleAllTorque()}
-        >
-          {anyTorqueEnabled.value ? "全部力矩关" : "全部力矩开"}
-        </button>
       </div>
+      {selectedPhysicalMachine.value?.census?.some((servo) => servo.model === "hd1910") && (
+        <article class={style.panelCard}>
+          <div class={style.panelHeader}>
+            <strong>实机编码器中位</strong>
+            <button
+              type="button"
+              disabled={!encoderCalibrationAllowed.value || bindingBusy.value}
+              title="将已绑定在线电机的当前位置校到编码器中间，并迁移这台实机的软件零位"
+              onClick={() => void centerEncoders()}
+            >
+              {bindingBusy.value ? "处理中…" : "校准编码器中位"}
+            </button>
+          </div>
+          <p>托住机身并保持肢体静止。校准会关闭力矩并保存到电机，保留当前关节角度与方向。</p>
+          {mappingOwnedByExecution.value && <p>请先在 VLA 切回模拟机，再执行校准。</p>}
+        </article>
+      )}
       <article class={style.panelCard}>
+        {mappingOwnedByExecution.value && <p>请先停止这台实机的控制环，再修改肢体映射或方向。</p>}
         <div class={style.panelHeader}>
           <button
             class={style.panelTitleButton}
@@ -687,7 +749,7 @@ export const DebugPage = defineComponent(() => {
                 <span>肢体名</span>
                 <span
                   class={
-                    store.state.jointRangeStates.some((state) => state.belowMin)
+                    store.state.loop?.jointRangeStates.some((state) => state.belowMin)
                       ? style.rangeMinTitle
                       : undefined
                   }
@@ -696,7 +758,7 @@ export const DebugPage = defineComponent(() => {
                 </span>
                 <span
                   class={
-                    store.state.jointRangeStates.some((state) => state.aboveMax)
+                    store.state.loop?.jointRangeStates.some((state) => state.aboveMax)
                       ? style.rangeMaxTitle
                       : undefined
                   }
@@ -748,7 +810,12 @@ export const DebugPage = defineComponent(() => {
                 <span>{slotId}</span>
                 <div class={style.bindingControl}>
                   <Select
-                    value={String(bindingFor(slotId)?.physicalId ?? officialServoIds[index])}
+                    disabled={mappingEditDisabled.value}
+                    value={
+                      bindingFor(slotId)?.physicalId == null
+                        ? ""
+                        : String(bindingFor(slotId)?.physicalId)
+                    }
                     onClick={(event: MouseEvent) => {
                       event.stopPropagation();
                       selectBinding(index + 1);
@@ -761,6 +828,7 @@ export const DebugPage = defineComponent(() => {
                       void updateBinding(slotId, value);
                     }}
                   >
+                    <option value="">未绑定</option>
                     {!bindingOptionsFor(index).some(
                       (option) =>
                         option.id === (bindingFor(slotId)?.physicalId ?? officialServoIds[index]),
@@ -781,7 +849,8 @@ export const DebugPage = defineComponent(() => {
                   >
                     <button
                       type="button"
-                      disabled={!physicalConnected.value}
+                      aria-label={`${slotId} 方向`}
+                      disabled={!physicalConnected.value || mappingEditDisabled.value}
                       onClick={() =>
                         void updateDirection(slotId, directionFor(slotId) === 1 ? -1 : 1)
                       }
@@ -866,15 +935,18 @@ export async function deleteAction(id: string) {
   store.state.actions = store.state.actions.filter((action) => action.id !== id);
 }
 
-export async function openLoop(physicalMachineId: string) {
+export async function openLoop(physicalMachineId: string, virtualMachineId?: string) {
   const store = useDesktopStore();
-  if (!store.state.selectedVirtualMachine) throw new Error("请选择模拟机");
-  store.state.loop = await commands.runtimeOpen({
-    virtualMachineId: store.state.selectedVirtualMachine,
-    physicalMachineId,
-    access: "read_only",
-    policyId: null,
-  });
+  const virtualId = virtualMachineId ?? store.state.selectedVirtualMachine;
+  if (!virtualId) throw new Error("请选择模拟机");
+  store.applyLoopStatus(
+    await commands.runtimeOpen({
+      virtualMachineId: virtualId,
+      physicalMachineId,
+      access: "read_only",
+      policyId: null,
+    }),
+  );
   return store.state.loop;
 }
 
@@ -883,6 +955,5 @@ export async function closeLoop() {
   await commands.runtimeClose(store.state.loop?.runtimeGeneration ?? 0, "readOnlySource");
   const remaining = await commands.loopStatus();
   // Releasing the debug source must preserve a physical execution owned by another page.
-  store.state.loop = remaining?.simulation ? null : remaining;
-  store.state.jointRangeStates = [];
+  store.state.loop = remaining;
 }

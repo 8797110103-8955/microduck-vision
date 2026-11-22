@@ -258,6 +258,7 @@ export class MemoryBackend {
     this.calls.push({ name: "officialSceneModel" });
     return {
       meshDir: "",
+      defaultFrame: { bodies: [[0, 0, 0, 1, 0, 0, 0]], markers: [] },
       model: {
         bodies: [{ name: "official-duck", geoms: [] }],
         joints: [],
@@ -324,7 +325,7 @@ export class MemoryBackend {
     this.calls.push({ name: "physicalMachines" });
     return this.physical.map((machine) => ({
       ...machine,
-      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
+      jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     }));
   }
@@ -417,13 +418,13 @@ export class MemoryBackend {
       onlineServoIds: detected.census.map((servo) => servo.servoId),
       connected: true,
       lastSeen: "刚刚",
-      jointDirections: [],
+      jointBindings: [],
     };
     this.physical.push(machine);
     return {
       ...machine,
       census: [...(machine.census ?? [])],
-      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
+      jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     };
   }
@@ -436,7 +437,7 @@ export class MemoryBackend {
     return {
       ...machine,
       census: [...(machine.census ?? [])],
-      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
+      jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     };
   }
@@ -482,7 +483,7 @@ export class MemoryBackend {
       onlineServoIds: [],
       connected: false,
       lastSeen: null,
-      jointDirections: [],
+      jointBindings: [],
     };
     this.calls.push({ name: "createPhysicalMachine", value: machine });
     this.physical.push(machine);
@@ -522,50 +523,23 @@ export class MemoryBackend {
 
   async bindPhysicalMachine(input: {
     physicalMachineId: string;
-    virtualMachineId?: string | null;
     slotId: string;
-    physicalId: number | null;
-    direction?: number | null;
+    direction: number;
   }) {
     this.calls.push({ name: "bindPhysicalMachine", value: input });
     const machine = this.physical.find((entry) => entry.id === input.physicalMachineId);
     if (!machine) throw new Error(`unknown physical machine: ${input.physicalMachineId}`);
-    const virtualMachine = this.machines.find(
-      (entry) => entry.id === (input.virtualMachineId ?? machine.virtualMachineId),
-    );
-    if (!virtualMachine)
-      throw new Error("physical machine is not associated with a virtual machine");
     if (input.direction != null && input.direction !== 1 && input.direction !== -1)
       throw new Error(`invalid joint direction: ${input.direction}`);
-    const current = virtualMachine.jointBindings?.find(
-      (binding) => binding.slotId === input.slotId,
-    );
-    const bindings = [...(virtualMachine.jointBindings ?? [])].filter(
-      (binding) => binding.slotId !== input.slotId,
-    );
-    if (input.physicalId !== null) {
-      if (!(machine.census ?? []).some((servo) => servo.servoId === input.physicalId))
-        throw new Error(`servo ${input.physicalId} is not in the machine census`);
-      bindings.push({
-        slotId: input.slotId,
-        physicalId: input.physicalId,
-        direction: current?.direction ?? 1,
-        zeroOffsetRad: current?.zeroOffsetRad ?? 0,
-        minRad: current?.minRad ?? null,
-        maxRad: current?.maxRad ?? null,
-      });
-    }
-    virtualMachine.jointBindings = bindings;
-    if (input.direction !== undefined && input.direction !== null) {
-      const directions = (machine.jointDirections ?? []).filter(
-        (binding) => binding.slotId !== input.slotId,
-      );
-      directions.push({ slotId: input.slotId, direction: input.direction });
-      machine.jointDirections = directions;
+    if (input.direction != null) {
+      machine.jointDirections = [
+        ...(machine.jointDirections ?? []).filter((binding) => binding.slotId !== input.slotId),
+        { slotId: input.slotId, direction: input.direction },
+      ];
     }
     return {
       ...machine,
-      jointDirections: machine.jointDirections?.map((binding) => ({ ...binding })),
+      jointBindings: machine.jointBindings?.map((binding) => ({ ...binding })),
       onlineServoIds: [...machine.onlineServoIds],
     };
   }
@@ -578,7 +552,6 @@ export class MemoryBackend {
     this.calls.push({ name: "bindVirtualMachine", value: input });
     const machine = this.machines.find((entry) => entry.id === input.virtualMachineId);
     if (!machine) throw new Error(`unknown virtual machine: ${input.virtualMachineId}`);
-    const current = machine.jointBindings?.find((binding) => binding.slotId === input.slotId);
     const bindings = (machine.jointBindings ?? []).filter(
       (binding) => binding.slotId !== input.slotId,
     );
@@ -586,12 +559,10 @@ export class MemoryBackend {
       bindings.push({
         slotId: input.slotId,
         physicalId: input.physicalId,
-        direction: current?.direction ?? 1,
-        zeroOffsetRad: current?.zeroOffsetRad ?? 0,
-        minRad: current?.minRad ?? null,
-        maxRad: current?.maxRad ?? null,
       });
     }
+    if (new Set(bindings.map((binding) => binding.physicalId)).size !== bindings.length)
+      throw new Error("duplicate servo ID");
     machine.jointBindings = bindings;
     return { ...machine, jointBindings: bindings.map((binding) => ({ ...binding })) };
   }
@@ -619,30 +590,14 @@ export class MemoryBackend {
     this.calls.push({ name: "validatePhysicalMachineBindings", value: id });
     const machine = this.physical.find((entry) => entry.id === id);
     if (!machine) throw new Error(`unknown physical machine: ${id}`);
-    const virtualMachine = this.machines.find((entry) => entry.id === machine.virtualMachineId);
-    const bindings = virtualMachine?.jointBindings ?? [];
-    const conflictingIds = bindings
-      .filter((binding, index) =>
-        bindings.slice(index + 1).some((other) => other.physicalId === binding.physicalId),
-      )
-      .map((binding) => binding.physicalId);
-    const validBindings = bindings.filter(
-      (binding) => !conflictingIds.includes(binding.physicalId),
-    );
-    if (virtualMachine) virtualMachine.jointBindings = validBindings;
     return { ...machine, onlineServoIds: [...machine.onlineServoIds] };
   }
 
-  async setPhysicalMachinePoseZero(id: string, virtualMachineId?: string | null) {
+  async setPhysicalMachinePoseZero(id: string, _virtualMachineId?: string | null) {
     this.calls.push({ name: "setPhysicalMachinePoseZero", value: id });
     const machine = this.physical.find((item) => item.id === id);
     if (!machine) throw new Error("unknown physical machine");
-    const virtualMachine = this.machines.find(
-      (item) => item.id === (virtualMachineId ?? machine.virtualMachineId),
-    );
-    if (!virtualMachine)
-      throw new Error("physical machine is not associated with a virtual machine");
-    virtualMachine.jointBindings = (virtualMachine.jointBindings ?? []).map((binding) => ({
+    machine.jointBindings = (machine.jointBindings ?? []).map((binding) => ({
       ...binding,
       zeroOffsetRad: 0,
     }));
@@ -926,18 +881,20 @@ export class MemoryBackend {
 
   async loopOpen(input: RuntimeOpenInput & { physicalMachineId: string }) {
     this.calls.push({ name: "loopOpen", value: input });
-    const machine = this.machines.find((entry) => entry.id === input.virtualMachineId);
     const seen = new Set<number>();
-    const duplicate = machine?.jointBindings?.find((binding) => {
-      if (seen.has(binding.physicalId)) return true;
-      seen.add(binding.physicalId);
-      return false;
-    });
+    const duplicate = this.machines
+      .find((entry) => entry.id === input.virtualMachineId)
+      ?.jointBindings?.find((binding) => {
+        if (seen.has(binding.physicalId)) return true;
+        seen.add(binding.physicalId);
+        return false;
+      });
     if (duplicate) throw new Error(`绑定冲突：舵机 ${duplicate.physicalId} 被重复绑定`);
     const count = 15;
     this.status = {
       runtimeState: "running",
       hasExecution: true,
+      activeBody: { virtualMachineId: null, physicalMachineId: input.physicalMachineId },
       simulation: null,
       readSources: [],
       runtimeGeneration: 1,
@@ -989,7 +946,10 @@ export class MemoryBackend {
         })()
       );
     }
-    if (request.kind === "policy") return this.previewLoopPolicy(request.policy_id);
+    if (request.kind === "policy") {
+      await this.previewLoopPolicy(request.policy_id);
+      return this.previewLoopCommand(request.input);
+    }
     if (request.kind === "resetWorld") return this.previewLoopResetWorld();
     if (request.kind === "action") return this.loopAction(request.action);
     this.calls.push({ name: "loopCommand", value: request.targets });
@@ -1103,6 +1063,7 @@ export class MemoryBackend {
     this.previewStatus = {
       runtimeState: "running",
       hasExecution: true,
+      activeBody: { virtualMachineId, physicalMachineId: null },
       simulation: null,
       readSources: [],
       runtimeGeneration: 1,

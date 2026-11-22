@@ -6,7 +6,7 @@ use servo::hd1910::{
     FeetechDriver, FeetechRawBus, HD1910, Hd1910Driver, STS3215, baud_code, current_ma_from_raw,
     decode_frame, decode_register, decode_xdat, encode_frame, encode_register, encode_xdat,
     model_from_identity, motion_registers, position_steps_from_rad, protocol_for_model, register,
-    registers, reset_instruction, temperature_c_from_raw, velocity_rad_s_from_raw,
+    registers, reset_instruction, temperature_c_from_raw, velocity_rad_s_from_counts,
     voltage_v_from_raw,
 };
 use servo::{
@@ -18,6 +18,29 @@ use std::collections::VecDeque;
 const SCS_IDENTITY: [u8; 2] = [5, 4];
 const STS_IDENTITY: [u8; 2] = [9, 3];
 const HD1910_IDENTITY: [u8; 2] = [10, 31];
+
+#[test]
+fn hls_center_calibration_is_one_unicast_instruction_and_requires_a_valid_status() {
+    let (mut port, written) = ScriptedPort::new(vec![vec![0xff, 0xff, 1, 2, 0, 0xfc]]);
+    servo::hd1910::send_center_calibration(&mut port, 1).unwrap();
+    assert_eq!(
+        *written.lock().unwrap(),
+        [vec![0xff, 0xff, 1, 2, 0x0b, 0xf1]]
+    );
+    for response in [
+        vec![],
+        vec![0xff, 0xff, 2, 2, 0, 0xfb],
+        vec![0xff, 0xff, 1, 2, 1, 0xfb],
+        vec![0xff, 0xff, 1, 2, 0, 0],
+    ] {
+        let (mut port, written) = ScriptedPort::new(vec![response]);
+        assert!(servo::hd1910::send_center_calibration(&mut port, 1).is_err());
+        assert_eq!(written.lock().unwrap().len(), 1);
+    }
+    let (mut port, written) = ScriptedPort::new(vec![]);
+    assert!(servo::hd1910::send_center_calibration(&mut port, 254).is_err());
+    assert!(written.lock().unwrap().is_empty());
+}
 
 #[derive(Default)]
 struct DriverBus {
@@ -121,6 +144,51 @@ fn hd1910_reads_each_position_and_velocity_block_in_id_order() {
     assert_eq!(sample.positions, [0.0, 0.0]);
     assert!(sample.velocities[0] > 0.0);
     assert!(sample.velocities[1] < 0.0);
+    assert!((sample.velocities[0] + sample.velocities[1]).abs() < 1e-12);
+}
+
+#[test]
+fn hd1910_motion_packets_use_hls_velocity_units_with_signed_counts() {
+    // HLS address 58 uses 0.732 RPM/count, not the STS SDK's fine speed unit.
+    // https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-hls/
+    // Literal wire words are independent of our register encoder.
+    for raw in [0_u16, 1, 2, 100, 0x7fff, 0x8000, 0x8001, 0x8064, 0xffff] {
+        let [lo, hi] = raw.to_le_bytes();
+        let bus = DriverBus {
+            read_answers: VecDeque::from([vec![0, 8, lo, hi]]),
+            ..DriverBus::default()
+        };
+        let mut driver = Hd1910Driver::new(bus).with_ids([4]);
+        let sample = ServoLoopDriver::read_positions(&mut driver, &[4]).unwrap();
+        let magnitude = f64::from(raw & 0x7fff);
+        let signed_counts = if raw & 0x8000 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        let expected = signed_counts * 0.732 * std::f64::consts::TAU / 60.0;
+        assert_eq!(sample.positions, [0.0]);
+        assert!(
+            (sample.velocities[0] - expected).abs() < 1e-12,
+            "wire=0x{raw:04x}, actual={}, hls_rad_s={expected}",
+            sample.velocities[0]
+        );
+    }
+}
+
+#[test]
+fn sts3215_signed_velocity_keeps_the_vendor_unit_conversion() {
+    use rustypot::servo::conversion::Conversion;
+
+    for raw in [0_u16, 1, 100, 0x7fff, 0x8001, 0x8064, 0xffff] {
+        let counts = decode_register("present_velocity", &raw.to_le_bytes()).unwrap() as i16;
+        assert!(
+            (velocity_rad_s_from_counts(ServoModel::Sts3215, counts)
+                - sts3215::Velocity::from_raw(raw))
+            .abs()
+                < 1e-12
+        );
+    }
 }
 
 #[test]
@@ -329,10 +397,10 @@ fn feetech_model_specific_reset_and_position_boundaries_are_explicit() {
         position_steps_from_rad(ServoModel::Hd1910, std::f64::consts::PI),
         Ok(4096)
     );
-    assert!(matches!(
-        position_steps_from_rad(ServoModel::Hd1910, std::f64::consts::PI + 0.001),
-        Err(ServoError::RegisterOutOfRange { .. })
-    ));
+    assert_eq!(
+        position_steps_from_rad(ServoModel::Hd1910, std::f64::consts::PI + 0.01),
+        Ok(4103)
+    );
     assert!(matches!(
         position_steps_from_rad(ServoModel::Hd1910, f64::INFINITY),
         Err(ServoError::NonFinitePosition(value)) if value.is_infinite()
@@ -341,6 +409,70 @@ fn feetech_model_specific_reset_and_position_boundaries_are_explicit() {
         position_steps_from_rad(ServoModel::Xl330M288, 0.0),
         Err(ServoError::UnknownRegister(_))
     ));
+}
+
+#[test]
+fn hd1910_continuous_feedback_round_trips_without_wrapping_or_losing_a_count() {
+    for raw in [
+        -32767, -4096, -279, -1, 0, 2048, 4095, 4108, 4115, 4754, 32767,
+    ] {
+        let angle = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, raw);
+        assert_eq!(position_steps_from_rad(ServoModel::Hd1910, angle), Ok(raw));
+        let block = servo::hd1910::position_target_block(angle).unwrap();
+        assert_eq!(
+            decode_register("goal_position", &block[1..3]).unwrap(),
+            i64::from(raw)
+        );
+    }
+    let too_far = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, 32768);
+    assert!(matches!(
+        position_steps_from_rad(ServoModel::Hd1910, too_far),
+        Err(ServoError::RegisterOutOfRange { value: 32768, .. })
+    ));
+}
+
+#[test]
+fn hd1910_prepares_the_entire_target_frame_before_any_servo_write() {
+    let mut driver = Hd1910Driver::new(DriverBus::default()).with_ids([9, 1]);
+    let too_far = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, 32768);
+    assert!(
+        ServoLoopDriver::write_positions(
+            &mut driver,
+            &[9, 1],
+            &ServoPositionTargets {
+                positions: vec![3.1707382885596207, too_far],
+            }
+        )
+        .is_err()
+    );
+    assert!(driver.into_inner().writes.is_empty());
+}
+
+#[test]
+fn hd1910_encodes_the_calibrated_goals_from_the_reported_failure() {
+    let mut driver = Hd1910Driver::new(DriverBus::default()).with_ids([9, 4, 5, 11]);
+    let targets = [
+        3.1707382885596207,
+        3.57570921656143,
+        4.150952012018545,
+        -3.3011266555298997,
+    ];
+    ServoLoopDriver::write_positions(
+        &mut driver,
+        &[9, 4, 5, 11],
+        &ServoPositionTargets {
+            positions: targets.to_vec(),
+        },
+    )
+    .unwrap();
+    let bus = driver.into_inner();
+    for ((id, addr, data), expected) in bus.writes.iter().zip(targets) {
+        assert!([9, 4, 5, 11].contains(id));
+        assert_eq!(*addr, 41);
+        let raw = decode_register("goal_position", &data[1..3]).unwrap() as i32;
+        let angle = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, raw);
+        assert!((angle - expected).abs() <= std::f64::consts::TAU / 4096.0);
+    }
 }
 
 #[test]
@@ -453,7 +585,7 @@ fn feetech_signed_magnitude_speed_and_load_vectors_are_preserved() -> Result<(),
 #[test]
 fn feetech_unit_projections_cover_position_speed_current_voltage_and_temperature() {
     assert_eq!(position_steps_from_rad(ServoModel::Hd1910, 0.0), Ok(2048));
-    assert!((velocity_rad_s_from_raw(ServoModel::Hd1910, 0) - 0.0).abs() < 1e-12);
+    assert!((velocity_rad_s_from_counts(ServoModel::Hd1910, 0) - 0.0).abs() < 1e-12);
     assert_eq!(current_ma_from_raw(ServoModel::Hd1910, 2), 13.0);
     assert_eq!(voltage_v_from_raw(ServoModel::Hd1910, 74), 7.4);
     assert_eq!(temperature_c_from_raw(ServoModel::Hd1910, 31), 31.0);

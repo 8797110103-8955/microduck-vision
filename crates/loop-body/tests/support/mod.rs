@@ -13,6 +13,7 @@ pub struct FakeDriver {
     pub torque: Option<bool>,
     pub gains: Vec<u16>,
     pub fail_reads: usize,
+    pub fail_torque_off: usize,
     pub events: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -58,6 +59,10 @@ impl ServoLoopDriver for FakeDriver {
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ServoError> {
         self.events.lock().unwrap().push("torque");
+        if !enabled && self.fail_torque_off > 0 {
+            self.fail_torque_off -= 1;
+            return Err(ServoError::Bus("fake torque-off failure".into()));
+        }
         self.torque = Some(enabled);
         Ok(())
     }

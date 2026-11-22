@@ -14,8 +14,16 @@ use tauri::{App, AppHandle, Manager, RunEvent, Wry};
 /// command dispatch stay in their own modules; lifecycle owns only startup wiring and resource
 /// registration.
 pub(crate) fn setup(app: &mut App<Wry>) -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = app.path().app_config_dir()?;
-    let state = DesktopState::load(config_dir);
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("resolve application configuration directory: {error}"))?;
+    let state = DesktopState::load(config_dir.clone()).map_err(|error| {
+        format!(
+            "load application state at {}: {error}",
+            config_dir.display()
+        )
+    })?;
     state.set_app_handle(app.handle().clone());
     app.manage(state);
     app.manage(DeviceWatcher::start(app.handle().clone()));
@@ -32,5 +40,11 @@ pub(crate) fn handle_event(app: &AppHandle<Wry>, event: RunEvent) {
     let _ = control::close(state.inner());
     if let Ok(mut preview) = state.runtime_loop.lock() {
         *preview = None;
+    }
+    if let Err(error) = state.world_placements.flush() {
+        crate::logging::append_control_event(
+            state.config_dir.as_deref(),
+            format!("world_placement_save_failed error={error}"),
+        );
     }
 }

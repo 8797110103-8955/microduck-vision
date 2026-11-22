@@ -91,6 +91,21 @@ impl BodyLoop {
         Ok(())
     }
 
+    /// Establish the measured hold target before enabling torque, then wait for Drive(true).
+    pub fn arm_at_current_pose(&mut self) -> Result<(), LoopError> {
+        if self.phase == LoopPhase::Estop {
+            return Err(LoopError::InvalidAction(self.phase));
+        }
+        self.read_sensors_only(self.config.period)?;
+        let positions = self.body.read_state().positions;
+        self.adapter.write(&positions)?;
+        self.last_targets = positions;
+        self.command = None;
+        self.send(LoopAction::Power(true))?;
+        self.phase = LoopPhase::Holding;
+        Ok(())
+    }
+
     pub fn send(&mut self, action: LoopAction) -> Result<(), LoopError> {
         match action {
             LoopAction::Power(true) => {
@@ -121,9 +136,9 @@ impl BodyLoop {
                 self.phase = LoopPhase::Holding;
             }
             LoopAction::Stop => {
+                self.adapter.set_torque(false)?;
                 self.phase = LoopPhase::Stopped;
                 self.command = None;
-                self.adapter.set_torque(false)?;
             }
             LoopAction::Estop => {
                 self.phase = LoopPhase::Estop;

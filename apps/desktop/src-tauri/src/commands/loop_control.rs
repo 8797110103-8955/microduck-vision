@@ -33,6 +33,24 @@ pub(crate) fn runtime_reconfigure(
 
 #[tauri::command]
 #[specta::specta]
+pub(crate) fn runtime_select_body(
+    state: State<'_, DesktopState>,
+    generation: u32,
+    execution_generation: u32,
+    virtual_machine_id: String,
+    physical_machine_id: Option<String>,
+) -> Result<LoopStatus, String> {
+    loop_service::select_body(
+        state.inner(),
+        u64::from(generation),
+        u64::from(execution_generation),
+        virtual_machine_id,
+        physical_machine_id,
+    )
+}
+
+#[tauri::command]
+#[specta::specta]
 pub(crate) fn runtime_command(
     state: State<'_, DesktopState>,
     generation: u32,

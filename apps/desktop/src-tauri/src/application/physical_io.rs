@@ -50,7 +50,7 @@ pub(crate) fn with_bus_locked<T>(
                 if runtime.physical().is_err() {
                     return Err("physical writes are disabled in this runtime configuration".into());
                 }
-                if runtime.has_policy() {
+                if runtime.has_policy() || runtime.has_policy_execution() {
                     return Err("policy owns the physical execution source; use runtime actions or switch to manual control".into());
                 }
                 if state

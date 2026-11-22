@@ -19,14 +19,14 @@ pub(crate) fn virtual_machine_create(
         input.name.trim().to_owned()
     };
     let machine = VirtualMachine {
-        id: format!("virtual-{}", machines.len() + 1),
+        id: crate::helpers::new_machine_id("virtual"),
         name,
         body_id: input.body_id,
         servo_model,
         simulation: input.simulation,
         startup_selected: false,
         referenced_by: Vec::new(),
-        joint_bindings: Vec::new(),
+        joint_bindings: crate::helpers::default_joint_bindings(),
     };
     machines.push(machine.clone());
     drop(machines);
@@ -106,6 +106,35 @@ pub(crate) fn virtual_machine_rename(
 mod tests {
     use super::*;
     use crate::helpers::default_simulation;
+
+    #[test]
+    fn recreating_a_machine_gets_a_new_identity_and_its_own_default_bindings() {
+        let state = DesktopState::new(None);
+        let input = VirtualMachineInput {
+            name: "same name".into(),
+            body_id: "official".into(),
+            servo_model: "hd1910".into(),
+            simulation: default_simulation(duck_body::ServoModelKey::Hd1910),
+        };
+        let first = virtual_machine_create(&state, input.clone()).unwrap();
+        assert!(uuid::Uuid::parse_str(first.id.strip_prefix("virtual-").unwrap()).is_ok());
+        crate::application::binding::virtual_machine_bind(
+            &state,
+            crate::types::VirtualMachineBindingInput {
+                virtual_machine_id: first.id.clone(),
+                slot_id: "left_hip_yaw".into(),
+                physical_id: Some(7),
+            },
+        )
+        .unwrap();
+        virtual_machine_delete(&state, first.id.clone()).unwrap();
+        let second = virtual_machine_create(&state, input).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            second.joint_bindings,
+            crate::helpers::default_joint_bindings()
+        );
+    }
 
     #[test]
     fn virtual_machine_service_updates_world_position_without_tauri() {

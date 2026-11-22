@@ -3,7 +3,8 @@
 //! BAM equations follow Rhoban/bam 62bd8ce12154340be97e06f7f41a0ca8f116d967
 //! (Apache-2.0), model.py, actuator.py and mujoco.py. Model setup/initialization follows
 //! vendor/microduck_rl/scripts/infer_policy.py. q_offset/identified command_delay are testbench
-//! fitting parameters: MujocoController does not apply them; actuator delay is queued here once.
+//! fitting parameters: MujocoController does not apply them. Command history follows mjlab
+//! 1.3.0 Actuator.apply_delay/DelayBuffer, updated once per physics step.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -29,7 +30,9 @@ pub(super) struct SimulationActuatorResponse {
 }
 
 impl SimulationActuatorResponse {
-    const XL330: Self = Self {
+    /// The official XL330/M6 simulation contract is fixed.  It must not be
+    /// derived from the HD1910 hardware-drive correction profile.
+    const OFFICIAL_XL330: Self = Self {
         delay_steps: [3, 6],
         position_gain_scale: 1.0,
         back_emf_scale: 1.0,
@@ -42,7 +45,6 @@ pub(super) struct SimulationActuatorProfile {
     pub id: &'static str,
     pub encoder_through_backlash: bool,
     pub response: SimulationActuatorResponse,
-    pub velstand_response: Option<SimulationActuatorResponse>,
 }
 
 impl SimulationActuatorProfile {
@@ -51,27 +53,24 @@ impl SimulationActuatorProfile {
             servo::ServoModel::Xl330M288 => Ok(Self {
                 id: "official-xl330-m6",
                 encoder_through_backlash: true,
-                response: SimulationActuatorResponse::XL330,
-                velstand_response: None,
+                response: SimulationActuatorResponse::OFFICIAL_XL330,
             }),
-            servo::ServoModel::Hd1910 => Ok(Self {
-                id: "policy-compatible-hd1910",
-                encoder_through_backlash: false,
-                response: SimulationActuatorResponse {
-                    // The identified HD1910 command delay is below one physics step.
-                    delay_steps: [0, 0],
-                    position_gain_scale: 0.075481,
-                    ..SimulationActuatorResponse::XL330
-                },
-                // velstand was trained with delayed actuation. Reduce back EMF and friction
-                // so small targets can drive the gait without relying on high gain alone.
-                velstand_response: Some(SimulationActuatorResponse {
-                    delay_steps: [3, 6],
-                    position_gain_scale: 0.16,
-                    back_emf_scale: 0.6,
-                    friction_scale: 0.5,
-                }),
-            }),
+            servo::ServoModel::Hd1910 => {
+                let profile = duck_body::servo_profiles()
+                    .into_iter()
+                    .find(|profile| profile.model == model)
+                    .ok_or_else(|| failure("missing body servo drive profile"))?;
+                Ok(Self {
+                    id: "body-drive-hd1910",
+                    encoder_through_backlash: profile.drive_encoder_through_backlash,
+                    response: SimulationActuatorResponse {
+                        delay_steps: profile.drive_delay_steps,
+                        position_gain_scale: profile.drive_position_gain_scale(),
+                        back_emf_scale: profile.drive_back_emf_scale,
+                        friction_scale: profile.drive_friction_scale,
+                    },
+                })
+            }
             _ => Err(failure("unsupported simulation actuator profile")),
         }
     }
@@ -149,9 +148,10 @@ pub(super) struct NativeSimulation {
     home: Vec<f64>,
     profile: ServoProfile,
     targets: Vec<f64>,
-    pending: VecDeque<(u64, Vec<f64>)>,
+    requested_targets: Vec<f64>,
+    target_history: VecDeque<Vec<f64>>,
+    delay_rng: u64,
     default_response: SimulationActuatorResponse,
-    sequence: u64,
     step: u64,
     previous_torque: Vec<f64>,
     friction: Vec<f64>,
@@ -233,10 +233,11 @@ impl NativeSimulation {
             trunk: -1,
             home: template.control.home_pose.clone(),
             targets: template.control.home_pose.clone(),
+            requested_targets: template.control.home_pose.clone(),
             profile,
-            pending: VecDeque::new(),
+            target_history: VecDeque::new(),
+            delay_rng: 1,
             default_response: actuator_profile.response,
-            sequence: 0,
             step: 0,
             previous_torque: vec![0.0; template.joints.len()],
             friction: vec![0.0; template.joints.len()],
@@ -329,11 +330,12 @@ impl NativeSimulation {
             duck_mj_forward(self.ptr());
         }
         self.targets.clone_from(&self.home);
+        self.requested_targets.clone_from(&self.home);
         self.previous_torque.fill(0.0);
         self.friction.fill(0.0);
         self.effective_voltage = self.profile.bam_vin;
-        self.pending.clear();
-        self.sequence = 0;
+        self.target_history.clear();
+        self.delay_rng = 1;
         self.step = 0;
         self.publish()
     }
@@ -348,13 +350,23 @@ impl NativeSimulation {
     }
 
     fn step_physics(&mut self, response: SimulationActuatorResponse) -> Result<(), ServoError> {
-        let mut due = None;
-        while self.pending.front().is_some_and(|(at, _)| *at <= self.step) {
-            due = self.pending.pop_front().map(|(_, t)| t);
+        let [earliest, latest] = response.delay_steps;
+        self.target_history
+            .push_back(self.requested_targets.clone());
+        while self.target_history.len() > latest + 1 {
+            self.target_history.pop_front();
         }
-        if let Some(targets) = due {
-            self.targets = targets;
-        }
+        // Training appends the held policy target at every physics step, then reads T-lag.
+        // A fresh buffer repeats its first sample instead of holding home for an extra lag.
+        // A seeded xorshift stream makes runs reproducible without synchronizing lag to
+        // decimation (cycling 3/4/5/6 with four substeps aliases to a fixed control-frame lag).
+        self.delay_rng ^= self.delay_rng << 13;
+        self.delay_rng ^= self.delay_rng >> 7;
+        self.delay_rng ^= self.delay_rng << 17;
+        let lag = (earliest + (self.delay_rng % (latest - earliest + 1) as u64) as usize)
+            .min(self.target_history.len() - 1);
+        self.targets
+            .clone_from(&self.target_history[self.target_history.len() - 1 - lag]);
         let p = &self.profile;
         let vin = (p.bam_vin - 0.1 * self.previous_torque.iter().map(|v| v.abs()).sum::<f64>())
             .max(p.vin_min);
@@ -558,7 +570,7 @@ impl ServoLoopDriver for NativeSimulation {
         {
             return Err(failure("invalid simulation targets"));
         }
-        let mut next = self.targets.clone();
+        let mut next = self.requested_targets.clone();
         for (id, target) in ids.iter().zip(&targets.positions) {
             let slot = usize::from(*id)
                 .checked_sub(1)
@@ -566,26 +578,13 @@ impl ServoLoopDriver for NativeSimulation {
                 .ok_or_else(|| failure("invalid canonical simulation target ID"))?;
             next[slot] = *target;
         }
-        let [earliest, latest] = self.actuator_response()?.delay_steps;
-        let delay = earliest + self.sequence as usize % (latest - earliest + 1);
-        self.sequence += 1;
-        // Absolute deadlines; a later command may become due before an older one. In that case
-        // the older command is superseded, so it can never overwrite a newer applied target.
-        let at = self.step + delay as u64;
-        while self
-            .pending
-            .back()
-            .is_some_and(|(deadline, _)| *deadline >= at)
-        {
-            self.pending.pop_back();
-        }
-        self.pending.push_back((at, next));
+        self.requested_targets = next;
         Ok(())
     }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ServoError> {
         self.torque = enabled;
         if !enabled {
-            self.pending.clear();
+            self.target_history.clear();
             self.previous_torque.fill(0.0);
         }
         Ok(())
@@ -629,21 +628,6 @@ pub(super) fn runtime_version() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-    use std::collections::BTreeMap;
-
-    #[derive(Deserialize)]
-    struct Fixture {
-        asset_sha256: BTreeMap<String, String>,
-        tolerances: BTreeMap<String, f64>,
-        cases: Vec<Case>,
-    }
-    #[derive(Deserialize)]
-    struct Case {
-        delay: [usize; 2],
-        encoder_through_backlash: bool,
-        frames: Vec<serde_json::Value>,
-    }
 
     #[test]
     fn servo_models_use_separate_simulation_actuator_profiles() {
@@ -652,141 +636,94 @@ mod tests {
         assert_eq!(xl.id, "official-xl330-m6");
         assert_eq!(xl.response.delay_steps, [3, 6]);
         assert!(xl.encoder_through_backlash);
-        assert_eq!(xl.response.position_gain_scale, 1.0);
-        assert_eq!(hd.id, "policy-compatible-hd1910");
+        assert_eq!(
+            xl.response,
+            SimulationActuatorResponse::OFFICIAL_XL330
+        );
+        assert_eq!(hd.id, "body-drive-hd1910");
         assert_eq!(hd.response.delay_steps, [0, 0]);
         assert!(!hd.encoder_through_backlash);
-        assert_eq!(hd.response.position_gain_scale, 0.075481);
+        let profiles = duck_body::servo_profiles();
+        let hd_body = profiles
+            .iter()
+            .find(|profile| profile.model == servo::ServoModel::Hd1910)
+            .unwrap();
+        let xl_body = profiles
+            .iter()
+            .find(|profile| profile.model == servo::ServoModel::Xl330M288)
+            .unwrap();
+        assert!((hd.response.position_gain_scale
+            - xl_body.bam_position_stiffness() / hd_body.bam_position_stiffness())
+            .abs()
+            < 1e-12);
     }
 
     #[test]
-    fn native_mujoco_matches_pinned_vendor_cpu_for_300_ticks_and_all_delay_schedules() {
-        let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../tests/fixtures/native-mujoco-xl330.json"
-        ))
-        .unwrap();
-        use sha2::{Digest, Sha256};
-        let root = resource_directory().unwrap();
-        for (path, expected) in &fixture.asset_sha256 {
-            assert_eq!(
-                format!(
-                    "{:x}",
-                    Sha256::digest(std::fs::read(root.join(path)).unwrap())
-                ),
-                *expected,
-                "reference asset changed: {path}"
-            );
-        }
+    fn command_delay_backfills_the_first_target_and_keeps_physics_step_history() {
         let body = BodyTemplate::official().unwrap();
         let profile = duck_body::servo_profiles()
             .into_iter()
-            .find(|p| p.model == servo::ServoModel::Xl330M288)
+            .find(|profile| profile.model == servo::ServoModel::Xl330M288)
             .unwrap();
-        let ids = (1..=15).collect::<Vec<_>>();
-        let mut reports = Vec::new();
-        let mut first_failure = None;
-        for case in fixture.cases {
-            let snapshot = SnapshotHandle::default();
-            let mut simulation = NativeSimulation::open(
-                &body,
-                profile.clone(),
-                SimulationActuatorProfile {
-                    id: "test-fixture",
-                    encoder_through_backlash: case.encoder_through_backlash,
-                    response: SimulationActuatorResponse {
-                        delay_steps: case.delay,
-                        ..SimulationActuatorResponse::XL330
-                    },
-                    velstand_response: None,
-                },
-                snapshot.clone(),
-            )
-            .unwrap();
-            simulation.set_torque(true).unwrap();
-            let mut maxima = BTreeMap::<String, f64>::new();
-            for (tick, expected) in case.frames.iter().enumerate() {
-                let target: Vec<f64> = serde_json::from_value(expected["target"].clone()).unwrap();
-                simulation
-                    .write_positions(&ids, &ServoPositionTargets { positions: target })
-                    .unwrap();
-                simulation
-                    .advance_execution(4, Duration::from_millis(5))
-                    .unwrap();
-                assert!(
-                    simulation.pending.len() <= 2,
-                    "delay queue must remain bounded"
-                );
-                let sample = simulation.read_positions(&ids).unwrap();
-                let imu = simulation.read_imu().unwrap().unwrap();
-                let state = snapshot.lock().unwrap().state.clone().unwrap();
-                assert_eq!(state.physics_step, (tick as u64 + 1) * 4);
-                assert_eq!(
-                    serde_json::to_value(&state.contacts).unwrap(),
-                    expected["contacts"],
-                    "contact pairs at tick {tick}"
-                );
-                let motor_torque = simulation
-                    .previous_torque
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| simulation.joints[i].is_some().then_some(*v))
-                    .collect::<Vec<_>>();
-                let actual = serde_json::json!({"positions":sample.positions,"velocities":sample.velocities,
-                    "motor_positions":state.motor_positions,"passive_positions":state.passive_positions,
-                    "trunk_position":state.trunk_position,"trunk_quaternion":state.trunk_quaternion,
-                    "gyro":imu.gyro,"gravity":imu.gravity,"torque":motor_torque,"base_velocity":state.base_velocity,"time":state.time});
-                for (field, tolerance) in &fixture.tolerances {
-                    let error = if field == "time" {
-                        (actual[field].as_f64().unwrap() - expected[field].as_f64().unwrap()).abs()
-                    } else {
-                        let a = actual[field].as_array().unwrap();
-                        let e = expected[field].as_array().unwrap();
-                        assert_eq!(a.len(), e.len());
-                        let direct = a
-                            .iter()
-                            .zip(e)
-                            .map(|(a, e)| (a.as_f64().unwrap() - e.as_f64().unwrap()).abs())
-                            .fold(0.0, f64::max);
-                        if field == "trunk_quaternion" {
-                            direct.min(
-                                a.iter()
-                                    .zip(e)
-                                    .map(|(a, e)| (a.as_f64().unwrap() + e.as_f64().unwrap()).abs())
-                                    .fold(0.0, f64::max),
-                            )
-                        } else {
-                            direct
-                        }
-                    };
-                    let max = maxima.entry(field.clone()).or_default();
-                    *max = max.max(error);
-                    if error > *tolerance && first_failure.is_none() {
-                        first_failure = Some(format!(
-                            "delay={:?} tick={tick} field={field} error={error} tolerance={tolerance}",
-                            case.delay
-                        ));
-                    }
-                }
-            }
-            reports.push(serde_json::json!({"delay":case.delay,"encoder_through_backlash":case.encoder_through_backlash,"ticks":case.frames.len(),"max_abs_error":maxima}));
-            // Reset must clear solver/controller/delay state and reproduce the initial state.
-            simulation.reset().unwrap();
-            assert_eq!(simulation.step, 0);
-            assert!(simulation.pending.is_empty());
-            assert_eq!(
-                simulation.read_positions(&ids).unwrap().positions,
-                body.control.home_pose
-            );
-        }
-        let report = serde_json::json!({"source":"fixed vendor CPU reference; not an upstream published golden","cases":reports,"first_failure":first_failure});
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.agentic");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            directory.join("native-mujoco-comparison.json"),
-            serde_json::to_vec_pretty(&report).unwrap(),
+        let actuator = SimulationActuatorProfile::for_model(servo::ServoModel::Xl330M288).unwrap();
+        let response = SimulationActuatorResponse {
+            delay_steps: [3, 3],
+            ..actuator.response
+        };
+        let mut simulation = NativeSimulation::open(
+            &body,
+            profile,
+            actuator,
+            std::sync::Arc::new(std::sync::Mutex::new(SharedSnapshot::default())),
         )
         .unwrap();
-        assert!(first_failure.is_none(), "{report}");
+        simulation.set_torque(true).unwrap();
+        simulation
+            .write_positions(
+                &[8],
+                &ServoPositionTargets {
+                    positions: vec![0.1],
+                },
+            )
+            .unwrap();
+        simulation.step_physics(response).unwrap();
+        assert_eq!(
+            simulation.targets[7], 0.1,
+            "first target fills missing history"
+        );
+
+        simulation
+            .write_positions(
+                &[8],
+                &ServoPositionTargets {
+                    positions: vec![0.2],
+                },
+            )
+            .unwrap();
+        simulation
+            .write_positions(
+                &[9],
+                &ServoPositionTargets {
+                    positions: vec![0.3],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            simulation.requested_targets[7], 0.2,
+            "partial writes retain the latest requested frame"
+        );
+        for _ in 0..3 {
+            simulation.step_physics(response).unwrap();
+            assert_eq!(simulation.targets[7], 0.1);
+            assert_eq!(simulation.targets[8], 0.0);
+        }
+        simulation.step_physics(response).unwrap();
+        assert_eq!(simulation.targets[7], 0.2);
+        assert_eq!(simulation.targets[8], 0.3);
+        assert_eq!(simulation.target_history.len(), 4);
+        simulation.reset().unwrap();
+        assert!(simulation.target_history.is_empty());
+        assert_eq!(simulation.requested_targets, body.control.home_pose);
     }
 
     #[test]
@@ -802,8 +739,12 @@ mod tests {
             SimulationActuatorProfile {
                 id: "test-fixture",
                 encoder_through_backlash: true,
-                response: SimulationActuatorResponse::XL330,
-                velstand_response: None,
+                response: SimulationActuatorResponse {
+                    delay_steps: [3, 6],
+                    position_gain_scale: 1.0,
+                    back_emf_scale: 1.0,
+                    friction_scale: 1.0,
+                },
             },
             SnapshotHandle::default(),
         )

@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn official_source_is_visible_before_download() {
-        let root = std::env::temp_dir().join("microduck-vision-no-policy-config");
+        let root = crate::helpers::test_directory().join("microduck-vision-no-policy-config");
         let _ = std::fs::remove_dir_all(&root);
         let config = root.join("config");
         write_manifest(&config);
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn selecting_a_missing_policy_is_rejected() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::helpers::test_directory().join(format!(
             "microduck-vision-policy-test-{}",
             std::process::id()
         ));

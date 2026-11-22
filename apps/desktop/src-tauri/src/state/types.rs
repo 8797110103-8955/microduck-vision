@@ -1,5 +1,103 @@
 pub use duck_body::{ServoCatalogEntry, ServoModelKey};
+use crate::backend::encoder_calibration::EncoderSnapshot;
+use duck_body::JointCalibration;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingCalibration {
+    pub(crate) physical_id: String,
+    pub(crate) operation_id: String,
+    pub(crate) joint: JointCalibration,
+    pub(crate) before: EncoderSnapshot,
+    pub(crate) body_angle_rad: f64,
+    pub(crate) new_zero_offset_rad: Option<f64>,
+    pub(crate) after: Option<EncoderSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingInfo {
+    pub id: String,
+    pub app_session_id: String,
+    pub duck_id: String,
+    pub name: String,
+    pub path: String,
+    pub started_at_ms: f64,
+    pub ended_at_ms: Option<f64>,
+    pub state: String,
+    pub frames: u32,
+    pub dropped_frames: u32,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingPolicy {
+    pub observation: Vec<f32>,
+    pub action: Vec<f32>,
+    pub raw_targets: Option<Vec<f64>>,
+    pub applied_targets: Option<Vec<f64>>,
+    pub twist: [f64; 3],
+    pub head: [f64; 4],
+    pub body: [f64; 3],
+    pub positions: Vec<f64>,
+    pub velocities: Vec<f64>,
+    pub valid: Vec<bool>,
+    pub gyro: [f64; 3],
+    pub gravity: [f64; 3],
+    pub imu_source: String,
+    pub saturation_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingFrame {
+    pub recording_id: String,
+    pub duck_id: String,
+    pub segment_id: u32,
+    pub episode_id: u32,
+    pub elapsed_s: f64,
+    pub control_started_s: f64,
+    pub status: LoopStatus,
+    pub policy: Option<RecordingPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingWindow {
+    pub id: String,
+    pub segment_id: u32,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingMetric {
+    pub field: String,
+    pub samples: u32,
+    pub rmse: f64,
+    pub max_error: f64,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingComparison {
+    pub metrics: Vec<RecordingMetric>,
+    pub matched_frames: u32,
+    pub unmatched_frames: u32,
+    pub path: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingExport {
+    pub path: String,
+    pub samples: u32,
+    pub excluded_frames: u32,
+}
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +118,8 @@ pub struct TrainingStartInput {
     pub experiment_id: Option<String>,
     pub recipe: String,
     pub teacher_motion_provenance: String,
+    #[serde(default)]
+    pub dataset_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, specta::Type)]
@@ -158,21 +258,24 @@ pub enum RuntimeCloseScope {
 }
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PhysicalMachineBindingInput {
     pub physical_machine_id: String,
-    #[serde(default)]
-    pub virtual_machine_id: Option<String>,
     pub slot_id: String,
-    pub physical_id: Option<u8>,
-    #[serde(default)]
-    pub direction: Option<i8>,
+    pub direction: i8,
 }
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualMachineBindingInput {
     pub virtual_machine_id: String,
+    pub slot_id: String,
+    pub physical_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualJointBindingInput {
     pub slot_id: String,
     pub physical_id: Option<u8>,
 }
@@ -285,6 +388,7 @@ pub struct SimulationState {
 pub struct SceneInfo {
     pub model: SceneModel,
     pub mesh_dir: String,
+    pub default_frame: SceneFrame,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -296,6 +400,7 @@ pub struct SimulationParameters {
     pub kp: f64,
     pub force_range: f64,
     #[serde(default)]
+    /// Scene placement offset in metres, using the MuJoCo right-handed Z-up basis.
     pub world_position: [f64; 3],
 }
 
@@ -310,7 +415,7 @@ pub struct VirtualMachine {
     pub startup_selected: bool,
     pub referenced_by: Vec<String>,
     #[serde(default)]
-    pub joint_bindings: Vec<ServoJointBinding>,
+    pub joint_bindings: Vec<VirtualJointBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -334,10 +439,20 @@ pub struct PhysicalMachine {
     pub last_seen: Option<String>,
     #[serde(default)]
     pub torque_enabled: bool,
-    /// Per-real-machine joint direction overrides.  These belong to the robot
-    /// installation and are persisted with the physical-machine cache.
+    /// Installation direction overrides, independent of the virtual body's servo IDs.
     #[serde(default)]
     pub joint_directions: Vec<ServoJointDirection>,
+    /// Installation zero and limits keyed by body slot; bus IDs belong to the virtual machine.
+    #[serde(default)]
+    pub joint_bindings: Vec<ServoJointCalibration>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderCalibrationResult {
+    pub machine: PhysicalMachine,
+    pub calibrated_servo_ids: Vec<u8>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
@@ -360,8 +475,9 @@ pub struct JointRange {
     pub max_rad: f64,
 }
 
-/// The physical Dynamixel assigned to one body actuator slot.  The slot name is
-/// the stable body-side identity; the ID is allowed to vary per robot.
+/// A merged body-to-servo calibration used by the loop boundary. The virtual
+/// machine supplies the ID; the selected physical machine supplies direction
+/// and installation calibration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ServoJointBinding {
@@ -376,12 +492,43 @@ pub struct ServoJointBinding {
     pub max_rad: Option<f64>,
 }
 
+/// A virtual machine's body slot to the physical servo ID used when a physical
+/// machine is attached. Direction and installation calibration belong to the
+/// selected physical machine and are merged at body construction time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VirtualJointBinding {
+    pub slot_id: String,
+    pub physical_id: u8,
+}
+
 /// Direction override for a physical robot installation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ServoJointDirection {
     pub slot_id: String,
     pub direction: i8,
+}
+
+/// Installation zero and limits belong to a physical limb, independently of bus IDs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServoJointCalibration {
+    pub slot_id: String,
+    pub zero_offset_rad: f64,
+    pub min_rad: Option<f64>,
+    pub max_rad: Option<f64>,
+}
+
+impl From<&ServoJointBinding> for ServoJointCalibration {
+    fn from(binding: &ServoJointBinding) -> Self {
+        Self {
+            slot_id: binding.slot_id.clone(),
+            zero_offset_rad: binding.zero_offset_rad,
+            min_rad: binding.min_rad,
+            max_rad: binding.max_rad,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -466,8 +613,16 @@ pub struct JointRangeState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
+pub struct ActiveBody {
+    pub virtual_machine_id: Option<String>,
+    pub physical_machine_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct LoopStatus {
     pub has_execution: bool,
+    pub active_body: Option<ActiveBody>,
     pub runtime_state: RuntimeState,
     pub simulation: Option<SimulationState>,
     pub phase: LoopPhase,
@@ -533,6 +688,7 @@ pub enum ReadSourceHealth {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorldState {
+    /// Accumulated scene displacement in the MuJoCo X/Y plane, in metres.
     pub position: [f64; 2],
     pub yaw: f64,
     pub distance_m: f64,
@@ -572,6 +728,7 @@ pub enum RuntimeCommand {
     },
     Policy {
         policy_id: String,
+        input: PreviewInput,
     },
     Action {
         action: LoopAction,

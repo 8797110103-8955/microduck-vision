@@ -6,6 +6,17 @@
 use super::*;
 use crate::application::binding as binding_service;
 use crate::application::virtual_machine as service;
+use crate::types::VirtualJointBindingInput;
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn virtual_machine_bindings(
+    state: State<'_, DesktopState>,
+    virtual_machine_id: String,
+    bindings: Vec<VirtualJointBindingInput>,
+) -> Result<VirtualMachine, String> {
+    binding_service::virtual_machine_bindings(state.inner(), virtual_machine_id, bindings)
+}
 
 #[tauri::command]
 #[specta::specta]

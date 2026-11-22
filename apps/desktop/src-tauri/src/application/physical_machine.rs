@@ -35,7 +35,7 @@ pub(crate) fn physical_machine_save(
     };
     let hint = input.reconnect_hint;
     let machine = PhysicalMachine {
-        id: format!("physical-{}", machines.len() + 1),
+        id: crate::helpers::new_machine_id("physical"),
         name: input
             .name
             .and_then(|name| (!name.trim().is_empty()).then(|| name.trim().to_owned()))
@@ -53,6 +53,7 @@ pub(crate) fn physical_machine_save(
         last_seen: Some("刚刚".into()),
         torque_enabled: false,
         joint_directions: Vec::new(),
+        joint_bindings: Vec::new(),
     };
     let pending_bus_key = hint
         .as_ref()
@@ -66,6 +67,19 @@ pub(crate) fn physical_machine_save(
     )?;
     state.persist()?;
     Ok(machine)
+}
+
+pub(crate) fn physical_servo_model(machine: &PhysicalMachine) -> Result<servo::ServoModel, String> {
+    let first = machine.census.first().ok_or("真机没有舵机清单")?;
+    let key = crate::helpers::model_key(&first.model.to_ascii_lowercase())?;
+    if machine
+        .census
+        .iter()
+        .any(|servo| !servo.model.eq_ignore_ascii_case(&first.model))
+    {
+        return Err("当前真机总线只支持同型号舵机".into());
+    }
+    Ok(crate::helpers::model(&key))
 }
 
 pub(crate) fn physical_machine_disconnect(
@@ -140,7 +154,7 @@ pub(crate) fn physical_machine_create(
         product: None,
     });
     let machine = PhysicalMachine {
-        id: format!("physical-{}", machines.len() + 1),
+        id: crate::helpers::new_machine_id("physical"),
         name,
         usb_port: input.usb_port,
         machine_code: input.machine_code,
@@ -152,6 +166,7 @@ pub(crate) fn physical_machine_create(
         last_seen: None,
         torque_enabled: false,
         joint_directions: Vec::new(),
+        joint_bindings: Vec::new(),
     };
     machines.push(machine.clone());
     drop(machines);
@@ -274,6 +289,11 @@ pub(crate) fn physical_machine_mount(
     id: String,
     virtual_machine_id: String,
 ) -> Result<PhysicalMachine, String> {
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    super::encoder_calibration::ensure_ready(state, &id)?;
     let mut virtual_machines = state.virtual_machines.lock().map_err(|e| e.to_string())?;
     if !virtual_machines
         .iter()
@@ -304,7 +324,13 @@ pub(crate) fn physical_machine_mount(
 }
 
 pub(crate) fn physical_machine_delete(state: &DesktopState, id: String) -> Result<(), String> {
+    super::encoder_calibration::ensure_ready(state, &id)?;
     crate::control::detach_physical_connection(state, &id)?;
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    super::encoder_calibration::ensure_ready(state, &id)?;
     state
         .connected_buses
         .lock()

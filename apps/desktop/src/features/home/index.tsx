@@ -1,6 +1,15 @@
 import { sendRuntimeCommand } from "../../runtime-command";
 import * as commands from "../../../generated/types";
-import { computed, defineComponent, onMounted, onScopeDispose, ref, shallowRef, watch } from "vue";
+import {
+  computed,
+  defineComponent,
+  onMounted,
+  onScopeDispose,
+  ref,
+  shallowRef,
+  toRef,
+  watch,
+} from "vue";
 import { useEventListener } from "@vueuse/core";
 import type { LoopStatus, PolicyEntry, PreviewInput } from "../../../generated/types";
 import { ScrollArea } from "../../components/scroll-area";
@@ -15,7 +24,13 @@ import {
   servoSelectionEvent,
 } from "../../components/viewer-events";
 import { persistWorldCache, pruneWorldCache, useDesktopStore } from "../../store";
-import { DebugPage, debugBindingFor, debugPhysicalMachineFor, load } from "../debug";
+import {
+  DebugPage,
+  debugBindingFor,
+  debugBindingMachineFor,
+  debugPhysicalMachineFor,
+  load,
+} from "../debug";
 import { TrainingPage } from "../training";
 import { DuckViewer } from "./viewer";
 import style from "./style.module.scss";
@@ -38,7 +53,7 @@ const officialJointNames = [
   "right_knee",
   "right_ankle",
 ];
-const officialServoIds = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
+
 /**
  * Right edge of the official jaw.stl mesh at the mouth seam for the default
  * camera after its MJCF geom transform, expressed in the jaw_soft body frame.
@@ -71,7 +86,7 @@ const inputForPolicy = (policy: PolicyEntry | undefined): PreviewInput => ({
   twist: isWalkingPolicy(policy) ? [0.15, 0, 0] : [0, 0, 0],
   head: [0, 0, 0, 0],
   body: [0, 0, 0],
-  targetDistanceM: isWalkingPolicy(policy) ? 1 : null,
+  targetDistanceM: null,
 });
 
 export const OfficialDuckStage = defineComponent(() => {
@@ -80,24 +95,74 @@ export const OfficialDuckStage = defineComponent(() => {
   const viewer = shallowRef<DuckViewer>();
   const scene = ref<Awaited<ReturnType<typeof commands.officialSceneModel>> | null>(null);
   const frame = ref<Awaited<ReturnType<typeof commands.officialSceneFrame>> | null>(null);
-  const debug = computed(() => store.state.tab === "debug");
-  const activeLoop = computed(() =>
-    debug.value || store.state.physicalSyncEnabled ? store.state.loop : store.state.previewLoop,
+  const debug = computed(() => !store.state.recordingPlayback && store.state.tab === "debug");
+  const activeLoop = computed(() => store.state.recordingPlayback?.status ?? store.state.loop);
+  const previewPhysicalId = computed(() =>
+    !store.state.recordingPlayback && store.state.tab === "preview"
+      ? store.state.requestedPhysicalMachine
+      : null,
+  );
+  const displayingSimulation = computed(
+    () =>
+      !debug.value &&
+      !previewPhysicalId.value &&
+      !!activeLoop.value?.activeBody &&
+      !activeLoop.value.activeBody.physicalMachineId,
   );
   const cachedWorld = computed(() => {
     const machineId = store.state.selectedVirtualMachine;
     return machineId ? store.state.worldCache[machineId] : undefined;
   });
-  const displayWorld = computed(() => activeLoop.value?.world ?? cachedWorld.value);
-  const activePositions = computed(() =>
-    debug.value || store.state.physicalSyncEnabled
-      ? (store.state.rangePreview ?? store.state.loop?.positions ?? store.state.debugPose)
-      : store.state.previewLoop?.positions,
+  const displayWorld = computed(() => {
+    const body = activeLoop.value?.activeBody;
+    return body?.virtualMachineId &&
+      (!debug.value || body.virtualMachineId === store.state.selectedVirtualMachine)
+      ? activeLoop.value?.world
+      : cachedWorld.value;
+  });
+  const displayFrame = computed(() =>
+    displayingSimulation.value ? activeLoop.value?.simulation?.frame : undefined,
+  );
+  const debugSource = computed(() =>
+    activeLoop.value?.readSources.find((source) => source.id === mappedMachine.value?.id),
+  );
+  const activePositions = computed(() => {
+    const loop = activeLoop.value;
+    if (!debug.value) {
+      if (previewPhysicalId.value)
+        return loop?.activeBody?.physicalMachineId === previewPhysicalId.value
+          ? loop.positions
+          : loop?.readSources.find((source) => source.id === previewPhysicalId.value)?.positions;
+      return loop?.activeBody ? loop.positions : undefined;
+    }
+    if (store.state.debugMappingPending) return undefined;
+    const physicalId = mappedMachine.value?.id;
+    const physicalPositions =
+      physicalId && loop?.activeBody?.physicalMachineId === physicalId
+        ? loop.positions
+        : debugSource.value?.positions;
+    return store.state.rangePreview ?? physicalPositions ?? store.state.debugPose;
+  });
+  const frameContext = computed(() =>
+    JSON.stringify([
+      debug.value,
+      previewPhysicalId.value,
+      store.state.debugMappingPending,
+      selectedMachine.value?.jointBindings,
+      store.state.selectedVirtualMachine,
+      activeLoop.value?.runtimeGeneration,
+      activeLoop.value?.executionGeneration,
+      activeLoop.value?.activeBody?.physicalMachineId,
+      debugSource.value?.generation,
+      mappedMachine.value?.jointBindings,
+      mappedMachine.value?.jointDirections,
+    ]),
   );
   const markerPos = ref<({ x: number; y: number } | null)[]>([]);
   const labelPos = ref<({ x: number; y: number } | null)[]>([]);
   const selectedServoId = ref<number | null>(null);
   let frameRequestInFlight = false;
+  let diagnosedPoseContext: string | null = null;
   let pendingFramePositions: number[] | null = null;
   let stageActive = true;
 
@@ -108,49 +173,19 @@ export const OfficialDuckStage = defineComponent(() => {
       store.state.physicalMachines,
     ),
   );
-  const physicalSyncAvailable = computed(() => {
-    const machine = mappedMachine.value;
-    if (!machine?.connected || machine.onlineServoIds.length !== JOINT_COUNT) return false;
-    return new Set(machine.onlineServoIds).size === JOINT_COUNT;
-  });
   const selectedMachine = computed(() =>
     store.state.virtualMachines.find(
       (machine) => machine.id === store.state.selectedVirtualMachine,
     ),
   );
-  const rangeStateBySlot = computed(
-    () => new Map(store.state.jointRangeStates.map((state) => [state.slotId, state])),
-  );
-  watch(physicalSyncAvailable, (available) => {
-    if (!available && store.state.physicalSyncEnabled) {
-      store.state.physicalSyncEnabled = false;
-      if (store.state.loop) {
-        void commands
-          .runtimeClose(store.state.loop.runtimeGeneration, "runtime")
-          .then(() => {
-            store.state.loop = null;
-            store.state.jointRangeStates = [];
-          })
-          .catch(() => undefined);
-      }
-    }
+  const rangeStateBySlot = computed(() => {
+    const loop = activeLoop.value;
+    const states =
+      debug.value && loop?.activeBody?.physicalMachineId !== mappedMachine.value?.id
+        ? []
+        : (loop?.jointRangeStates ?? []);
+    return new Map(states.map((state) => [state.slotId, state]));
   });
-  watch(
-    () => store.state.selectedVirtualMachine,
-    (current, previous) => {
-      if (current === previous || !store.state.physicalSyncEnabled) return;
-      store.state.physicalSyncEnabled = false;
-      if (store.state.loop) {
-        void commands
-          .runtimeClose(store.state.loop.runtimeGeneration, "runtime")
-          .then(() => {
-            store.state.loop = null;
-            store.state.jointRangeStates = [];
-          })
-          .catch(() => undefined);
-      }
-    },
-  );
   watch(
     [() => store.state.virtualMachines.map((machine) => machine.id), () => store.state.loading],
     ([machineIds, loading]) => {
@@ -164,7 +199,12 @@ export const OfficialDuckStage = defineComponent(() => {
   const selectedSceneIndex = computed(() =>
     Math.max(
       0,
-      sceneMachines.value.findIndex((machine) => machine.id === store.state.selectedVirtualMachine),
+      sceneMachines.value.findIndex(
+        (machine) =>
+          machine.id ===
+          ((!debug.value && activeLoop.value?.activeBody?.virtualMachineId) ||
+            store.state.selectedVirtualMachine),
+      ),
     ),
   );
   const ghostCount = () => Math.max(sceneMachines.value.length - 1, 0);
@@ -178,8 +218,22 @@ export const OfficialDuckStage = defineComponent(() => {
       ];
     }),
   );
+  const worldPoses = computed(() =>
+    sceneMachines.value.map((machine) => store.state.worldCache[machine.id]),
+  );
   /** Every duck gets a label so selecting a machine remains visible in both views. */
-  const labels = computed(() => sceneMachines.value);
+  const labels = computed(() => {
+    const body = activeLoop.value?.activeBody;
+    const physical =
+      !debug.value &&
+      store.state.physicalMachines.find(
+        (machine) => machine.id === (previewPhysicalId.value ?? body?.physicalMachineId),
+      );
+    return sceneMachines.value.map((machine) => ({
+      id: machine.id,
+      name: physical && machine.id === body?.virtualMachineId ? physical.name : machine.name,
+    }));
+  });
   const markers = computed(() =>
     officialJointNames.map((name, index) => ({
       name,
@@ -190,7 +244,19 @@ export const OfficialDuckStage = defineComponent(() => {
       index,
       id: index + 1,
       physicalId:
-        debugBindingFor(selectedMachine.value, name)?.physicalId ?? officialServoIds[index],
+        debugBindingFor(
+          debugBindingMachineFor(
+            selectedMachine.value,
+            debug.value
+              ? mappedMachine.value
+              : store.state.physicalMachines.find(
+                  (machine) =>
+                    machine.id ===
+                    (previewPhysicalId.value ?? activeLoop.value?.activeBody?.physicalMachineId),
+                ),
+          ),
+          name,
+        )?.physicalId ?? null,
     })),
   );
   const markerState = (physicalId: number | null) => {
@@ -199,16 +265,28 @@ export const OfficialDuckStage = defineComponent(() => {
       physicalId,
       online,
       mappedMachine.value != null,
-      activeLoop.value?.sensorFailures ?? 0,
+      debugSource.value
+        ? Number(debugSource.value.health === "offline")
+        : (activeLoop.value?.sensorFailures ?? 0),
     );
   };
 
   async function refreshFrame(positions: number[]) {
-    if (!scene.value) return;
-    const simulation = activeLoop.value?.simulation;
+    if (!scene.value || (debug.value && store.state.debugMappingPending)) return;
+    const simulation = displayFrame.value;
     if (simulation) {
-      frame.value = simulation.frame;
-      viewer.value?.setSimulationFrame(simulation.frame);
+      pendingFramePositions = null;
+      frame.value = simulation;
+      const world = displayWorld.value;
+      viewer.value?.setWorldPose(world?.position ?? [0, 0], world?.yaw ?? 0);
+      if (activeLoop.value?.simulation)
+        viewer.value?.setSimulationFrame(activeLoop.value.simulation);
+      return;
+    }
+    // Reopening a read source temporarily has no sample. Keep the last real pose;
+    // synthesizing zero angles here makes the whole body jump during a direction edit.
+    if (positions.length !== JOINT_COUNT) {
+      pendingFramePositions = null;
       return;
     }
     if (frameRequestInFlight) {
@@ -217,17 +295,44 @@ export const OfficialDuckStage = defineComponent(() => {
     }
     frameRequestInFlight = true;
     try {
-      const generation = activeLoop.value?.runtimeGeneration;
-      const rawFrame = await commands.officialSceneFrame(
-        positions.length === JOINT_COUNT ? positions : Array(JOINT_COUNT).fill(0),
-      );
-      if (generation !== activeLoop.value?.runtimeGeneration || activeLoop.value?.simulation)
-        return;
+      const context = frameContext.value;
+      const source = debugSource.value;
+      const rawFrame = await commands.officialSceneFrame(positions);
+      if (!stageActive || context !== frameContext.value || displayFrame.value) return;
       const markerFrame = officialJointNames.map(
         (_, index) => rawFrame.markers[index] ?? [0, 0, 0],
       );
       frame.value = { ...rawFrame, markers: markerFrame };
       viewer.value?.setFrame(frame.value);
+      if (
+        debug.value &&
+        viewer.value &&
+        source?.positions.length === JOINT_COUNT &&
+        source.sequence > 0 &&
+        diagnosedPoseContext !== context &&
+        !store.state.rangePreview
+      ) {
+        diagnosedPoseContext = context;
+        void commands
+          .frontendDiagnostic(
+            JSON.stringify({
+              event: "debug_pose_applied",
+              physicalMachineId: mappedMachine.value?.id,
+              virtualMachineId: store.state.selectedVirtualMachine,
+              runtimeGeneration: activeLoop.value?.runtimeGeneration,
+              executionGeneration: activeLoop.value?.executionGeneration,
+              source: "readOnlySource",
+              sourceGeneration: source.generation,
+              sequence: source.sequence,
+              jointOrder: officialJointNames,
+              positions,
+              jointBindings: selectedMachine.value?.jointBindings,
+              jointCalibration: mappedMachine.value?.jointBindings,
+              jointDirections: mappedMachine.value?.jointDirections,
+            }),
+          )
+          .catch((error) => console.warn("记录调试姿态失败", error));
+      }
     } finally {
       frameRequestInFlight = false;
       if (stageActive && pendingFramePositions) {
@@ -260,10 +365,11 @@ export const OfficialDuckStage = defineComponent(() => {
       labelPos.value = labels.value.map((_, index) => v.duckScreen(index));
     };
     viewer.value.setGhosts(ghostCount(), 0.25, worldPositions.value);
+    viewer.value.setMachineWorldPoses(worldPoses.value);
     viewer.value.setSelectedDuck(selectedSceneIndex.value);
     const world = displayWorld.value;
     viewer.value.setWorldPose(world?.position ?? [0, 0], world?.yaw ?? 0);
-    await refreshFrame(activePositions.value ?? Array(JOINT_COUNT).fill(0));
+    await refreshFrame(activePositions.value ?? []);
   }
 
   useEventListener(window, focusDuckEvent, focusCurrentDuck);
@@ -298,7 +404,10 @@ export const OfficialDuckStage = defineComponent(() => {
   }
 
   function restoreDefaultPose() {
-    void refreshFrame(Array(JOINT_COUNT).fill(0));
+    if (!scene.value) return;
+    pendingFramePositions = null;
+    frame.value = scene.value.defaultFrame;
+    viewer.value?.setFrame(scene.value.defaultFrame);
   }
 
   function selectSceneDuck(event: MouseEvent) {
@@ -310,36 +419,27 @@ export const OfficialDuckStage = defineComponent(() => {
     store.state.selectedVirtualMachineManual = true;
   }
 
-  watch(
-    () => activePositions.value,
-    (positions) => {
-      if (positions) void refreshFrame(positions);
-    },
-  );
+  watch([frameContext, activePositions, displayFrame], ([, positions]) => {
+    void refreshFrame(positions ?? []);
+  });
   watch(
     () => displayWorld.value,
     (world) => {
-      if (activeLoop.value?.simulation) return;
       viewer.value?.setWorldPose(world?.position ?? [0, 0], world?.yaw ?? 0);
     },
     { deep: true },
-  );
-  watch(
-    () => activeLoop.value?.jointRangeStates,
-    (states) => {
-      store.state.jointRangeStates = states ? states.map((state) => ({ ...state })) : [];
-    },
-    { deep: true, immediate: true },
   );
   watch(
     [
       () => debug.value,
       () => sceneMachines.value,
       () => worldPositions.value,
+      () => worldPoses.value,
       () => selectedSceneIndex.value,
     ],
     () => {
       viewer.value?.setGhosts(ghostCount(), 0.25, worldPositions.value);
+      viewer.value?.setMachineWorldPoses(worldPoses.value);
       viewer.value?.setSelectedDuck(selectedSceneIndex.value);
     },
     { deep: true },
@@ -424,8 +524,6 @@ export const PreviewPage = defineComponent(() => {
   const busy = ref<string | null>(null);
   const error = ref<string | null>(null);
   const loopBusy = ref(false);
-  let pageActive = true;
-  let testRevision = 0;
   const selectedMachine = computed(() =>
     store.state.virtualMachines.find(
       (machine) => machine.id === store.state.selectedVirtualMachine,
@@ -438,16 +536,10 @@ export const PreviewPage = defineComponent(() => {
       store.state.physicalMachines,
     ),
   );
-  const physicalSyncAvailable = computed(() => {
-    const machine = physicalMachine.value;
-    if (!machine?.connected || machine.onlineServoIds.length !== JOINT_COUNT) return false;
-    return new Set(machine.onlineServoIds).size === JOINT_COUNT;
-  });
+  const physicalSyncAvailable = computed(() => physicalMachine.value?.connected === true);
   const worldAtConfiguredPosition = computed(() => {
     const machineId = selectedMachine.value?.id;
-    const activeWorld = (
-      store.state.physicalSyncEnabled ? store.state.loop : store.state.previewLoop
-    )?.world;
+    const activeWorld = runtime.value?.world;
     const world = activeWorld ?? (machineId ? store.state.worldCache[machineId] : undefined);
     if (!world) return true;
     const epsilon = 1e-6;
@@ -462,71 +554,60 @@ export const PreviewPage = defineComponent(() => {
   const selectedPolicy = computed(() =>
     cachedPolicies.value.find((policy) => policy.id === store.state.selectedPolicyId),
   );
-  const previewInput = ref<PreviewInput>({
-    twist: [0.15, 0, 0],
-    head: [0, 0, 0, 0],
-    body: [0, 0, 0],
-    targetDistanceM: 1,
-  });
-  let selectionTask = Promise.resolve();
-  watch(
-    [() => selectedMachine.value?.id, () => store.state.physicalSyncEnabled],
-    ([current, physical], previous) => {
-      if (!current || physical) return;
-      selectionTask = selectionTask
-        .catch(() => undefined)
-        .then(async () => {
-          if (
-            !pageActive ||
-            current !== selectedMachine.value?.id ||
-            store.state.physicalSyncEnabled
-          )
-            return;
-          if (previous?.[0] && current !== previous[0] && store.state.previewLoop) {
-            await commands.runtimeClose(store.state.previewLoop.runtimeGeneration, "runtime");
-            store.state.previewLoop = null;
-          }
-          await commands.previewMachineSelect(current);
-        });
-      void selectionTask.catch((reason) => {
-        if (pageActive) error.value = reason instanceof Error ? reason.message : String(reason);
-      });
-    },
-    { immediate: true, flush: "sync" },
+  const previewInput = toRef(store.state, "previewInput");
+  const runtime = computed(() =>
+    store.state.loop?.activeBody?.virtualMachineId ||
+    (store.state.loop?.runtimeState === "faulted" && store.state.loop.hasExecution)
+      ? store.state.loop
+      : null,
   );
+  const detached = computed(
+    () => runtime.value?.runtimeState === "faulted" && !runtime.value.activeBody,
+  );
+  const physicalSyncEnabled = computed(
+    () => !!store.state.requestedPhysicalMachine || !!runtime.value?.activeBody?.physicalMachineId,
+  );
+  const torqueEnabled = computed(
+    () => !!runtime.value?.activeBody?.physicalMachineId && runtime.value.torque,
+  );
+  const controlRunning = computed(() => runtime.value?.phase === "driving");
 
-  const updateWorldStatus = (status: LoopStatus): LoopStatus => {
-    const machineId = selectedMachine.value?.id;
-    if (!machineId) return status;
-    store.state.worldCache[machineId] = status.world;
-    persistWorldCache(store.state.worldCache);
-    return status;
+  const updateWorldStatus = (status: LoopStatus) => {
+    store.applyLoopStatus(status);
+  };
+
+  const reportLoopError = async (reason: unknown) => {
+    error.value = reason instanceof Error ? reason.message : String(reason);
+    const status = await commands.loopStatus().catch(() => undefined);
+    if (status) store.applyLoopStatus(status);
+    else if (status === null) store.state.loop = null;
+  };
+
+  const switchBody = async (loop: LoopStatus, virtualId: string, physicalId: string | null) => {
+    updateWorldStatus(
+      await commands.runtimeSelectBody(
+        loop.runtimeGeneration,
+        loop.executionGeneration,
+        virtualId,
+        physicalId,
+      ),
+    );
   };
 
   const updatePreviewInput = async () => {
+    const loop = runtime.value;
+    if (!loop || loopBusy.value || !controlRunning.value) return;
     try {
-      if (store.state.physicalSyncEnabled) {
-        if (!store.state.loop) return;
-        await sendRuntimeCommand(
-          store.state.loop?.runtimeGeneration ?? 0,
-          store.state.loop?.executionGeneration ?? 0,
-          { kind: "input", input: previewInput.value },
-        );
-        const status = await commands.loopStatus();
-        if (status) store.state.loop = updateWorldStatus(status);
-      } else {
-        if (!store.state.previewLoop) return;
-        store.state.previewLoop = updateWorldStatus(
-          await sendRuntimeCommand(
-            store.state.previewLoop.runtimeGeneration,
-            store.state.previewLoop.executionGeneration,
-            { kind: "input", input: previewInput.value },
-          ),
-        );
-      }
+      updateWorldStatus(
+        await sendRuntimeCommand(loop.runtimeGeneration, loop.executionGeneration, {
+          kind: "input",
+          input: previewInput.value,
+        }),
+      );
       error.value = null;
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      if (runtime.value?.executionGeneration === loop.executionGeneration)
+        await reportLoopError(reason);
     }
   };
 
@@ -540,29 +621,21 @@ export const PreviewPage = defineComponent(() => {
   };
 
   const resetWorld = async () => {
-    const machineId = selectedMachine.value?.id;
-    if (!machineId) return;
+    const machineId = runtime.value?.activeBody?.virtualMachineId ?? selectedMachine.value?.id;
+    if (!machineId || physicalSyncEnabled.value) return;
     try {
-      const status = store.state.physicalSyncEnabled
-        ? store.state.loop
-          ? await commands.loopStatus()
-          : null
-        : store.state.previewLoop
-          ? await sendRuntimeCommand(
-              store.state.previewLoop.runtimeGeneration,
-              store.state.previewLoop.executionGeneration,
-              { kind: "resetWorld" },
-            )
-          : null;
+      const loop = runtime.value;
+      if (loop)
+        store.applyLoopStatus(
+          await sendRuntimeCommand(loop.runtimeGeneration, loop.executionGeneration, {
+            kind: "resetWorld",
+          }),
+        );
       delete store.state.worldCache[machineId];
       persistWorldCache(store.state.worldCache);
-      if (status) {
-        if (store.state.physicalSyncEnabled) store.state.loop = status;
-        else store.state.previewLoop = status;
-      }
       error.value = null;
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      await reportLoopError(reason);
     }
   };
 
@@ -596,158 +669,222 @@ export const PreviewPage = defineComponent(() => {
     }
   };
 
+  const applyPolicy = async (loop: LoopStatus, id: string) => {
+    const status = await sendRuntimeCommand(loop.runtimeGeneration, loop.executionGeneration, {
+      kind: "policy",
+      policy_id: id,
+      input: previewInput.value,
+    });
+    updateWorldStatus(status);
+  };
+
   const selectPolicy = async (id: string) => {
+    if (loopBusy.value || busy.value) return;
     busy.value = id;
     try {
       const selected = await commands.policySelect(id);
       store.state.selectedPolicyId = selected.id;
       previewInput.value = inputForPolicy(selected);
-      if (store.state.physicalSyncEnabled && store.state.loop) {
-        await startLoop();
-      } else if (store.state.previewLoop) {
-        store.state.previewLoop = updateWorldStatus(
-          await sendRuntimeCommand(
-            store.state.previewLoop.runtimeGeneration,
-            store.state.previewLoop.executionGeneration,
-            { kind: "policy", policy_id: id },
-          ),
-        );
-        await updatePreviewInput();
-      }
+      if (runtime.value && controlRunning.value) await applyPolicy(runtime.value, id);
       await refresh();
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      await reportLoopError(reason);
     } finally {
       busy.value = null;
     }
   };
 
-  const startLoop = async (allowBusy = false) => {
-    if (!selectedMachine.value || (loopBusy.value && !allowBusy)) return;
+  const ensureSampling = async () => {
+    const virtualId = selectedMachine.value?.id;
+    if (!virtualId) return;
+    if (!runtime.value) {
+      updateWorldStatus(
+        await commands.runtimeOpen({
+          virtualMachineId: virtualId,
+          physicalMachineId: null,
+          access: "read_only",
+          policyId: null,
+        }),
+      );
+    }
+    const physicalId = store.state.requestedPhysicalMachine;
+    if (
+      physicalId &&
+      !runtime.value?.activeBody?.physicalMachineId &&
+      !store.state.loop?.readSources.some((source) => source.id === physicalId)
+    ) {
+      updateWorldStatus(
+        await commands.runtimeOpen({
+          virtualMachineId: virtualId,
+          physicalMachineId: physicalId,
+          access: "read_only",
+          policyId: null,
+        }),
+      );
+    }
+  };
+
+  const pauseControl = async () => {
+    const loop = runtime.value;
+    if (!loop) return;
+    updateWorldStatus(
+      await sendRuntimeCommand(loop.runtimeGeneration, loop.executionGeneration, {
+        kind: "action",
+        action: { kind: "drive", on: false },
+      }),
+    );
+  };
+
+  const startLoop = async () => {
+    if (
+      loopBusy.value ||
+      busy.value ||
+      !selectedPolicy.value ||
+      (physicalSyncEnabled.value && !torqueEnabled.value)
+    )
+      return;
     loopBusy.value = true;
     try {
-      await selectionTask;
-      if (store.state.physicalSyncEnabled) {
-        const machine = physicalMachine.value;
-        if (!machine || !physicalSyncAvailable.value) {
-          throw new Error("真机未连接完整的 15 个舵机");
-        }
-        if (!selectedPolicy.value) throw new Error("请选择已缓存的 ONNX 策略后启动真机控制");
-        const input = {
-          virtualMachineId: selectedMachine.value.id,
-          physicalMachineId: machine.id,
-          access: "control" as const,
-          policyId: selectedPolicy.value.id,
-        };
-        const current = store.state.loop ?? store.state.previewLoop;
-        store.state.loop = updateWorldStatus(
-          await (current
-            ? commands.runtimeReconfigure(current.runtimeGeneration, current.configRevision, input)
-            : commands.runtimeOpen(input)),
-        );
-        store.state.previewLoop = null;
-        store.state.loop = updateWorldStatus(
-          await sendRuntimeCommand(
-            store.state.loop.runtimeGeneration,
-            store.state.loop.executionGeneration,
-            {
-              kind: "action",
-              action: { kind: "power", on: true },
-            },
-          ),
-        );
-        // Rust owns homing and starts the selected policy when the body reaches Ready.
-        await updatePreviewInput();
-      } else {
-        const input = {
-          virtualMachineId: selectedMachine.value.id,
-          physicalMachineId: null,
-          access: "read_only" as const,
-          policyId: null,
-        };
-        const current = store.state.previewLoop ?? store.state.loop;
-        store.state.previewLoop = updateWorldStatus(
-          await (current
-            ? commands.runtimeReconfigure(current.runtimeGeneration, current.configRevision, input)
-            : commands.runtimeOpen(input)),
-        );
-        store.state.loop = null;
-        if (selectedPolicy.value) {
-          store.state.previewLoop = updateWorldStatus(
-            await sendRuntimeCommand(
-              store.state.previewLoop.runtimeGeneration,
-              store.state.previewLoop.executionGeneration,
-              { kind: "policy", policy_id: selectedPolicy.value.id },
-            ),
-          );
-          await updatePreviewInput();
-        }
-      }
+      await ensureSampling();
+      if (runtime.value) await applyPolicy(runtime.value, selectedPolicy.value.id);
       error.value = null;
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      await reportLoopError(reason);
     } finally {
       loopBusy.value = false;
     }
   };
 
   const stopLoop = async () => {
-    if (loopBusy.value) return;
+    if (loopBusy.value || busy.value) return;
     loopBusy.value = true;
-    testRevision += 1;
     try {
-      if (store.state.physicalSyncEnabled) {
-        if (store.state.loop)
-          await commands.runtimeClose(store.state.loop.runtimeGeneration, "runtime");
-        store.state.loop = null;
-      } else {
-        if (store.state.previewLoop) {
-          await commands.runtimeClose(store.state.previewLoop.runtimeGeneration, "runtime");
-        }
-        store.state.previewLoop = null;
-      }
-      store.state.jointRangeStates = [];
+      await pauseControl();
       error.value = null;
     } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      await reportLoopError(reason);
     } finally {
       loopBusy.value = false;
     }
   };
 
   const toggleLoop = () => {
-    if (store.state.physicalSyncEnabled ? store.state.loop : store.state.previewLoop) {
-      void stopLoop();
-      return;
-    }
-    void startLoop();
+    if (controlRunning.value) void stopLoop();
+    else void startLoop();
   };
 
-  const togglePhysicalSync = async () => {
-    if (!physicalSyncAvailable.value || loopBusy.value) return;
+  const resetFaultedLoop = async () => {
+    const loop = runtime.value;
+    if (!loop || loopBusy.value) return;
     loopBusy.value = true;
     try {
-      if (store.state.physicalSyncEnabled) {
-        store.state.physicalSyncEnabled = false;
-        if (store.state.loop) await startLoop(true);
-      } else {
-        store.state.physicalSyncEnabled = true;
-        if (!store.state.loop) await startLoop(true);
-      }
+      await commands.runtimeClose(loop.runtimeGeneration, "runtime");
+      store.state.loop = null;
+      await ensureSampling();
       error.value = null;
     } catch (reason) {
-      store.state.physicalSyncEnabled = false;
-      error.value = reason instanceof Error ? reason.message : String(reason);
+      await reportLoopError(reason);
     } finally {
       loopBusy.value = false;
     }
   };
 
+  const toggleTorque = async () => {
+    const virtualId = selectedMachine.value?.id;
+    const physicalId = physicalMachine.value?.id;
+    if (!virtualId || !physicalId || !physicalSyncEnabled.value || loopBusy.value || busy.value)
+      return;
+    loopBusy.value = true;
+    try {
+      await ensureSampling();
+      if (runtime.value) {
+        if (runtime.value.activeBody?.physicalMachineId === physicalId && !torqueEnabled.value) {
+          updateWorldStatus(
+            await sendRuntimeCommand(
+              runtime.value.runtimeGeneration,
+              runtime.value.executionGeneration,
+              {
+                kind: "action",
+                action: { kind: "power", on: true },
+              },
+            ),
+          );
+        } else await switchBody(runtime.value, virtualId, torqueEnabled.value ? null : physicalId);
+      }
+      await ensureSampling();
+      error.value = null;
+    } catch (reason) {
+      await reportLoopError(reason);
+      await ensureSampling().catch(() => undefined);
+    } finally {
+      loopBusy.value = false;
+    }
+  };
+
+  const togglePhysicalSync = async () => {
+    const virtualId = selectedMachine.value?.id;
+    if (
+      !virtualId ||
+      loopBusy.value ||
+      busy.value ||
+      (!detached.value && !physicalSyncEnabled.value && !physicalSyncAvailable.value)
+    )
+      return;
+    const previousPhysicalId = store.state.requestedPhysicalMachine;
+    loopBusy.value = true;
+    try {
+      if (physicalSyncEnabled.value || detached.value) {
+        if (runtime.value?.activeBody?.physicalMachineId || detached.value) {
+          await switchBody(runtime.value!, virtualId, null);
+        }
+        if (
+          store.state.loop?.readSources.some(
+            (source) => source.id === store.state.requestedPhysicalMachine,
+          )
+        ) {
+          await commands.runtimeClose(store.state.loop.runtimeGeneration, "readOnlySource");
+          const status = await commands.loopStatus();
+          if (status) updateWorldStatus(status);
+        }
+        store.state.requestedPhysicalMachine = null;
+      } else {
+        await pauseControl();
+        store.state.requestedPhysicalMachine = physicalMachine.value?.id ?? null;
+        await ensureSampling();
+      }
+      error.value = null;
+    } catch (reason) {
+      store.state.requestedPhysicalMachine = previousPhysicalId;
+      await reportLoopError(reason);
+    } finally {
+      loopBusy.value = false;
+    }
+  };
+  watch(
+    [() => selectedMachine.value?.id, () => store.state.loading],
+    async ([id, loading]) => {
+      if (!id || loading || loopBusy.value) return;
+      loopBusy.value = true;
+      try {
+        const loop = runtime.value;
+        if (loop && loop.activeBody?.virtualMachineId !== id) {
+          if (loop.readSources.length) {
+            await commands.runtimeClose(loop.runtimeGeneration, "readOnlySource");
+          }
+          await switchBody(loop, id, null);
+          store.state.requestedPhysicalMachine = null;
+        }
+        await ensureSampling();
+      } catch (reason) {
+        await reportLoopError(reason);
+      } finally {
+        loopBusy.value = false;
+      }
+    },
+    { immediate: true },
+  );
   onMounted(() => {
     if (!store.state.policies.length && !store.state.loading) void refresh();
-  });
-  onScopeDispose(() => {
-    pageActive = false;
   });
 
   return () => (
@@ -764,16 +901,19 @@ export const PreviewPage = defineComponent(() => {
         />
         <button
           type="button"
-          class={[style.previewSource, store.state.physicalSyncEnabled ? style.syncOn : undefined]}
-          disabled={!physicalSyncAvailable.value || loopBusy.value}
+          class={[style.previewSource, physicalSyncEnabled.value ? style.syncOn : undefined]}
+          aria-pressed={physicalSyncEnabled.value}
+          disabled={
+            (!detached.value && !physicalSyncEnabled.value && !physicalSyncAvailable.value) ||
+            loopBusy.value ||
+            !!busy.value
+          }
           onClick={() => void togglePhysicalSync()}
           title={
-            physicalSyncAvailable.value
-              ? "将当前 VLA 控制环切换到真机"
-              : "需要真机在线且 15 个舵机全部在线"
+            physicalSyncAvailable.value ? "只读同步真机体态，开启力矩后可运行策略" : "需要真机在线"
           }
         >
-          真机同步
+          {detached.value ? "切回模拟" : "真机同步"}
         </button>
       </div>
       <div class={style.previewPolicyList} aria-label="已缓存 ONNX 策略">
@@ -855,9 +995,10 @@ export const PreviewPage = defineComponent(() => {
                   />
                 </div>
                 <div class={style.previewParameterField}>
-                  <span>目标前进距离（m）</span>
+                  <span>本次前进距离（m，0 为持续行走）</span>
                   <Slider
                     value={previewInput.value.targetDistanceM ?? 0}
+                    disabled={physicalSyncEnabled.value}
                     min={0}
                     max={10}
                     step={0.1}
@@ -972,32 +1113,61 @@ export const PreviewPage = defineComponent(() => {
         )}
       </ScrollArea>
       <div class={style.previewLoopBar}>
-        <button type="button" disabled={loopBusy.value} onClick={toggleLoop}>
-          {store.state.physicalSyncEnabled
-            ? store.state.loop
-              ? "停止控制环"
-              : "开启真机控制环"
-            : store.state.previewLoop
-              ? "停止控制环"
+        {physicalSyncEnabled.value && (
+          <button
+            type="button"
+            disabled={loopBusy.value || (!torqueEnabled.value && !physicalSyncAvailable.value)}
+            onClick={() => void toggleTorque()}
+          >
+            {torqueEnabled.value ? "关闭力矩" : "开启力矩"}
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={
+            loopBusy.value ||
+            runtime.value?.runtimeState === "faulted" ||
+            (!controlRunning.value &&
+              (!selectedPolicy.value ||
+                (physicalSyncEnabled.value &&
+                  (!torqueEnabled.value || !physicalSyncAvailable.value))))
+          }
+          onClick={toggleLoop}
+        >
+          {controlRunning.value
+            ? "停止控制环"
+            : physicalSyncEnabled.value
+              ? "开启真机控制环"
               : "开启控制环"}
         </button>
         <button type="button" onClick={() => void openLogs()}>
           打开日志
         </button>
-        {store.state.previewLoop && (
+        {runtime.value?.runtimeState === "faulted" && (
+          <button type="button" disabled={loopBusy.value} onClick={() => void resetFaultedLoop()}>
+            重置控制环
+          </button>
+        )}
+        {runtime.value && (
           <small>
-            {store.state.previewLoop.runtimeState === "faulted"
-              ? `控制环故障：${store.state.previewLoop.lastError ?? "执行失败"}`
-              : store.state.previewLoop.torque
+            {runtime.value.runtimeState === "faulted"
+              ? `控制环故障：${runtime.value.lastError ?? "执行失败"}`
+              : controlRunning.value
                 ? "策略运行中"
-                : "控制环已开启，等待策略"}
+                : physicalSyncEnabled.value
+                  ? torqueEnabled.value
+                    ? "力矩已开启，等待策略启动"
+                    : "只读同步真机体态"
+                  : "采样中，等待策略启动"}
           </small>
         )}
         {error.value && <span class={style.previewError}>{error.value}</span>}
         <div class={style.previewSystemActions}>
           <button
             type="button"
-            disabled={worldAtConfiguredPosition.value || loopBusy.value}
+            disabled={
+              physicalSyncEnabled.value || worldAtConfiguredPosition.value || loopBusy.value
+            }
             onClick={() => void resetWorld()}
           >
             归零

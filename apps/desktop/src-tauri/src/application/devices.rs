@@ -321,7 +321,8 @@ mod tests {
                 connected: true,
                 last_seen: Some("刚刚".into()),
                 torque_enabled: false,
-                joint_directions: vec![],
+                joint_directions: Vec::new(),
+                joint_bindings: vec![],
             });
 
         mark_offline(&state, "physical-device-test").expect("offline transition");

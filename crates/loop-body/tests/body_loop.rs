@@ -28,6 +28,49 @@ impl LoopController for FixedController {
 }
 
 #[test]
+fn arming_holds_feedback_before_torque_and_waits_for_explicit_drive() {
+    let mut driver = FakeDriver::new(15);
+    driver.positions[1] = 0.12;
+    let events = driver.event_log();
+    let mut body_loop = loop_with(driver);
+    body_loop.arm_at_current_pose().unwrap();
+    assert_eq!(*events.lock().unwrap(), ["read", "write", "torque", "gain"]);
+    assert_eq!(body_loop.status().phase, LoopPhase::Holding);
+    assert!(body_loop.status().torque);
+    assert_eq!(body_loop.status().targets[1], 0.12);
+    let mut controller = FixedController { calls: 0 };
+    body_loop
+        .tick_with_controller(Duration::from_millis(20), &mut controller)
+        .unwrap();
+    assert_eq!(controller.calls, 0);
+}
+
+#[test]
+fn failed_arm_feedback_does_not_enable_torque_or_write_a_target() {
+    let mut driver = FakeDriver::new(15);
+    driver.fail_reads = 1;
+    let events = driver.event_log();
+    let mut body_loop = loop_with(driver);
+    assert!(body_loop.arm_at_current_pose().is_err());
+    assert_eq!(*events.lock().unwrap(), ["read"]);
+    assert!(!body_loop.status().torque);
+}
+
+#[test]
+fn a_failed_torque_off_keeps_the_power_state_unconfirmed_and_can_be_retried() {
+    let mut driver = FakeDriver::new(15);
+    driver.fail_torque_off = 1;
+    let mut body_loop = loop_with(driver);
+    body_loop.send(LoopAction::Power(true)).unwrap();
+    assert!(body_loop.send(LoopAction::Stop).is_err());
+    assert_ne!(body_loop.status().phase, LoopPhase::Stopped);
+    assert!(body_loop.status().torque);
+    body_loop.send(LoopAction::Stop).unwrap();
+    assert_eq!(body_loop.status().phase, LoopPhase::Stopped);
+    assert!(!body_loop.status().torque);
+}
+
+#[test]
 fn controller_hook_runs_between_sensor_read_and_backend_write() {
     let driver = FakeDriver::new(15);
     let events = driver.event_log();

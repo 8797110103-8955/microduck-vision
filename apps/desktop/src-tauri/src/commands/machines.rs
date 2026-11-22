@@ -302,6 +302,7 @@ mod register_table_tests {
             last_seen: None,
             torque_enabled: false,
             joint_directions: Vec::new(),
+            joint_bindings: Vec::new(),
         };
 
         update_servo_id_cache(&mut machine, 5, 7).unwrap();
@@ -344,6 +345,7 @@ mod register_table_tests {
             last_seen: None,
             torque_enabled: false,
             joint_directions: Vec::new(),
+            joint_bindings: Vec::new(),
         };
         let before = machine.clone();
         assert!(update_servo_id_cache(&mut machine, 9, 3).is_err());
@@ -395,21 +397,13 @@ mod register_table_tests {
             },
         ];
         let bindings = vec![
-            ServoJointBinding {
+            crate::types::VirtualJointBinding {
                 slot_id: "left_hip_yaw".into(),
                 physical_id: 7,
-                direction: 1,
-                zero_offset_rad: 0.0,
-                min_rad: None,
-                max_rad: None,
             },
-            ServoJointBinding {
+            crate::types::VirtualJointBinding {
                 slot_id: "right_hip_yaw".into(),
                 physical_id: 42,
-                direction: 1,
-                zero_offset_rad: 0.0,
-                min_rad: None,
-                max_rad: None,
             },
         ];
         let resolved = debug_servo_bindings(
@@ -425,7 +419,7 @@ mod register_table_tests {
     }
 
     #[test]
-    fn debug_bindings_keep_official_defaults_when_another_slot_is_overridden() {
+    fn debug_bindings_never_guess_limb_ids_from_the_census() {
         let census = vec![
             ServoIdentity {
                 servo_id: 20,
@@ -443,23 +437,19 @@ mod register_table_tests {
                 .iter()
                 .map(|binding| binding.as_ref().map(|binding| binding.physical_id))
                 .collect::<Vec<_>>(),
-            vec![Some(20), Some(10)]
+            vec![None, None]
         );
-        let override_binding = ServoJointBinding {
+        let override_binding = crate::types::VirtualJointBinding {
             slot_id: "left_hip_yaw".into(),
             physical_id: 20,
-            direction: -1,
-            zero_offset_rad: 0.4,
-            min_rad: Some(-0.5),
-            max_rad: Some(0.7),
         };
         let resolved =
             debug_servo_bindings(&census, std::slice::from_ref(&override_binding), &slots);
-        assert_eq!(resolved[0], Some(override_binding));
         assert_eq!(
-            resolved[1].as_ref().map(|binding| binding.physical_id),
-            Some(10)
+            resolved[0].as_ref().map(|binding| binding.physical_id),
+            Some(20)
         );
+        assert!(resolved[1].is_none());
     }
 
     #[test]
@@ -549,29 +539,22 @@ mod register_table_tests {
             last_seen: None,
             torque_enabled: false,
             joint_directions: Vec::new(),
+            joint_bindings: Vec::new(),
         };
-        let bindings = vec![
-            ServoJointBinding {
+        let bindings = [
+            crate::types::VirtualJointBinding {
                 slot_id: "left_hip_yaw".into(),
                 physical_id: 7,
-                direction: 1,
-                zero_offset_rad: 0.0,
-                min_rad: None,
-                max_rad: None,
             },
-            ServoJointBinding {
+            crate::types::VirtualJointBinding {
                 slot_id: "right_hip_yaw".into(),
                 physical_id: 42,
-                direction: 1,
-                zero_offset_rad: 0.0,
-                min_rad: None,
-                max_rad: None,
             },
         ];
         let slots = vec!["left_hip_yaw".into(), "right_hip_yaw".into()];
 
         let (resolved, driver_ids, active_ids) =
-            resolve_physical_loop_mapping(&physical, &bindings, &slots).unwrap();
+            resolve_physical_loop_mapping(&bindings, &physical, &slots).unwrap();
 
         assert_eq!(
             resolved
@@ -588,6 +571,7 @@ mod register_table_tests {
 
 #[cfg(test)]
 mod training_tests {
+    use crate::application::devices::virtual_machines;
     use crate::application::training::training_metadata;
     use crate::state::DesktopState;
     use crate::types::TrainingStartInput;
@@ -595,15 +579,17 @@ mod training_tests {
     #[test]
     fn training_metadata_uses_the_selected_body_and_fixed_policy_layout() {
         let state = DesktopState::new(None);
+        let virtual_machine_id = virtual_machines(&state).unwrap()[0].id.clone();
         let input = TrainingStartInput {
             program: "uv".into(),
             args: vec!["run".into(), "train".into()],
             working_dir: ".".into(),
-            virtual_machine_id: "official-hd1910".into(),
+            virtual_machine_id,
             policy_id: None,
             experiment_id: Some("experiment-1".into()),
             recipe: "student-distillation".into(),
             teacher_motion_provenance: "teacher:official-motion".into(),
+            dataset_path: None,
         };
 
         let metadata = training_metadata(&state, &input, "run-1").expect("training metadata");

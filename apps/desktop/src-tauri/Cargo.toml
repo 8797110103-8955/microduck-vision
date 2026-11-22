@@ -33,6 +33,7 @@ serde_json = "1.0.145"
 toml = "0.9.8"
 md-5 = "0.10.6"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 specta = { version = "=2.0.0-rc.28", features = ["derive", "function"] }
 specta-typescript = "0.0.15"
 tauri-specta = { version = "=2.0.0-rc.29", features = ["derive", "typescript"] }
@@ -45,6 +46,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "system-proxy",
 ] }
 tauri-plugin-opener = "2.7.3"
+mcap = { version = "0.26.0", default-features = false }
 
 [[bin]]
 name = "microduck-vision"

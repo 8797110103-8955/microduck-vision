@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const COMMAND_FILES: &[&str] = &[
         "../src-tauri/src/commands/actions.rs",
         "../src-tauri/src/commands/loop_control.rs",
+        "../src-tauri/src/commands/logs.rs",
         "../src-tauri/src/commands/machines.rs",
         "../src-tauri/src/commands/machines/physical.rs",
         "../src-tauri/src/commands/machines/registers.rs",
@@ -117,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "policy ::",
         "training ::",
         "loop_control ::",
+        "logs ::",
         "scene ::",
     ] {
         builder_source = builder_source.replace(prefix, "client ::");

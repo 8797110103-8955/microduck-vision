@@ -64,6 +64,10 @@ fn official_scene() -> Result<&'static duck_body::OfficialScene, String> {
 pub(crate) fn scene_model() -> Result<FrontendSceneInfo, String> {
     let scene = official_scene()?;
     let model = scene.model();
+    let template = BodyTemplate::official().map_err(|error| error.to_string())?;
+    let default_frame = scene
+        .frame(&template.control.home_pose)
+        .map_err(|error| error.to_string())?;
     Ok(FrontendSceneInfo {
         model: FrontendSceneModel {
             bodies: model
@@ -98,6 +102,10 @@ pub(crate) fn scene_model() -> Result<FrontendSceneInfo, String> {
             }),
         },
         mesh_dir: scene.mesh_dir().to_string_lossy().into_owned(),
+        default_frame: FrontendSceneFrame {
+            bodies: default_frame.bodies,
+            markers: default_frame.markers,
+        },
     })
 }
 

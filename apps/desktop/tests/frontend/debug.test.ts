@@ -4,6 +4,7 @@ import {
   bindingConflictsFor,
   bindingConflictsForDrafts,
   debugBindingFor,
+  debugBindingMachineFor,
   debugPhysicalMachineFor,
   defaultDebugVirtualMachineId,
 } from "../../src/features/debug";
@@ -44,6 +45,32 @@ const physicalMachine = (
 });
 
 describe("debug physical pairing", () => {
+  it("selects bindings by machine identity when hardware shares a virtual model", () => {
+    const virtual = virtualMachine("virtual-a", "model");
+    virtual.jointBindings = [{ slotId: "left_hip_yaw", physicalId: 42 }];
+    const first = physicalMachine("physical-a", "same name", virtual.id);
+    const second = physicalMachine("physical-b", "same name", virtual.id);
+    first.jointBindings = [
+      { slotId: "left_hip_yaw", zeroOffsetRad: 2, minRad: null, maxRad: null },
+    ];
+    first.jointDirections = [{ slotId: "left_hip_yaw", direction: -1 }];
+    second.jointBindings = [
+      { slotId: "left_hip_yaw", zeroOffsetRad: 3, minRad: null, maxRad: null },
+    ];
+    expect(debugBindingFor(debugBindingMachineFor(virtual, first), "left_hip_yaw")).toMatchObject({
+      physicalId: 42,
+      zeroOffsetRad: 2,
+      direction: -1,
+    });
+    expect(debugBindingFor(debugBindingMachineFor(virtual, second), "left_hip_yaw")).toMatchObject({
+      physicalId: 42,
+      zeroOffsetRad: 3,
+      direction: 1,
+    });
+    expect(debugBindingFor(debugBindingMachineFor(virtual, null), "left_hip_yaw")).toMatchObject({
+      physicalId: 42,
+    });
+  });
   it("pairs unbound machines by creation order without changing the binding", () => {
     const virtualMachines = [
       virtualMachine("machine-0", "机器 0"),
@@ -66,9 +93,7 @@ describe("debug physical pairing", () => {
 
   it("uses the virtual mapping consistently for debug IDs and scene IDs", () => {
     const virtual = virtualMachine("machine-0", "机器 0");
-    virtual.jointBindings = [
-      { slotId: "left_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
-    ];
+    virtual.jointBindings = [{ slotId: "left_hip_yaw", physicalId: 42 }];
     expect(debugBindingFor(virtual, "left_hip_yaw")?.physicalId).toBe(42);
     expect(debugBindingFor(virtual, "right_hip_yaw")).toBeUndefined();
   });
@@ -83,8 +108,8 @@ describe("debug physical pairing", () => {
   it("reports duplicate virtual IDs without needing a physical machine", () => {
     const virtual = virtualMachine("machine-0", "机器 0");
     virtual.jointBindings = [
-      { slotId: "left_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
-      { slotId: "right_hip_yaw", physicalId: 42, direction: 1, zeroOffsetRad: 0 },
+      { slotId: "left_hip_yaw", physicalId: 42 },
+      { slotId: "right_hip_yaw", physicalId: 42 },
     ];
 
     expect(bindingConflictsFor(virtual)).toEqual(["42:left_hip_yaw,right_hip_yaw"]);
@@ -92,16 +117,12 @@ describe("debug physical pairing", () => {
 
   it("detects conflicts from frontend binding drafts without mutating the saved machine", () => {
     const virtual = virtualMachine("machine-0", "机器 0");
-    virtual.jointBindings = [
-      { slotId: "left_hip_yaw", physicalId: 1, direction: 1, zeroOffsetRad: 0 },
-    ];
+    virtual.jointBindings = [{ slotId: "left_hip_yaw", physicalId: 1 }];
 
     expect(bindingConflictsForDrafts(virtual, { right_hip_yaw: 1 })).toEqual([
       "1:left_hip_yaw,right_hip_yaw",
     ]);
-    expect(virtual.jointBindings).toEqual([
-      { slotId: "left_hip_yaw", physicalId: 1, direction: 1, zeroOffsetRad: 0 },
-    ]);
+    expect(virtual.jointBindings).toEqual([{ slotId: "left_hip_yaw", physicalId: 1 }]);
     expect(bindingConflictsForDrafts(virtual, { right_hip_yaw: 2 })).toEqual([]);
   });
 });

@@ -324,6 +324,7 @@ mod tests {
             last_seen: None,
             torque_enabled: false,
             joint_directions: Vec::new(),
+            joint_bindings: Vec::new(),
         };
         let detected = DetectedPhysicalMachine {
             census: machine.census.clone(),

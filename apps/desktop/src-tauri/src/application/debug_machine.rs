@@ -8,12 +8,8 @@ use loop_body::BackendAccess;
 use duck_body::BodyTemplate;
 use loop_body::{Calibration, JointCalibration};
 
-use crate::application::loop_service::{
-    apply_physical_directions, binding_conflict_error, debug_servo_bindings,
-    resolve_physical_loop_mapping,
-};
+use crate::application::loop_service::{binding_conflict_error, resolve_physical_loop_mapping};
 use crate::application::physical_io::with_bus;
-use crate::helpers::model;
 use crate::state::DesktopState;
 use crate::types::PhysicalMachine;
 
@@ -51,8 +47,15 @@ fn write_position(
 ) -> Result<(), String> {
     with_bus(state, physical_id, BackendAccess::Control, |bus| {
         super::physical_io::validate_control_ids(state, &[servo_id])?;
-        bus.ok_or_else(|| "实机没有可用连接".to_owned())?
-            .write_position(servo_id, position_rad)
+        let bus = bus.ok_or_else(|| "实机没有可用连接".to_owned())?;
+        if matches!(bus, crate::backend::control::ConnectedBus::Hd1910(_)) {
+            let snapshot = bus.read_hd1910_configuration(servo_id)?;
+            crate::backend::hd1910_body::PositionDomain::from_snapshot(&snapshot)
+                .ok_or_else(|| format!("HD1910 id={servo_id} 未读到硬件位置模式及限位"))?
+                .validate(position_rad)
+                .map_err(|error| format!("HD1910 id={servo_id}: {error}"))?;
+        }
+        bus.write_position(servo_id, position_rad)
     })
 }
 pub(crate) fn set_pose_zero(
@@ -74,12 +77,13 @@ fn set_pose_zero_with_reader(
     virtual_machine_id: Option<String>,
     read: impl FnOnce(servo::ServoModel, &[u8]) -> Result<Vec<f64>, String>,
 ) -> Result<PhysicalMachine, String> {
-    // Calibration and execution replacement must not race. Read-only sampling may continue;
-    // its immutable binding is refreshed by the caller after saving the new calibration.
+    // Calibration and execution replacement must not race. The existing read-only source
+    // resolves the updated calibration from shared configuration on its next sample.
     let _transition = state
         .execution_transition
         .lock()
         .map_err(|error| error.to_string())?;
+    super::encoder_calibration::ensure_ready(state, &id)?;
     if state
         .runtime_loop
         .lock()
@@ -97,35 +101,25 @@ fn set_pose_zero_with_reader(
         .find(|machine| machine.id == id)
         .cloned()
         .ok_or_else(|| "unknown physical machine".to_owned())?;
+    let template = BodyTemplate::official().map_err(|error| error.to_string())?;
+    let slots = template
+        .actuators
+        .iter()
+        .map(|slot| slot.id.clone())
+        .collect::<Vec<_>>();
     let virtual_id = virtual_machine_id
-        .as_deref()
-        .or(machine.virtual_machine_id.as_deref())
-        .ok_or_else(|| "实机尚未关联模拟机".to_owned())?
-        .to_owned();
-    let (model, bindings) = {
-        let virtual_machine = state
-            .virtual_machines
-            .lock()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .find(|item| item.id == virtual_id)
-            .cloned()
-            .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
-        let slots = BodyTemplate::official()
-            .map_err(|error| error.to_string())?
-            .actuators
-            .into_iter()
-            .map(|slot| slot.id)
-            .collect::<Vec<_>>();
-        let mut bindings =
-            debug_servo_bindings(&machine.census, &virtual_machine.joint_bindings, &slots)
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-        apply_physical_directions(&mut bindings, &machine);
-        let model = model(&virtual_machine.servo_model);
-        (model, bindings)
-    };
+        .or_else(|| machine.virtual_machine_id.clone())
+        .ok_or("实机没有关联模拟机")?;
+    let virtual_bindings = state
+        .virtual_machines
+        .lock()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .find(|virtual_machine| virtual_machine.id == virtual_id)
+        .map(|virtual_machine| virtual_machine.joint_bindings.clone())
+        .ok_or("unknown virtual machine")?;
+    let (bindings, _, _) = resolve_physical_loop_mapping(&virtual_bindings, &machine, &slots)?;
+    let model = super::physical_machine::physical_servo_model(&machine)?;
     if let Some(error) = binding_conflict_error(&bindings) {
         return Err(error);
     }
@@ -134,14 +128,11 @@ fn set_pose_zero_with_reader(
         .map(|binding| binding.physical_id)
         .collect::<Vec<_>>();
     let positions = read(model, &ids)?;
-    let mut virtual_machines = state
-        .virtual_machines
-        .lock()
-        .map_err(|error| error.to_string())?;
-    let virtual_machine = virtual_machines
+    let mut machines = state.physical_machines.lock().map_err(|e| e.to_string())?;
+    let machine = machines
         .iter_mut()
-        .find(|machine| machine.id == virtual_id)
-        .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
+        .find(|machine| machine.id == id)
+        .ok_or("unknown physical machine")?;
     let mut resolved_calibrations = bindings
         .iter()
         .map(|binding| JointCalibration {
@@ -155,32 +146,36 @@ fn set_pose_zero_with_reader(
         .collect::<Vec<_>>();
     duck_body::apply_pose_zero_positions(&mut resolved_calibrations, &positions)
         .map_err(|error| error.to_string())?;
-    let mut updated_bindings = if virtual_machine.joint_bindings.is_empty() {
-        bindings
-    } else {
-        virtual_machine.joint_bindings.clone()
-    };
+    let updated_bindings = &mut machine.joint_bindings;
     for calibration in resolved_calibrations {
         if let Some(binding) = updated_bindings
             .iter_mut()
             .find(|binding| binding.slot_id == calibration.slot_id)
         {
-            binding.zero_offset_rad = calibration.zero_offset_rad;
-        } else {
-            updated_bindings.push(crate::types::ServoJointBinding {
+            *binding = crate::types::ServoJointCalibration {
                 slot_id: calibration.slot_id,
-                physical_id: calibration.physical_id,
-                direction: calibration.direction,
+
+                zero_offset_rad: calibration.zero_offset_rad,
+                min_rad: calibration.min_rad,
+                max_rad: calibration.max_rad,
+            };
+        } else {
+            updated_bindings.push(crate::types::ServoJointCalibration {
+                slot_id: calibration.slot_id,
+
                 zero_offset_rad: calibration.zero_offset_rad,
                 min_rad: calibration.min_rad,
                 max_rad: calibration.max_rad,
             });
         }
     }
-    virtual_machine.joint_bindings = updated_bindings;
-    drop(virtual_machines);
-    state.persist()?;
-    Ok(machine)
+    let result = machine.clone();
+    drop(machines);
+    state.persist_physical_machines()?;
+    state
+        .config_revision
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    Ok(result)
 }
 
 pub(crate) fn pose(
@@ -199,26 +194,24 @@ pub(crate) fn pose(
             .find(|machine| machine.id == id)
             .cloned()
             .ok_or_else(|| "unknown physical machine".to_owned())?;
-        let virtual_id = virtual_machine_id
-            .as_deref()
-            .or(machine.virtual_machine_id.as_deref())
-            .ok_or_else(|| "实机尚未关联模拟机".to_owned())?;
-        let virtual_machine = state
-            .virtual_machines
-            .lock()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .find(|item| item.id == virtual_id)
-            .cloned()
-            .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
-        let model = model(&virtual_machine.servo_model);
+        let model = super::physical_machine::physical_servo_model(&machine)?;
         let slots = template
             .actuators
             .iter()
             .map(|slot| slot.id.clone())
             .collect::<Vec<_>>();
-        let (bindings, _, _) =
-            resolve_physical_loop_mapping(&machine, &virtual_machine.joint_bindings, &slots)?;
+        let virtual_id = virtual_machine_id
+            .or_else(|| machine.virtual_machine_id.clone())
+            .ok_or("实机没有关联模拟机")?;
+        let virtual_bindings = state
+            .virtual_machines
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .find(|virtual_machine| virtual_machine.id == virtual_id)
+            .map(|virtual_machine| virtual_machine.joint_bindings.clone())
+            .ok_or("unknown virtual machine")?;
+        let (bindings, _, _) = resolve_physical_loop_mapping(&virtual_bindings, &machine, &slots)?;
         (model, bindings)
     };
     if let Some(error) = binding_conflict_error(&bindings) {
@@ -263,7 +256,7 @@ pub(crate) fn set_torque_state(
     state: &DesktopState,
     id: String,
     enabled: bool,
-    virtual_machine_id: Option<String>,
+    _virtual_machine_id: Option<String>,
 ) -> Result<PhysicalMachine, String> {
     let (model, ids) = {
         let machines = state
@@ -274,18 +267,7 @@ pub(crate) fn set_torque_state(
             .iter()
             .find(|machine| machine.id == id)
             .ok_or_else(|| "unknown physical machine".to_owned())?;
-        let virtual_id = virtual_machine_id
-            .as_deref()
-            .or(machine.virtual_machine_id.as_deref())
-            .ok_or_else(|| "实机尚未关联模拟机".to_owned())?;
-        let model = state
-            .virtual_machines
-            .lock()
-            .map_err(|error| error.to_string())?
-            .iter()
-            .find(|item| item.id == virtual_id)
-            .map(|item| model(&item.servo_model))
-            .ok_or_else(|| "关联的模拟机不存在".to_owned())?;
+        let model = super::physical_machine::physical_servo_model(machine)?;
         (
             model,
             machine
@@ -348,18 +330,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn calibrated_machine(state: &DesktopState) -> String {
-        let mut machines = state.virtual_machines.lock().unwrap();
-        let virtual_machine = &mut machines[0];
-        virtual_machine.joint_bindings = vec![crate::types::ServoJointBinding {
+        let virtual_id = state.virtual_machines.lock().unwrap()[0].id.clone();
+        let bindings = vec![crate::types::VirtualJointBinding {
             slot_id: "left_hip_yaw".into(),
             physical_id: 7,
-            direction: -1,
-            zero_offset_rad: 0.0,
-            min_rad: None,
-            max_rad: None,
         }];
-        let virtual_id = virtual_machine.id.clone();
-        drop(machines);
+        state.virtual_machines.lock().unwrap()[0].joint_bindings = bindings.clone();
         state
             .physical_machines
             .lock()
@@ -379,7 +355,20 @@ mod tests {
                 connected: true,
                 last_seen: None,
                 torque_enabled: false,
-                joint_directions: Vec::new(),
+                joint_directions: vec![crate::types::ServoJointDirection {
+                    slot_id: "left_hip_yaw".into(),
+                    direction: -1,
+                }],
+                joint_bindings: bindings
+                    .iter()
+                    .map(|binding| crate::types::ServoJointCalibration {
+                        slot_id: binding.slot_id.clone(),
+
+                        zero_offset_rad: 0.0,
+                        min_rad: None,
+                        max_rad: None,
+                    })
+                    .collect(),
             });
         virtual_id
     }
@@ -408,9 +397,16 @@ mod tests {
             Ok(vec![0.37])
         })
         .unwrap();
-        let binding = state.virtual_machines.lock().unwrap()[0].joint_bindings[0].clone();
+        let binding = state.physical_machines.lock().unwrap()[0].joint_bindings[0].clone();
         assert_eq!(binding.zero_offset_rad, 0.37);
-        assert_eq!(binding.direction, -1);
+        assert_eq!(
+            state.physical_machines.lock().unwrap()[0].joint_directions[0].direction,
+            -1
+        );
+        assert_eq!(
+            state.virtual_machines.lock().unwrap()[0].joint_bindings[0].physical_id,
+            7
+        );
         assert!(
             events.lock().unwrap().is_empty(),
             "calibration must not send actuator writes"
@@ -435,7 +431,7 @@ mod tests {
         set_pose_zero_with_reader(&state, "physical-test".into(), None, |_, _| Ok(vec![0.42]))
             .unwrap();
         assert_eq!(
-            state.virtual_machines.lock().unwrap()[0].joint_bindings[0].zero_offset_rad,
+            state.physical_machines.lock().unwrap()[0].joint_bindings[0].zero_offset_rad,
             0.42
         );
         assert!(
@@ -493,7 +489,7 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("控制环运行时不能绑定姿态零位"));
         assert_eq!(
-            state.virtual_machines.lock().unwrap()[0].joint_bindings[0].zero_offset_rad,
+            state.physical_machines.lock().unwrap()[0].joint_bindings[0].zero_offset_rad,
             0.0
         );
     }

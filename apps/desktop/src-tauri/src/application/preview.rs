@@ -4,7 +4,7 @@
 //! command layer remains a transport adapter.
 
 use crate::application::policy;
-use crate::backend::simulation::PreviewMicroDuckPolicyRunner;
+use crate::backend::policy_runtime::PolicyExecution;
 use crate::control;
 use crate::helpers::model;
 use crate::logging::append_control_event;
@@ -106,17 +106,7 @@ pub(crate) fn open_locked(
     {
         return Err("preview loop is already active".into());
     }
-    let preview = PreviewMicroDuckPolicyRunner::open(
-        model(&machine.servo_model),
-        machine.simulation.clone(),
-        state.config_dir.as_deref(),
-        &machine.id,
-        &machine.name,
-        &mut *state
-            .backend_registry
-            .lock()
-            .map_err(|error| error.to_string())?,
-    )?;
+    let preview = open_body(state, &machine)?;
     let status = preview.status();
     state.emit_joint_range_states(&status.joint_range_states);
     let mut runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
@@ -141,32 +131,43 @@ pub(crate) fn open_locked(
     Ok(with_runtime_generation(state, status))
 }
 
+pub(crate) fn open_body(
+    state: &DesktopState,
+    machine: &crate::types::VirtualMachine,
+) -> Result<PolicyExecution, String> {
+    let mut execution = PolicyExecution::open(
+        model(&machine.servo_model),
+        machine.simulation.clone(),
+        state.config_dir.as_deref(),
+        &machine.id,
+        &machine.name,
+        &mut *state
+            .backend_registry
+            .lock()
+            .map_err(|error| error.to_string())?,
+    )?;
+    execution.restore_placement(state.world_placements.clone());
+    Ok(execution)
+}
+
 pub(crate) fn select_policy(
     state: &DesktopState,
     policy_id: String,
+    input: PreviewInput,
 ) -> Result<FrontendLoopStatus, String> {
     let selected = policy::list(state.config_dir.as_deref())?
         .into_iter()
         .find(|entry| entry.id == policy_id && entry.cached && entry.selected)
         .ok_or_else(|| "selected ONNX policy is not downloaded".to_owned())?;
-    let path = policy::selected_path(state.config_dir.as_deref())
-        .ok_or_else(|| format!("selected ONNX policy is unavailable: {}", selected.id))?;
     let mut guard = state.runtime_loop.lock().map_err(|e| e.to_string())?;
     let preview = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?
-        .simulation_mut()?;
-    let config = policy::runtime_config(state.config_dir.as_deref(), &selected)?;
-    let descriptor = policy::descriptor(state.config_dir.as_deref(), &selected)?;
-    preview.select_policy(
-        &path,
-        selected.command,
-        descriptor,
-        config,
-        selected.kind.as_deref(),
-        selected.duration_s,
-    )?;
-    let status = preview.status();
+        .policy_execution_mut()?;
+    preview.select_policy(&selected.id)?;
+    // Policy and its command become visible to the clock together. No tick may
+    // run the new network with the previous policy's input (or the startup zero).
+    preview.set_input(input);
     guard
         .as_mut()
         .ok_or("runtime is closed")?
@@ -177,6 +178,7 @@ pub(crate) fn select_policy(
     state
         .execution_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let status = guard.as_ref().ok_or("runtime is closed")?.snapshot();
     state.emit_joint_range_states(&status.joint_range_states);
     Ok(with_runtime_generation(state, status))
 }
@@ -189,9 +191,9 @@ pub(crate) fn set_input(
     let preview = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?
-        .simulation_mut()?;
+        .policy_execution_mut()?;
     preview.set_input(input);
-    let status = preview.status();
+    let status = guard.as_ref().ok_or("runtime is closed")?.snapshot();
     state.emit_joint_range_states(&status.joint_range_states);
     Ok(with_runtime_generation(state, status))
 }
@@ -201,9 +203,12 @@ pub(crate) fn reset_world(state: &DesktopState) -> Result<FrontendLoopStatus, St
     let preview = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?
-        .simulation_mut()?;
+        .policy_execution_mut()?;
     preview.reset_world()?;
-    let status = preview.status();
+    state
+        .config_revision
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let status = guard.as_ref().ok_or("runtime is closed")?.snapshot();
     state.emit_joint_range_states(&status.joint_range_states);
     Ok(with_runtime_generation(state, status))
 }
@@ -214,7 +219,7 @@ pub(crate) fn tick(state: &DesktopState) -> Result<FrontendLoopStatus, String> {
     let status = guard
         .as_mut()
         .ok_or_else(|| "preview loop is closed".to_owned())?
-        .simulation_mut()?
+        .policy_execution_mut()?
         .tick()?;
     state.emit_joint_range_states(&status.joint_range_states);
     log_joint_range_states(state.config_dir.as_deref(), &status.joint_range_states);
@@ -229,8 +234,9 @@ pub(crate) fn action(
     let preview = runtime
         .as_mut()
         .ok_or("runtime is closed")?
-        .simulation_mut()?;
-    let status = preview.action(action)?;
+        .policy_execution_mut()?;
+    preview.action(action)?;
+    let status = runtime.as_ref().ok_or("runtime is closed")?.snapshot();
     Ok(with_runtime_generation(state, status))
 }
 
@@ -243,7 +249,7 @@ pub(crate) fn close(state: &DesktopState) -> Result<(), String> {
     )
 }
 
-fn with_runtime_generation(
+pub(crate) fn with_runtime_generation(
     state: &DesktopState,
     mut status: FrontendLoopStatus,
 ) -> FrontendLoopStatus {
@@ -334,7 +340,8 @@ mod tests {
                 connected: true,
                 last_seen: None,
                 torque_enabled: false,
-                joint_directions: vec![],
+                joint_directions: Vec::new(),
+                joint_bindings: vec![],
             });
 
         preview::open(&state, machine_id.clone()).unwrap();

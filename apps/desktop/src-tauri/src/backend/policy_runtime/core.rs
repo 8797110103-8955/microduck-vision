@@ -126,6 +126,25 @@ impl PolicyControlCore {
         self.previous_targets = None;
     }
 
+    pub(crate) fn seed_from_pose(&mut self, positions: &[f64]) -> Result<(), LoopError> {
+        let pose: [f64; NUM_JOINTS] =
+            positions.try_into().map_err(|_| LoopError::SensorLength {
+                actual: positions.len(),
+                expected: NUM_JOINTS,
+            })?;
+        if pose.iter().any(|position| !position.is_finite()) {
+            return Err(LoopError::InvalidBackendState {
+                field: "policy handoff pose",
+            });
+        }
+        let offsets = std::array::from_fn(|index| {
+            (pose[index] - self.home[index]) / self.config.action_scale
+        });
+        self.last_action = Observation::gather_action(&offsets);
+        self.previous_targets = Some(pose);
+        Ok(())
+    }
+
     pub(crate) fn history(&self) -> PolicyHistory {
         PolicyHistory {
             last_action: self.last_action.to_vec(),
@@ -133,18 +152,16 @@ impl PolicyControlCore {
         }
     }
 
-    pub(crate) fn restore_history(
-        &mut self,
-        history: &PolicyHistory,
-    ) -> Result<(), LoopError> {
-        self.last_action = history
-            .last_action
-            .as_slice()
-            .try_into()
-            .map_err(|_| LoopError::SensorLength {
-                actual: history.last_action.len(),
-                expected: ACTION_LEN,
-            })?;
+    pub(crate) fn restore_history(&mut self, history: &PolicyHistory) -> Result<(), LoopError> {
+        self.last_action =
+            history
+                .last_action
+                .as_slice()
+                .try_into()
+                .map_err(|_| LoopError::SensorLength {
+                    actual: history.last_action.len(),
+                    expected: ACTION_LEN,
+                })?;
         if self.last_action.iter().any(|value| !value.is_finite()) {
             return Err(LoopError::InvalidBackendState {
                 field: "policy last action",
@@ -156,10 +173,7 @@ impl PolicyControlCore {
             .map(TryInto::try_into)
             .transpose()
             .map_err(|_| LoopError::SensorLength {
-                actual: history
-                    .previous_targets
-                    .as_ref()
-                    .map_or(0, Vec::len),
+                actual: history.previous_targets.as_ref().map_or(0, Vec::len),
                 expected: NUM_JOINTS,
             })?;
         if self
@@ -303,7 +317,7 @@ impl PolicyControlCore {
     }
 }
 
-fn validate_config(config: PolicyConfig) -> Result<(), LoopError> {
+pub(crate) fn validate_config(config: PolicyConfig) -> Result<(), LoopError> {
     if !config.action_scale.is_finite()
         || config.action_scale <= 0.0
         || [config.head_lowpass, config.legs_lowpass]
@@ -354,6 +368,114 @@ mod tests {
     use duck_body::{BodyProfile, BodyTemplate};
     use duck_control::obs::Command;
     use loop_body::BackendState;
+
+    #[test]
+    fn negative_hd1910_feedback_keeps_its_magnitude_through_binding_and_observation() {
+        let profile = BodyProfile::from_template(BodyTemplate::official().unwrap()).unwrap();
+        let ranges = profile
+            .template()
+            .joints
+            .iter()
+            .map(|joint| joint.range_rad)
+            .collect();
+        let core = PolicyControlCore::new(&profile, ranges, PolicyConfig::default()).unwrap();
+        let knee = profile
+            .template()
+            .actuators
+            .iter()
+            .position(|slot| slot.id == "left_knee")
+            .unwrap();
+        // Address 56 motion data: position 2048, velocity sign-magnitude -100.
+        let (position, velocity) = servo::hd1910::decode_motion_block(&[0, 8, 100, 0x80]).unwrap();
+        let expected_speed = 100.0 * 0.732 * std::f64::consts::TAU / 60.0;
+        for direction in [-1, 1] {
+            let calibration = duck_body::BodyBinding {
+                body_id: profile.template().id.clone(),
+                body_version: profile.template().version,
+                joints: profile
+                    .template()
+                    .actuators
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slot)| duck_body::JointCalibration {
+                        slot_id: slot.id.clone(),
+                        physical_id: (index + 1) as u8,
+                        direction,
+                        zero_offset_rad: 0.25,
+                        min_rad: None,
+                        max_rad: None,
+                    })
+                    .collect(),
+            };
+            let mut servo_positions = vec![0.0; calibration.joints.len()];
+            let mut servo_velocities = servo_positions.clone();
+            servo_positions[knee] = position;
+            servo_velocities[knee] = velocity;
+            let state = BackendState {
+                positions: calibration.to_body_positions(&servo_positions),
+                velocities: calibration.to_body_velocities(&servo_velocities),
+                imu: None,
+                sequence: 1,
+                sampled_at: loop_body::SampleTime(1),
+                valid_positions: vec![true; calibration.joints.len()],
+                valid_velocities: vec![true; calibration.joints.len()],
+                source: Some("hd1910".into()),
+            };
+            let (observation, _, _) = core
+                .encode_observation(&state, &Command::default())
+                .unwrap();
+            assert!(
+                (f64::from(observation.as_slice()[20 + knee])
+                    + f64::from(direction) * expected_speed)
+                    .abs()
+                    < 1e-6
+            );
+            assert_eq!(
+                calibration.to_servo_positions_unchecked(&state.positions),
+                servo_positions
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_seeds_action_history_and_filter_from_body_pose_using_the_new_scale() {
+        let profile = BodyProfile::from_template(BodyTemplate::official().unwrap()).unwrap();
+        let ranges = profile
+            .template()
+            .joints
+            .iter()
+            .map(|joint| joint.range_rad)
+            .collect();
+        let mut core = PolicyControlCore::new(
+            &profile,
+            ranges,
+            PolicyConfig {
+                action_scale: 0.8,
+                ..PolicyConfig::default()
+            },
+        )
+        .unwrap();
+        let pose: Vec<_> = profile
+            .template()
+            .control
+            .home_pose
+            .iter()
+            .map(|home| home + 0.2)
+            .collect();
+        core.seed_from_pose(&pose).unwrap();
+        let history = core.history();
+        assert_eq!(history.previous_targets.as_ref().unwrap(), &pose);
+        assert!(
+            history
+                .last_action
+                .iter()
+                .all(|action| (*action - 0.25).abs() < 1e-6)
+        );
+        let mut invalid = pose;
+        invalid[0] = f64::NAN;
+        assert!(core.seed_from_pose(&invalid).is_err());
+        assert_eq!(core.history(), history);
+    }
 
     #[test]
     fn same_backend_frame_and_action_produce_the_same_canonical_target() {
@@ -440,8 +562,8 @@ mod tests {
             valid_velocities: vec![true; 15],
             source: Some("test".into()),
         };
-        let mut first = PolicyControlCore::new(&profile, ranges.clone(), PolicyConfig::default())
-            .unwrap();
+        let mut first =
+            PolicyControlCore::new(&profile, ranges.clone(), PolicyConfig::default()).unwrap();
         let input = ControlTickInput {
             backend_state: state.clone(),
             command: Command::default(),
@@ -450,7 +572,8 @@ mod tests {
         let expected = first.control_tick(&input).unwrap();
         let history = first.history();
 
-        let mut resumed = PolicyControlCore::new(&profile, ranges, PolicyConfig::default()).unwrap();
+        let mut resumed =
+            PolicyControlCore::new(&profile, ranges, PolicyConfig::default()).unwrap();
         resumed.restore_history(&history).unwrap();
         let (observation, _, _) = resumed
             .encode_observation(&state, &Command::default())

@@ -53,7 +53,35 @@ pub(crate) fn training_metadata(
             machine.body_id, identity.id
         ));
     }
-    let (policy_layout, policy_id) = if let Some(policy_id) = input
+    let (policy_layout, policy_id) = if let Some(dataset) = &input.dataset_path {
+        let dataset: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(dataset).join("dataset.json"))
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let contract = &dataset["policy_contract"];
+        if contract["body_id"].as_str() != Some(identity.id.as_str())
+            || contract["body_version"].as_u64() != Some(u64::from(identity.version))
+        {
+            return Err("教师数据的身体定义与所选模拟机不匹配".into());
+        }
+        let dimension = |name: &str| -> Result<usize, String> {
+            contract[name]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("教师数据缺少有效的 {name}"))
+        };
+        (
+            TrainingPolicyLayout {
+                obs_len: dimension("obs_len")?,
+                action_len: dimension("action_len")?,
+                control_hz: u32::try_from(dimension("control_hz")?).map_err(|e| e.to_string())?,
+                command_encoding: contract["command_encoding"].as_str().map(str::to_owned),
+            },
+            contract["id"].as_str().map(str::to_owned),
+        )
+    } else if let Some(policy_id) = input
         .policy_id
         .as_deref()
         .map(str::trim)
@@ -183,6 +211,24 @@ fn parse_training_line(progress: &mut TrainingProgress, line: &str) {
 fn emit_training_progress(state: &DesktopState, progress: TrainingProgress) {
     persist_training_progress(&progress);
     if let Ok(mut current) = state.training_progress.lock() {
+        if current.as_ref().is_none_or(|current| {
+            current.run_id != progress.run_id || current.phase != progress.phase
+        }) {
+            crate::logging::diagnostic(
+                state.config_dir.as_deref(),
+                "training",
+                if progress.phase == TrainingPhase::Failed {
+                    "error"
+                } else {
+                    "info"
+                },
+                "training_phase_changed",
+                serde_json::json!({
+                    "training_run_id":progress.run_id,"phase":progress.phase,
+                    "path":progress.result_dir,"message":progress.message,"exit_code":progress.exit_code,
+                }),
+            );
+        }
         *current = Some(progress.clone());
     }
     if let Ok(app) = state.app_handle.lock()
@@ -191,9 +237,24 @@ fn emit_training_progress(state: &DesktopState, progress: TrainingProgress) {
         let _ = app.emit("training-progress", progress);
     }
 }
-fn spawn_training_reader(app: AppHandle<Wry>, reader: impl std::io::Read + Send + 'static) {
+fn spawn_training_reader(
+    app: AppHandle<Wry>,
+    reader: impl std::io::Read + Send + 'static,
+    channel: &'static str,
+    initial: TrainingProgress,
+) {
     std::thread::spawn(move || {
+        use std::io::Write;
+        let path = std::path::Path::new(&initial.result_dir).join(format!("{channel}.log"));
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if let Some(output) = &mut output {
+                let _ = writeln!(output, "{line}");
+            }
             let state = app.state::<DesktopState>();
             let Some(mut progress) = state
                 .training_progress
@@ -203,6 +264,9 @@ fn spawn_training_reader(app: AppHandle<Wry>, reader: impl std::io::Read + Send 
             else {
                 continue;
             };
+            if progress.run_id != initial.run_id {
+                continue;
+            }
             parse_training_line(&mut progress, &line);
             emit_training_progress(&state, progress);
         }
@@ -261,9 +325,37 @@ pub(crate) fn start(
         .map_err(|error| error.to_string())?
         .clone()
         .ok_or_else(|| "训练事件通道尚未初始化".to_owned())?;
+    let mut args = input.args.clone();
+    if let Some(dataset) = &input.dataset_path {
+        let dataset = std::path::absolute(dataset).map_err(|e| e.to_string())?;
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dataset.join("dataset.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if manifest["kind"] != "policy" || manifest["samples"].as_u64().unwrap_or(0) < 2 {
+            return Err("请选择至少包含两个有效样本的策略模仿数据集".into());
+        }
+        let script = result_dir.join("teacher_train.py");
+        std::fs::write(&script, include_str!("../../../training/teacher_train.py"))
+            .map_err(|e| e.to_string())?;
+        args = vec![
+            "run".into(),
+            "python".into(),
+            script.to_string_lossy().into_owned(),
+            "--dataset".into(),
+            dataset.to_string_lossy().into_owned(),
+            "--output".into(),
+            result_dir.to_string_lossy().into_owned(),
+        ];
+        std::fs::write(
+            result_dir.join("teacher-dataset.json"),
+            serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let mut command = ProcessCommand::new(&input.program);
     command
-        .args(&input.args)
+        .args(&args)
         .current_dir(&working_dir)
         .env("MICRODUCK_TRAINING_RUN_ID", &run_id)
         .env("MICRODUCK_TRAINING_RESULT_DIR", &result_dir)
@@ -300,10 +392,10 @@ pub(crate) fn start(
     };
     emit_training_progress(state, starting.clone());
     if let Some(stdout) = stdout {
-        spawn_training_reader(app.clone(), stdout);
+        spawn_training_reader(app.clone(), stdout, "stdout", starting.clone());
     }
     if let Some(stderr) = stderr {
-        spawn_training_reader(app.clone(), stderr);
+        spawn_training_reader(app.clone(), stderr, "stderr", starting.clone());
     }
     let initial_progress = starting.clone();
     std::thread::spawn(move || {

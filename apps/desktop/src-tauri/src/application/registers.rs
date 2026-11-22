@@ -317,34 +317,13 @@ fn write_register_on_bus(
     bus.ok_or_else(|| "physical machine is not connected".to_owned())?
         .write_register(model, input.servo_id, register, i64::from(input.value))?;
     if let Some(new_servo_id) = new_servo_id {
-        let virtual_machine_id = {
-            let mut machines = state
-                .physical_machines
-                .lock()
-                .map_err(|error| error.to_string())?;
+        {
+            let mut machines = state.physical_machines.lock().map_err(|e| e.to_string())?;
             let machine = machines
                 .iter_mut()
                 .find(|machine| machine.id == input.physical_machine_id)
-                .ok_or_else(|| "unknown physical machine".to_owned())?;
-            let old_servo_id = input.servo_id;
-            update_servo_id_cache(machine, old_servo_id, new_servo_id)?;
-            machine.virtual_machine_id.clone()
-        };
-        if let Some(virtual_machine_id) = virtual_machine_id {
-            let mut virtual_machines = state
-                .virtual_machines
-                .lock()
-                .map_err(|error| error.to_string())?;
-            if let Some(virtual_machine) = virtual_machines
-                .iter_mut()
-                .find(|virtual_machine| virtual_machine.id == virtual_machine_id)
-            {
-                for binding in &mut virtual_machine.joint_bindings {
-                    if binding.physical_id == input.servo_id {
-                        binding.physical_id = new_servo_id;
-                    }
-                }
-            }
+                .ok_or("unknown physical machine")?;
+            update_servo_id_cache(machine, input.servo_id, new_servo_id)?;
         }
         state.persist()?;
     }
@@ -434,7 +413,8 @@ mod tests {
             connected: false,
             last_seen: None,
             torque_enabled: false,
-            joint_directions: vec![],
+            joint_directions: Vec::new(),
+            joint_bindings: vec![],
         }
     }
 

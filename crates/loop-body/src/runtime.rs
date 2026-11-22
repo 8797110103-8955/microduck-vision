@@ -250,6 +250,10 @@ impl<E, S> RuntimeLoop<E, S> {
     pub fn config(&self) -> &LoopRuntimeConfig {
         &self.config
     }
+
+    pub fn tick_index(&self) -> ControlTick {
+        self.tick
+    }
     pub fn set_control_source(&mut self, source: ControlSource) -> Result<(), RuntimeConfigError> {
         if self.execution.is_none() && source != ControlSource::None {
             return Err(RuntimeConfigError::MissingExecutionBackend);

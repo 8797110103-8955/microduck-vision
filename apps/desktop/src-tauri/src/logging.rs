@@ -1,9 +1,9 @@
-//! Small file logger for hardware control-loop I/O.
+//! JSON Lines diagnostics for application events and hardware control-loop I/O.
 
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::policy_runtime::PolicyTrace;
@@ -12,7 +12,7 @@ use servo::{ServoError, ServoImuSample, ServoPositionSample, ServoPositionTarget
 
 use crate::state::types::JointRangeState;
 
-fn log_directory(config_dir: Option<&Path>) -> PathBuf {
+pub(crate) fn log_directory(config_dir: Option<&Path>) -> PathBuf {
     config_dir
         .and_then(Path::parent)
         .map(|root| root.join("logs"))
@@ -39,7 +39,7 @@ fn date_stamp() -> String {
 }
 
 pub(crate) fn current_log_file(config_dir: Option<&Path>) -> PathBuf {
-    log_directory(config_dir).join(format!("{}.log", date_stamp()))
+    log_directory(config_dir).join(format!("{}.jsonl", date_stamp()))
 }
 
 fn timestamp_millis() -> u128 {
@@ -50,30 +50,178 @@ fn timestamp_millis() -> u128 {
 }
 
 fn append_line(path: &Path, line: &str) {
-    let result = (|| -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+    let event = line.split_whitespace().next().unwrap_or("event");
+    let level =
+        if event.contains("error") || event.contains("fault") || line.contains("result=failed") {
+            "error"
+        } else if event.contains("missed") || event.contains("violation") {
+            "warn"
+        } else {
+            "info"
+        };
+    enqueue(
+        path,
+        serde_json::json!({
+            "timestamp_ms":timestamp_millis() as u64, "app_session_id":crate::recordings::app_session_id(),
+            "category":event.split('_').next().unwrap_or("control"),"level":level,
+            "event":event,"message":line,
+            "context":contexts().lock().ok().and_then(|contexts| contexts.get(path).cloned()),
+        }),
+    );
+}
+
+pub(crate) fn diagnostic(
+    config: Option<&Path>,
+    category: &str,
+    level: &str,
+    event: &str,
+    context: serde_json::Value,
+) {
+    enqueue(
+        &current_log_file(config),
+        serde_json::json!({
+            "timestamp_ms":timestamp_millis() as u64,"app_session_id":crate::recordings::app_session_id(),
+            "category":category,"level":level,"event":event,"context":context,
+        }),
+    );
+}
+
+pub(crate) fn frontend_diagnostic(config: Option<&Path>, message: String) {
+    let message = message.chars().take(8192).collect::<String>();
+    if let Ok(context) = serde_json::from_str::<serde_json::Value>(&message)
+        && context.get("event").and_then(serde_json::Value::as_str) == Some("debug_pose_applied")
+    {
+        diagnostic(config, "debug", "info", "debug_pose_applied", context);
+    } else {
+        diagnostic(
+            config,
+            "frontend",
+            "error",
+            "frontend_error",
+            serde_json::json!({"message":message}),
+        );
+    }
+}
+
+#[cfg(test)]
+fn write_event(path: &Path, event: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, event)?;
+    writeln!(file)
+}
+
+#[cfg(not(test))]
+enum DiagnosticPacket {
+    Write(PathBuf, serde_json::Value),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+#[cfg(not(test))]
+fn diagnostic_queue() -> &'static std::sync::mpsc::SyncSender<DiagnosticPacket> {
+    use std::collections::HashMap;
+    use std::io::BufWriter;
+    use std::sync::{OnceLock, mpsc};
+    static QUEUE: OnceLock<mpsc::SyncSender<DiagnosticPacket>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(8192);
+        std::thread::spawn(move || {
+            let mut files: HashMap<PathBuf, BufWriter<std::fs::File>> = HashMap::new();
+            let mut last_flush = std::time::Instant::now();
+            loop {
+                let mut acknowledge = None;
+                match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(DiagnosticPacket::Write(path, event)) => {
+                        if !files.contains_key(&path) {
+                            if let Some(parent) = path.parent() {
+                                let _ = create_dir_all(parent);
+                            }
+                            match OpenOptions::new().create(true).append(true).open(&path) {
+                                Ok(file) => {
+                                    files.insert(path.clone(), BufWriter::new(file));
+                                }
+                                Err(error) => {
+                                    eprintln!("diagnostic write failed: {error}");
+                                    continue;
+                                }
+                            }
+                        }
+                        let file = files.get_mut(&path).expect("opened log");
+                        if let Err(error) = serde_json::to_writer(&mut *file, &event)
+                            .map_err(std::io::Error::other)
+                            .and_then(|()| writeln!(file))
+                        {
+                            eprintln!("diagnostic write failed: {error}");
+                        }
+                    }
+                    Ok(DiagnosticPacket::Flush(done)) => {
+                        acknowledge = Some(done);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if acknowledge.is_some()
+                    || last_flush.elapsed() >= std::time::Duration::from_millis(250)
+                {
+                    for file in files.values_mut() {
+                        if let Err(error) = file.flush() {
+                            eprintln!("diagnostic flush failed: {error}");
+                        }
+                    }
+                    last_flush = std::time::Instant::now();
+                }
+                if let Some(done) = acknowledge {
+                    let _ = done.send(());
+                }
+            }
+        });
+        sender
+    })
+}
+
+pub(crate) fn flush() {
+    #[cfg(not(test))]
+    {
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        if diagnostic_queue()
+            .send(DiagnosticPacket::Flush(done))
+            .is_ok()
+        {
+            let _ = result.recv();
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "[{}] {line}", timestamp_millis())
-    })();
-    if let Err(error) = result {
-        eprintln!("control-loop log write failed: {error}");
+    }
+}
+
+fn enqueue(path: &Path, event: serde_json::Value) {
+    #[cfg(test)]
+    if let Err(error) = write_event(path, &event) {
+        eprintln!("diagnostic write failed: {error}");
+    }
+    #[cfg(not(test))]
+    if diagnostic_queue()
+        .try_send(DiagnosticPacket::Write(path.to_owned(), event))
+        .is_err()
+    {
+        eprintln!("diagnostic queue full or closed");
+    }
+}
+
+type ContextMap = std::sync::Mutex<std::collections::HashMap<PathBuf, serde_json::Value>>;
+fn contexts() -> &'static ContextMap {
+    static CONTEXT: std::sync::OnceLock<ContextMap> = std::sync::OnceLock::new();
+    CONTEXT.get_or_init(ContextMap::default)
+}
+
+pub(crate) fn set_context(config: Option<&Path>, context: serde_json::Value) {
+    if let Ok(mut contexts) = contexts().lock() {
+        contexts.insert(current_log_file(config), context);
     }
 }
 
 fn append_handle(handle: &LogHandle, line: &str) {
-    let result = (|| -> std::io::Result<()> {
-        let mut writer = handle
-            .lock()
-            .map_err(|_| std::io::Error::other("control-loop log lock poisoned"))?;
-        writer.rotate_if_needed()?;
-        writeln!(writer.file, "[{}] {line}", timestamp_millis())?;
-        writer.file.flush()
-    })();
-    if let Err(error) = result {
-        eprintln!("control-loop log write failed: {error}");
-    }
+    append_line(handle, line);
 }
 
 pub(crate) fn log_joint_range_states(config_dir: Option<&Path>, states: &[JointRangeState]) {
@@ -99,40 +247,7 @@ pub(crate) fn log_joint_range_states(config_dir: Option<&Path>, states: &[JointR
     }
 }
 
-pub(crate) struct LogWriter {
-    config_dir: Option<PathBuf>,
-    day: String,
-    file: File,
-}
-
-impl LogWriter {
-    fn open(config_dir: Option<&Path>) -> std::io::Result<Self> {
-        let day = date_stamp();
-        let path = current_log_file(config_dir);
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
-            config_dir: config_dir.map(Path::to_path_buf),
-            day,
-            file,
-        })
-    }
-
-    fn rotate_if_needed(&mut self) -> std::io::Result<()> {
-        let day = date_stamp();
-        if day == self.day {
-            return Ok(());
-        }
-        let next = Self::open(self.config_dir.as_deref())?;
-        self.day = next.day;
-        self.file = next.file;
-        Ok(())
-    }
-}
-
-pub(crate) type LogHandle = Arc<Mutex<LogWriter>>;
+pub(crate) type LogHandle = Arc<PathBuf>;
 
 pub(crate) fn begin_control_loop(
     config_dir: Option<&Path>,
@@ -140,28 +255,15 @@ pub(crate) fn begin_control_loop(
     machine_name: &str,
     binding_summary: &str,
 ) -> Option<LogHandle> {
-    let mut writer = match LogWriter::open(config_dir) {
-        Ok(writer) => writer,
-        Err(error) => {
-            eprintln!("control-loop log initialization failed: {error}");
-            return None;
-        }
-    };
-    let result = writeln!(
-        writer.file,
-        "[{}] loop_open machine_id={} machine_name={:?} binding={ids}",
-        timestamp_millis(),
-        machine_id,
-        machine_name,
-        ids = binding_summary
+    let path = current_log_file(config_dir);
+    append_line(
+        &path,
+        &format!(
+            "loop_open machine_id={machine_id} machine_name={machine_name:?} binding={binding_summary}"
+        ),
     );
-    if let Err(error) = result {
-        eprintln!("control-loop log initialization failed: {error}");
-        return None;
-    }
-    Some(Arc::new(Mutex::new(writer)))
+    Some(Arc::new(path))
 }
-
 pub(crate) fn append_policy_trace(config_dir: Option<&Path>, tick: u64, trace: &PolicyTrace) {
     let imu_observation = trace.observation.get(..6).unwrap_or_default();
     let joint_position_observation = trace.observation.get(6..20).unwrap_or_default();
@@ -243,6 +345,8 @@ pub(crate) struct LoggedServoDriver {
     inner: Box<dyn ControlBackend>,
     handle: LogHandle,
     machine_id: String,
+    calibration: Option<loop_body::Calibration>,
+    periodic_ranges: Option<Vec<[f64; 2]>>,
 }
 
 impl LoggedServoDriver {
@@ -255,13 +359,25 @@ impl LoggedServoDriver {
             inner,
             handle,
             machine_id: machine_id.into(),
+            calibration: None,
+            periodic_ranges: None,
         }
+    }
+
+    pub(crate) fn with_calibration(
+        mut self,
+        calibration: loop_body::Calibration,
+        periodic_ranges: Option<Vec<[f64; 2]>>,
+    ) -> Self {
+        self.calibration = Some(calibration);
+        self.periodic_ranges = periodic_ranges;
+        self
     }
 
     fn line(&self, message: impl AsRef<str>) {
         append_handle(
             &self.handle,
-            &format!("machine_id={} {}", self.machine_id, message.as_ref()),
+            &format!("{} machine_id={}", message.as_ref(), self.machine_id),
         );
     }
 }
@@ -285,8 +401,39 @@ impl servo::ServoLoopDriver for LoggedServoDriver {
         match &result {
             Ok(sample) => {
                 for (index, id) in ids.iter().enumerate() {
+                    let mapping = self
+                        .calibration
+                        .as_ref()
+                        .and_then(|binding| {
+                            binding
+                                .joints
+                                .iter()
+                                .enumerate()
+                                .find(|(_, joint)| joint.physical_id == *id)
+                        })
+                        .map(|(slot_index, joint)| {
+                            let raw = sample.positions.get(index).copied().unwrap_or_default();
+                            let position = self
+                                .periodic_ranges
+                                .as_ref()
+                                .and_then(|ranges| ranges.get(slot_index))
+                                .map_or_else(
+                                    || (raw - joint.zero_offset_rad) * f64::from(joint.direction),
+                                    |range| {
+                                        crate::backend::hd1910_body::display_position(
+                                            raw, joint, *range,
+                                        )
+                                    },
+                                );
+                            format!(
+                                " slot_id={} direction={} zero_offset_rad={} body_position_rad={} position_turn_offset_rad={}",
+                                joint.slot_id, joint.direction, joint.zero_offset_rad, position,
+                                joint.zero_offset_rad + position * f64::from(joint.direction) - raw
+                            )
+                        })
+                        .unwrap_or_default();
                     self.line(format!(
-                        "servo_read id={} position_rad={} velocity_rad_s={}",
+                        "servo_read id={} position_rad={} velocity_rad_s={}{mapping}",
                         id,
                         sample.positions.get(index).copied().unwrap_or_default(),
                         sample.velocities.get(index).copied().unwrap_or_default()
@@ -318,14 +465,17 @@ impl servo::ServoLoopDriver for LoggedServoDriver {
     ) -> Result<(), ServoError> {
         for (index, id) in ids.iter().enumerate() {
             self.line(format!(
-                "servo_write id={} target_rad={}",
+                "servo_write_request id={} target_rad={}",
                 id,
                 targets.positions.get(index).copied().unwrap_or_default()
             ));
         }
         let result = self.inner.write_positions(ids, targets);
-        if let Err(error) = &result {
-            self.line(format!("servo_write_error ids={ids:?} error={error}"));
+        match &result {
+            Ok(()) => self.line(format!("servo_write_result ids={ids:?} result=accepted")),
+            Err(error) => self.line(format!(
+                "servo_write_result ids={ids:?} result=failed error={error}"
+            )),
         }
         result
     }
@@ -335,6 +485,8 @@ impl servo::ServoLoopDriver for LoggedServoDriver {
         let result = self.inner.set_torque(enabled);
         if let Err(error) = &result {
             self.line(format!("servo_torque_error error={error}"));
+        } else {
+            self.line(format!("servo_torque_result enabled={enabled} result=ok"));
         }
         result
     }
@@ -401,7 +553,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("microduck-control-log-{suffix}"));
+        let root = crate::helpers::test_directory().join(format!("microduck-control-log-{suffix}"));
         let config_dir = root.join("config");
         let handle = begin_control_loop(
             Some(&config_dir),
@@ -410,7 +562,22 @@ mod tests {
             "left_hip_yaw->1 dir=1 offset=0",
         )
         .unwrap();
-        let mut driver = LoggedServoDriver::new(Box::new(FakeDriver), handle, "physical-1");
+        let mut driver = LoggedServoDriver::new(Box::new(FakeDriver), handle, "physical-1")
+            .with_calibration(
+                loop_body::Calibration {
+                    body_id: "official".into(),
+                    body_version: 1,
+                    joints: vec![loop_body::JointCalibration {
+                        slot_id: "left_knee".into(),
+                        physical_id: 1,
+                        direction: -1,
+                        zero_offset_rad: 0.4,
+                        min_rad: None,
+                        max_rad: None,
+                    }],
+                },
+                None,
+            );
         driver.read_positions(&[1, 2]).unwrap();
         driver
             .write_positions(
@@ -423,8 +590,39 @@ mod tests {
         let text = std::fs::read_to_string(current_log_file(Some(&config_dir))).unwrap();
         assert!(text.contains("servo_read id=1"));
         assert!(text.contains("servo_read id=2"));
-        assert!(text.contains("servo_write id=1 target_rad=0.1"));
-        assert!(text.contains("servo_write id=2 target_rad=-0.2"));
+        assert!(
+            text.contains(
+                "slot_id=left_knee direction=-1 zero_offset_rad=0.4 body_position_rad=-0.6"
+            )
+        );
+        frontend_diagnostic(
+            Some(&config_dir),
+            serde_json::json!({
+                "event":"debug_pose_applied", "physicalMachineId":"physical-1",
+                "sourceGeneration":7,"positions":[0,0,0,-0.6],
+            })
+            .to_string(),
+        );
+        frontend_diagnostic(Some(&config_dir), "a frontend error".into());
+        let text = std::fs::read_to_string(current_log_file(Some(&config_dir))).unwrap();
+        let events = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let pose = events
+            .iter()
+            .find(|event| event["event"] == "debug_pose_applied")
+            .unwrap();
+        assert_eq!(pose["level"], "info");
+        assert_eq!(pose["context"]["sourceGeneration"], 7);
+        assert_eq!(pose["context"]["positions"][3], -0.6);
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "frontend_error" && event["level"] == "error")
+        );
+        assert!(text.contains("servo_write_request id=1 target_rad=0.1"));
+        assert!(text.contains("servo_write_request id=2 target_rad=-0.2"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -434,7 +632,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("microduck-policy-log-{suffix}"));
+        let root = crate::helpers::test_directory().join(format!("microduck-policy-log-{suffix}"));
         let config_dir = root.join("config");
         let trace = crate::backend::policy_runtime::PolicyTrace {
             phase: loop_body::LoopPhase::Driving,
@@ -464,7 +662,7 @@ mod tests {
         assert!(text.contains("backend_positions=[0.1]"));
         assert!(text.contains("backend_velocities=[0.4]"));
         assert!(text.contains("execution_positions=[0.15]"));
-        assert!(text.contains("saturation_reason=[\"target_filter\"]"));
+        assert!(text.contains("target_filter"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -502,7 +700,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("microduck-diagnostic-log-{suffix}"));
+        let root =
+            crate::helpers::test_directory().join(format!("microduck-diagnostic-log-{suffix}"));
         let config_dir = root.join("config");
         for reason in [
             "body_range_exceeded",

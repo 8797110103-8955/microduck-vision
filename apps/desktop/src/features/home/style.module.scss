@@ -70,11 +70,13 @@
 .previewLoopBar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin-bottom: 32px;
 
   button {
+    flex-shrink: 0;
     padding: 6px 12px;
     border: 1px solid $border;
     border-radius: 7px;
@@ -92,12 +94,15 @@
   }
 
   small {
+    flex: 1 1 100%;
+    order: 1;
     color: $muted;
     font-size: 11px;
   }
 
   .previewError {
-    flex: 1 1 auto;
+    flex: 1 1 100%;
+    order: 2;
     min-width: 0;
   }
 
