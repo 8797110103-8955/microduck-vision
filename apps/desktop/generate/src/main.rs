@@ -1,11 +1,6 @@
 use std::{fs, io, path::Path};
 
-extern crate self as duck_body;
-#[path = "../../../../crates/duck-body/src/types.rs"]
-mod duck_body_types;
-pub use duck_body_types::*;
-
-#[path = "../../src-tauri/src/state/types.rs"]
+#[path = "../../src-tauri/src/platform/state/types.rs"]
 #[allow(dead_code)]
 mod types;
 

@@ -66,12 +66,6 @@ impl ActuatorDelaySpec {
     }
 }
 
-/// Shared backend boundary. The low-level servo API remains available for register and bus
-/// adapters; control code can depend on this marker without knowing a concrete transport.
-pub trait ControlBackend: servo::ServoLoopDriver {}
-
-impl<T: servo::ServoLoopDriver + ?Sized> ControlBackend for T {}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum LoopError {
     #[error("body error: {0}")]
@@ -313,7 +307,7 @@ pub struct SensorFrame {
     pub valid: Vec<bool>,
     pub positions: Vec<f64>,
     pub velocities: Vec<f64>,
-    pub imu: Option<servo::ServoImuSample>,
+    pub imu: Option<crate::BackendImuSample>,
 }
 
 /// Canonical state returned by a selected control backend.
@@ -325,7 +319,7 @@ pub struct SensorFrame {
 pub struct BackendState {
     pub positions: Vec<f64>,
     pub velocities: Vec<f64>,
-    pub imu: Option<servo::ServoImuSample>,
+    pub imu: Option<crate::BackendImuSample>,
     pub sequence: u64,
     pub sampled_at: SampleTime,
     pub valid_positions: Vec<bool>,

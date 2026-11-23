@@ -7,8 +7,8 @@ use rustypot::servo::dynamixel::{xl330, xl430};
 use rustypot::servo::feetech::sts3215;
 use rustypot::servo::{Encoding, RegisterError, ServoKind, WordOrder, find_model, scan_timeout};
 use servo::{
-    MemoryXl330Bus, RawBus, RustypotXl330Bus, ServoCommand, ServoDriver, ServoError,
-    ServoLoopDriver, ServoPositionTargets, ServoTelemetry, XL330, XL330_CAPABILITIES,
+    MemoryXl330Bus, RawBus, RustypotXl330Bus, ServoCommand, ServoDeviceDriver, ServoDriver,
+    ServoError, ServoPositionTargets, ServoTelemetry, XL330, XL330_CAPABILITIES,
     XL330_DEFAULT_BAUD, XL330_MODEL_NAME, XL330_MODEL_NUMBER, XL330_RESOLUTION, Xl330Driver,
     decode_register, encode_register, position_rad_from_raw, position_raw_from_rad, register,
     registers, velocity_rad_s_from_raw,
@@ -17,6 +17,25 @@ use servo::{
 use crate::support::ScriptedPort;
 use std::collections::VecDeque;
 use std::time::Duration;
+
+#[test]
+fn position_pid_updates_only_the_selected_device() {
+    let mut bus = MemoryXl330Bus::with_servos(&[1, 2]);
+    for id in [1, 2] {
+        bus.set_register(id, "position_p_gain", 32).unwrap();
+        bus.set_register(id, "position_i_gain", 12).unwrap();
+        bus.set_register(id, "position_d_gain", 40).unwrap();
+    }
+    servo::xl330::set_position_pid(&mut bus, 2, 200, 0, 0).unwrap();
+    for (name, untouched, configured) in [
+        ("position_p_gain", 32, 200),
+        ("position_i_gain", 12, 0),
+        ("position_d_gain", 40, 0),
+    ] {
+        assert_eq!(bus.register(1, name), untouched);
+        assert_eq!(bus.register(2, name), configured);
+    }
+}
 
 #[test]
 fn servo_public_keys_and_vendor_types_compile() {
@@ -89,10 +108,10 @@ impl RawBus for DriverBus {
 #[test]
 fn xl330_driver_uses_vendor_register_layout_for_loop_io() {
     let mut driver = Xl330Driver::new(DriverBus::default()).with_ids([1]);
-    let sample = ServoLoopDriver::read_positions(&mut driver, &[1]).unwrap();
+    let sample = ServoDeviceDriver::read_positions(&mut driver, &[1]).unwrap();
     assert_eq!(sample.positions.len(), 1);
     assert_eq!(sample.velocities, vec![0.0]);
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[1],
         &ServoPositionTargets {
@@ -100,8 +119,8 @@ fn xl330_driver_uses_vendor_register_layout_for_loop_io() {
         },
     )
     .unwrap();
-    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
-    ServoLoopDriver::set_gain(&mut driver, 200).unwrap();
+    ServoDeviceDriver::set_torque(&mut driver, true).unwrap();
+    ServoDeviceDriver::set_gain(&mut driver, 200).unwrap();
     let bus = driver.into_inner();
     assert_eq!(bus.goal, vec![0, 8, 0, 0]);
     assert_eq!(bus.torque, vec![1]);
@@ -118,7 +137,7 @@ fn xl330_reads_all_requested_ids_with_the_contiguous_motion_window() {
         ..DriverBus::default()
     };
     let mut driver = Xl330Driver::new(bus);
-    let sample = ServoLoopDriver::read_positions(&mut driver, &[2, 3]).unwrap();
+    let sample = ServoDeviceDriver::read_positions(&mut driver, &[2, 3]).unwrap();
     let bus = driver.into_inner();
 
     assert_eq!(bus.sync_reads, [(vec![2, 3], 128, 8)]);
@@ -134,7 +153,7 @@ fn xl330_rejects_sync_read_count_and_short_blocks() {
         ..DriverBus::default()
     };
     let mut count_driver = Xl330Driver::new(count_bus);
-    let count_error = ServoLoopDriver::read_positions(&mut count_driver, &[1, 2]).unwrap_err();
+    let count_error = ServoDeviceDriver::read_positions(&mut count_driver, &[1, 2]).unwrap_err();
     assert!(matches!(count_error, ServoError::CountMismatch { .. }));
     let _count_bus = count_driver.into_inner();
 
@@ -143,7 +162,7 @@ fn xl330_rejects_sync_read_count_and_short_blocks() {
         ..DriverBus::default()
     };
     let mut short_driver = Xl330Driver::new(short_bus);
-    let short_error = ServoLoopDriver::read_positions(&mut short_driver, &[1]).unwrap_err();
+    let short_error = ServoDeviceDriver::read_positions(&mut short_driver, &[1]).unwrap_err();
     assert_eq!(
         short_error,
         ServoError::ShortRead {
@@ -158,7 +177,7 @@ fn xl330_rejects_sync_read_count_and_short_blocks() {
 fn xl330_writes_a_single_sync_packet_for_all_targets() {
     let bus = DriverBus::default();
     let mut driver = Xl330Driver::new(bus);
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[4, 5],
         &ServoPositionTargets {
@@ -178,7 +197,7 @@ fn xl330_writes_a_single_sync_packet_for_all_targets() {
 fn xl330_rejects_invalid_targets_without_emitting_a_sync_packet() {
     let bus = DriverBus::default();
     let mut driver = Xl330Driver::new(bus);
-    let mismatch = ServoLoopDriver::write_positions(
+    let mismatch = ServoDeviceDriver::write_positions(
         &mut driver,
         &[1, 2],
         &ServoPositionTargets {
@@ -187,7 +206,7 @@ fn xl330_rejects_invalid_targets_without_emitting_a_sync_packet() {
     )
     .unwrap_err();
     assert!(matches!(mismatch, ServoError::CountMismatch { .. }));
-    let out_of_range = ServoLoopDriver::write_positions(
+    let out_of_range = ServoDeviceDriver::write_positions(
         &mut driver,
         &[1],
         &ServoPositionTargets {
@@ -233,12 +252,12 @@ fn xl330_memory_bus_round_trips_vendor_registers_and_presence() {
 #[test]
 fn xl330_driver_and_memory_bus_preserve_the_complete_loop_contract() {
     let mut driver = Xl330Driver::new(MemoryXl330Bus::with_servos(&[1, 2])).with_ids([1, 2]);
-    let initial = ServoLoopDriver::read_positions(&mut driver, &[1, 2]).unwrap();
+    let initial = ServoDeviceDriver::read_positions(&mut driver, &[1, 2]).unwrap();
     assert_eq!(initial.positions, [0.0, 0.0]);
 
-    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
-    ServoLoopDriver::set_gain(&mut driver, 180).unwrap();
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::set_torque(&mut driver, true).unwrap();
+    ServoDeviceDriver::set_gain(&mut driver, 180).unwrap();
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[1, 2],
         &ServoPositionTargets {

@@ -4,7 +4,6 @@
 //! intentionally independent of Tauri, MuJoCo, serial transports and controller storage. Products
 //! resolve registrations and controller contracts before opening it.
 
-use servo::ServoLoopDriver;
 use std::time::Duration;
 
 use crate::{
@@ -409,7 +408,7 @@ impl RuntimeLoop {
                 execution
                     .write_positions(
                         &self.config.servo_ids,
-                        &servo::ServoPositionTargets { positions: targets },
+                        &crate::BackendPositionTargets { positions: targets },
                     )
                     .map_err(|error| RuntimeConfigError::Provider(error.to_string()))?;
             }
@@ -470,7 +469,8 @@ fn _backend_boundary(_: &dyn ControlBackend, _: ExecutionInterval) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use servo::{ServoError, ServoLoopDriver, ServoPositionSample, ServoPositionTargets};
+    use crate::{BackendJointSample, BackendPositionTargets};
+    use servo::ServoError;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -478,10 +478,10 @@ mod tests {
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    impl ServoLoopDriver for Recorder {
-        fn read_positions(&mut self, _: &[u8]) -> Result<ServoPositionSample, ServoError> {
+    impl ControlBackend for Recorder {
+        fn read_positions(&mut self, _: &[u8]) -> Result<BackendJointSample, ServoError> {
             self.calls.lock().unwrap().push("read");
-            Ok(ServoPositionSample {
+            Ok(BackendJointSample {
                 positions: vec![0.0],
                 velocities: vec![0.0],
             })
@@ -489,7 +489,7 @@ mod tests {
         fn write_positions(
             &mut self,
             _: &[u8],
-            _: &ServoPositionTargets,
+            _: &BackendPositionTargets,
         ) -> Result<(), ServoError> {
             self.calls.lock().unwrap().push("write");
             Ok(())

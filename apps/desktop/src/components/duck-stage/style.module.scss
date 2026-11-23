@@ -1,0 +1,156 @@
+@use "../../styles/tokens" as *;
+
+.officialDuckStage {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: $background;
+
+  .muted {
+    color: $muted;
+  }
+
+  .danger {
+    border-color: #f3c5c6;
+    color: $red;
+    background: $surface;
+  }
+
+  .stageBar {
+    position: absolute;
+    top: 10px;
+    right: 16px;
+    left: 16px;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    pointer-events: none;
+
+    > * {
+      pointer-events: auto;
+    }
+  }
+
+  .seg {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+
+    button {
+      padding: 5px 10px;
+      border: 0;
+      color: $muted;
+      background: none;
+
+      &:hover,
+      &.on {
+        color: $text;
+      }
+
+      &.on {
+        font-weight: 600;
+      }
+    }
+  }
+
+  .stageBody {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .viewport {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    background: radial-gradient(circle at 50% 40%, #fffdf6, $background);
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      user-select: none;
+    }
+  }
+
+  .duckLabel {
+    position: absolute;
+    z-index: 2;
+    transform: translate(-50%, -50%);
+    padding: 4px 8px;
+    border: 1px solid rgba($accent, 0.65);
+    border-radius: 99px;
+    color: #8d6500;
+    background: rgba($surface, 0.92);
+    font-size: 11px;
+    pointer-events: none;
+  }
+
+  .marker {
+    position: absolute;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 5px;
+    transform: translate(-50%, -50%);
+    border: 2px solid #fff;
+    border-radius: 12px;
+    color: #fff;
+    background: #9a968c;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    cursor: pointer;
+
+    &.online {
+      background: $green;
+    }
+
+    &.warn {
+      background: $amber;
+    }
+
+    &.missing {
+      background: $red;
+    }
+
+    &.unknown,
+    &.unmapped {
+      background: #9a968c;
+    }
+
+    &.active {
+      border-color: $accent;
+      box-shadow:
+        0 0 0 3px rgba($accent, 0.2),
+        0 1px 5px rgba(0, 0, 0, 0.28);
+      transform: translate(-50%, -50%) scale(1.08);
+    }
+
+    &.chip {
+      position: static;
+      display: inline-block;
+      min-width: 9px;
+      width: 9px;
+      height: 9px;
+      padding: 0;
+      transform: none;
+      border: 0;
+      border-radius: 50%;
+      box-shadow: none;
+      cursor: default;
+    }
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+}

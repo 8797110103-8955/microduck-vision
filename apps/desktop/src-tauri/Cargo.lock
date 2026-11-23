@@ -1100,7 +1100,6 @@ dependencies = [
  "serde",
  "serde_json",
  "servo",
- "specta",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
 ]
@@ -2536,15 +2535,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "microduck-body-runtime"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "duck-body",
+ "loop-body",
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "servo",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
+name = "microduck-training"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "microduck-vision"
 version = "0.1.0"
 dependencies = [
- "cc",
  "duck-body",
  "duck-control",
  "loop-body",
  "mcap",
  "md-5",
+ "microduck-body-runtime",
+ "microduck-training",
+ "ort",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4017,6 +4041,7 @@ name = "servo"
 version = "0.1.0"
 dependencies = [
  "rustypot",
+ "serde",
  "serialport",
  "thiserror 2.0.21",
 ]

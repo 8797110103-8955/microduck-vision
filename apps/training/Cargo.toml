@@ -1,0 +1,16 @@
+[package]
+name = "microduck-training"
+description = "MicroDuck Python training, task preparation, and artifact handling."
+# Owns the packaged Python runners and their execution protocol. Desktop supplies the
+# selected simulation body and projects progress, previews, and policy contracts into its UI.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"

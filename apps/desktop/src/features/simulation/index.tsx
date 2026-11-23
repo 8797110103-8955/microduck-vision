@@ -2,6 +2,7 @@ import * as commands from "../../../generated/types";
 import { computed, defineComponent, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import type {
+  ModelKindKey,
   ServoCatalogEntry,
   ServoModelKey,
   SimulationParameters,
@@ -13,6 +14,11 @@ import { servoModel } from "../debug/helpers";
 import style from "./style.module.scss";
 
 const randomFactor = (spread: number) => 1 - spread + Math.random() * spread * 2;
+const modelLabels = {
+  xl330: "XL330 官方",
+  hd1910: "HD1910 原生",
+  "hd1910-compatible": "HD1910 兼容 XL330",
+} satisfies Record<ModelKindKey, string>;
 
 export const SimulationPage = defineComponent(() => {
   const store = useDesktopStore();
@@ -27,6 +33,7 @@ export const SimulationPage = defineComponent(() => {
   const editingNameInput = shallowRef<HTMLInputElement>();
   const newName = ref("");
   const newServo = ref<ServoModelKey>(store.state.selectedServo);
+  const hdModelKind = ref<Exclude<ModelKindKey, "xl330">>("hd1910-compatible");
   const newSimulation = ref<SimulationParameters>(simulationFor(newServo.value));
 
   type SimulationFieldKey = Exclude<keyof SimulationParameters, "worldPosition">;
@@ -117,7 +124,8 @@ export const SimulationPage = defineComponent(() => {
 
   const create = async () => {
     const name = newName.value.trim() || `机器 ${store.state.virtualMachines.length}`;
-    await createVirtualMachine(name, newServo.value, newSimulation.value);
+    const modelKind = newServo.value === "xl330" ? "xl330" : hdModelKind.value;
+    await createVirtualMachine(name, newServo.value, newSimulation.value, modelKind);
     newName.value = "";
     createOpen.value = false;
   };
@@ -144,6 +152,7 @@ export const SimulationPage = defineComponent(() => {
           onPointerdown={(event: PointerEvent) => event.stopPropagation()}
           onClick={() => {
             newServo.value = store.state.selectedServo;
+            hdModelKind.value = "hd1910-compatible";
             newSimulation.value = randomSimulation(newServo.value);
             createOpen.value = !createOpen.value;
           }}
@@ -188,6 +197,24 @@ export const SimulationPage = defineComponent(() => {
                 ))}
               </Select>
             </label>
+            {newServo.value === "hd1910" && (
+              <label>
+                仿真模型
+                <Select
+                  aria-label="仿真模型"
+                  value={hdModelKind.value}
+                  onChange={(event: Event) => {
+                    if (event.currentTarget instanceof HTMLSelectElement) {
+                      hdModelKind.value =
+                        event.currentTarget.value === "hd1910" ? "hd1910" : "hd1910-compatible";
+                    }
+                  }}
+                >
+                  <option value="hd1910-compatible">{modelLabels["hd1910-compatible"]}</option>
+                  <option value="hd1910">{modelLabels.hd1910}</option>
+                </Select>
+              </label>
+            )}
             <div class={style.simulationCreateParameters}>
               <strong>仿真参数</strong>
               {fieldsFor(newServo.value).map(([key, label, description]) => (
@@ -281,10 +308,7 @@ export const SimulationPage = defineComponent(() => {
                         {physicalNames.length ? physicalNames.join("、") : "实机"}
                       </span>
                     </div>
-                    <span class={style.machineModel}>
-                      {store.state.catalog.find((entry) => entry.key === machine.servoModel)
-                        ?.label ?? machine.servoModel}
-                    </span>
+                    <span class={style.machineModel}>{modelLabels[machine.modelKind]}</span>
                   </div>
                 )}
                 {isExpanded && editing.value !== machine.id && (
@@ -338,6 +362,7 @@ export async function createVirtualMachine(
   name: string,
   model?: ServoModelKey,
   simulation?: SimulationParameters,
+  modelKind?: ModelKindKey,
 ) {
   const store = useDesktopStore();
   const selectedServo = model ?? store.state.selectedServo;
@@ -355,6 +380,8 @@ export async function createVirtualMachine(
   const machine = await commands.virtualMachineCreate({
     name,
     bodyId: "official",
+    executionKind: "simulation",
+    modelKind: modelKind ?? (selectedServo === "xl330" ? "xl330" : "hd1910-compatible"),
     servoModel: selectedServo,
     simulation: resolvedSimulation,
   });

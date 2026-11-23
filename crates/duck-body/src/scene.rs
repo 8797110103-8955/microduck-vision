@@ -1,21 +1,19 @@
-//! Official Microduck display scene loaded from the vendor MJCF.
-//!
-//! This stays in `duck-body` because the scene is a virtual body asset. It never opens a
-//! serial port or receives a real servo driver. The desktop adapter only serializes these
-//! values for the WebView's official duck preview.
+//! Body display geometry and forward kinematics from a caller-supplied MJCF.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use duck_ipc_proto::JOINT_NAMES;
 use kinematics::Model;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::assets::{mesh_directory, read_xml};
+use crate::{AssetResolver, BodyError, BodyTemplate};
+
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum SceneError {
-    #[error("scene file cannot be read: {path}: {detail}")]
-    Io { path: String, detail: String },
+    #[error(transparent)]
+    Asset(#[from] BodyError),
     #[error("scene MJCF cannot be parsed: {path}: {detail}")]
     Mjcf { path: String, detail: String },
     #[error("scene has no visual mesh")]
@@ -69,8 +67,7 @@ pub struct SceneModel {
 #[serde(rename_all = "camelCase")]
 pub struct SceneFrame {
     pub bodies: Vec<[f64; 7]>,
-    /// Motor-axis markers in canonical [`JOINT_NAMES`] order, including the
-    /// mouth actuator which is not an articulated kinematic joint.
+    /// Motor-axis markers in canonical body joint order.
     pub markers: Vec<[f64; 3]>,
 }
 
@@ -88,18 +85,28 @@ pub struct OfficialScene {
 }
 
 impl OfficialScene {
-    pub fn load() -> Result<Self, SceneError> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/robot_walk.xml");
-        Self::from_path(&path)
+    pub fn from_body(
+        template: &BodyTemplate,
+        resolver: &dyn AssetResolver,
+    ) -> Result<Self, SceneError> {
+        Self::parse(template, resolver, |_| None)
     }
 
-    pub fn from_path(path: &Path) -> Result<Self, SceneError> {
+    pub fn for_official_body(
+        template: &BodyTemplate,
+        resolver: &dyn AssetResolver,
+    ) -> Result<Self, SceneError> {
+        Self::parse(template, resolver, crate::official::motor_mount_for)
+    }
+
+    fn parse(
+        template: &BodyTemplate,
+        resolver: &dyn AssetResolver,
+        motor_mount: impl Fn(&str) -> Option<(&'static str, &'static str, usize)>,
+    ) -> Result<Self, SceneError> {
+        let path = &template.assets.display_mjcf;
         let path_text = path.display().to_string();
-        let xml = std::fs::read_to_string(path).map_err(|error| SceneError::Io {
-            path: path_text.clone(),
-            detail: error.to_string(),
-        })?;
+        let xml = read_xml(resolver, path)?;
         let kin = Model::parse(&xml).map_err(|error| SceneError::Mjcf {
             path: path_text.clone(),
             detail: error.to_string(),
@@ -108,13 +115,7 @@ impl OfficialScene {
             path: path_text.clone(),
             detail: error.to_string(),
         })?;
-        let mesh_dir = path.parent().unwrap_or(Path::new(".")).join(
-            doc.descendants()
-                .find(|node| node.has_tag_name("compiler"))
-                .and_then(|node| node.attribute("meshdir"))
-                .unwrap_or("."),
-        );
-        let mesh_dir = mesh_dir.canonicalize().unwrap_or(mesh_dir);
+        let mesh_dir = mesh_directory(path, &doc);
         let meshes: HashMap<String, String> = doc
             .descendants()
             .filter(|node| node.has_tag_name("mesh"))
@@ -130,6 +131,9 @@ impl OfficialScene {
                 Some((name, file))
             })
             .collect();
+        for file in meshes.values() {
+            resolver.read(&mesh_dir.join(file))?;
+        }
         let materials: HashMap<String, [f32; 4]> = doc
             .descendants()
             .filter(|node| node.has_tag_name("material"))
@@ -147,7 +151,6 @@ impl OfficialScene {
             .collect();
         let mut bodies = Vec::new();
         let mut joint_body = HashMap::new();
-        let mut motor_mounts: HashMap<String, Vec<[f64; 3]>> = HashMap::new();
         let mut head_camera = None;
         for (index, name) in kin.body_names().enumerate() {
             let mut geoms = Vec::new();
@@ -175,9 +178,6 @@ impl OfficialScene {
                         continue;
                     };
                     let pos = parse_vec(child.attribute("pos"), [0.0; 3]);
-                    if child.attribute("mesh") == Some("xl330") {
-                        motor_mounts.entry(name.to_owned()).or_default().push(pos);
-                    }
                     geoms.push(SceneGeom {
                         mesh: mesh.clone(),
                         pos,
@@ -195,44 +195,60 @@ impl OfficialScene {
                 geoms,
             });
         }
-        let joints = JOINT_NAMES
+        let marker_bodies: Vec<_> = template
+            .joints
             .iter()
-            .filter_map(|name| {
+            .map(|joint| {
+                let name = joint.scene_joint.as_ref()?;
+                joint_body.get(name).map(|&index| index as u32)
+            })
+            .collect();
+        let joints = template
+            .joints
+            .iter()
+            .zip(&marker_bodies)
+            .filter_map(|(joint, body)| {
                 Some(SceneJoint {
-                    name: (*name).to_owned(),
-                    body: *joint_body.get(*name)? as u32,
+                    name: joint.name.clone(),
+                    body: (*body)?,
                 })
             })
-            .collect::<Vec<_>>();
+            .collect();
         let body_index = kin
             .body_names()
             .enumerate()
             .map(|(index, name)| (name, index as u32))
             .collect::<HashMap<_, _>>();
-        let marker_mounts = JOINT_NAMES
+        let marker_mounts = template
+            .joints
             .iter()
-            .map(|name| {
-                // These three anchors are the visual calibration references:
-                // their link origins are already confirmed to sit on the
-                // rendered motor axes.  The remaining motors use the exact
-                // XL330 mount in the MJCF.
-                if matches!(*name, "left_hip_roll" | "neck_pitch" | "head_pitch") {
-                    return None;
-                }
-                let (body_name, ordinal) = motor_mount_for(name)?;
-                let body = *body_index.get(body_name)?;
-                let pos = *motor_mounts.get(body_name)?.get(ordinal)?;
-                Some((body, pos))
+            .map(|joint| {
+                let (name, mesh, ordinal) = motor_mount(&joint.name)?;
+                let body = *body_index.get(name)?;
+                let geom = body_nodes
+                    .get(name)?
+                    .children()
+                    .filter(|child| {
+                        child.has_tag_name("geom")
+                            && child.attribute("class") != Some("collision")
+                            && child.attribute("mesh") == Some(mesh)
+                    })
+                    .nth(ordinal)?;
+                Some((body, parse_vec(geom.attribute("pos"), [0.0; 3])))
             })
             .collect();
-        let marker_bodies = JOINT_NAMES
+        let angle_index = template
+            .joints
             .iter()
-            .map(|name| joint_body.get(*name).copied().map(|index| index as u32))
-            .collect();
-        let angle_index = JOINT_NAMES
-            .iter()
-            .map(|name| kin.joint_index(name))
-            .collect();
+            .map(|joint| {
+                let Some(name) = &joint.scene_joint else {
+                    return Ok(None);
+                };
+                kin.joint_index(name)
+                    .map(Some)
+                    .ok_or_else(|| BodyError::MissingSceneJoint(name.clone()).into())
+            })
+            .collect::<Result<Vec<_>, SceneError>>()?;
         Ok(Self {
             model: SceneModel {
                 bodies,
@@ -257,10 +273,10 @@ impl OfficialScene {
     }
 
     pub fn frame(&self, positions: &[f64]) -> Result<SceneFrame, SceneError> {
-        if positions.len() != JOINT_NAMES.len() {
+        if positions.len() != self.angle_index.len() {
             return Err(SceneError::PositionLength {
                 actual: positions.len(),
-                expected: JOINT_NAMES.len(),
+                expected: self.angle_index.len(),
             });
         }
         let mut angles = vec![0.0; self.kin.num_joints()];
@@ -298,30 +314,6 @@ impl OfficialScene {
             .collect();
         Ok(SceneFrame { bodies, markers })
     }
-}
-
-/// Maps a canonical joint to the XL330 geom mounted at that motor's output
-/// axis.  A few bodies carry two motors, so the ordinal is within that body,
-/// not the global geom order.
-fn motor_mount_for(name: &str) -> Option<(&'static str, usize)> {
-    Some(match name {
-        "left_hip_yaw" => ("trunk_base", 0),
-        "right_hip_yaw" => ("trunk_base", 1),
-        "left_hip_roll" => ("yaw2roll", 0),
-        "left_hip_pitch" => ("upper_leg_left", 0),
-        "left_knee" => ("upper_leg_left", 1),
-        "left_ankle" => ("leg", 0),
-        "neck_pitch" => ("neck", 0),
-        "head_pitch" => ("neck", 1),
-        "head_yaw" => ("neck_pitch", 0),
-        "head_roll" => ("jaw_soft", 0),
-        "mouth" => ("jaw_soft", 1),
-        "right_hip_roll" => ("bearing_roll", 0),
-        "right_hip_pitch" => ("upper_leg_right", 0),
-        "right_knee" => ("upper_leg_right", 1),
-        "right_ankle" => ("leg_2", 0),
-        _ => return None,
-    })
 }
 
 fn parse_vec<const N: usize>(text: Option<&str>, default: [f64; N]) -> [f64; N] {

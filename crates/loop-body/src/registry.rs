@@ -3,11 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
-use servo::{
-    ServoError, ServoImuSample, ServoLoopDriver, ServoPositionSample, ServoPositionTargets,
-};
+use crate::{BackendImuSample, BackendJointSample, BackendPositionTargets};
+use servo::ServoError;
 
-use crate::ControlBackend;
+use crate::{ControlBackend, GainCapability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -316,7 +315,11 @@ impl BackendSession {
         }
         let result = operation(self.driver.as_mut());
         drop(state);
-        if result.is_err() && self.access == BackendAccess::Control {
+        if result
+            .as_ref()
+            .is_err_and(|error| !matches!(error, ServoError::UnsupportedGain))
+            && self.access == BackendAccess::Control
+        {
             // Reserve ownership until successful stop/drop. Revoking the lease immediately
             // would prevent torque-off and allow a replacement controller before cleanup.
             self.failed = true;
@@ -331,23 +334,23 @@ impl Drop for BackendSession {
     }
 }
 
-impl ServoLoopDriver for BackendSession {
+impl ControlBackend for BackendSession {
     fn set_read_cancel(&mut self, cancel: Arc<std::sync::atomic::AtomicBool>) {
         self.driver.set_read_cancel(cancel);
     }
     fn feedback_validity(&self, ids: &[u8]) -> Vec<bool> {
         self.driver.feedback_validity(ids)
     }
-    fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
+    fn read_positions(&mut self, ids: &[u8]) -> Result<BackendJointSample, ServoError> {
         self.dispatch(false, |driver| driver.read_positions(ids))
     }
-    fn read_imu(&mut self) -> Result<Option<ServoImuSample>, ServoError> {
+    fn read_imu(&mut self) -> Result<Option<BackendImuSample>, ServoError> {
         self.dispatch(false, |driver| driver.read_imu())
     }
     fn write_positions(
         &mut self,
         ids: &[u8],
-        targets: &ServoPositionTargets,
+        targets: &BackendPositionTargets,
     ) -> Result<(), ServoError> {
         self.dispatch(true, |driver| driver.write_positions(ids, targets))
     }
@@ -373,8 +376,16 @@ impl ServoLoopDriver for BackendSession {
         }
         result
     }
+    fn gain_capability(&self) -> GainCapability {
+        self.driver.gain_capability()
+    }
     fn set_gain(&mut self, gain: u16) -> Result<(), ServoError> {
-        self.dispatch(true, |driver| driver.set_gain(gain))
+        self.dispatch(true, |driver| match driver.gain_capability() {
+            GainCapability::Configurable => driver.set_gain(gain),
+            GainCapability::FixedModel | GainCapability::Unsupported => {
+                Err(ServoError::UnsupportedGain)
+            }
+        })
     }
     fn reboot(&mut self, id: u8) -> Result<(), ServoError> {
         self.dispatch(true, |driver| driver.reboot(id))
@@ -400,10 +411,10 @@ mod tests {
     use std::sync::Mutex;
 
     struct Recorder(Arc<Mutex<Vec<&'static str>>>);
-    impl ServoLoopDriver for Recorder {
-        fn read_positions(&mut self, _: &[u8]) -> Result<ServoPositionSample, ServoError> {
+    impl ControlBackend for Recorder {
+        fn read_positions(&mut self, _: &[u8]) -> Result<BackendJointSample, ServoError> {
             self.0.lock().unwrap().push("read");
-            Ok(ServoPositionSample {
+            Ok(BackendJointSample {
                 positions: vec![0.25],
                 velocities: vec![0.5],
             })
@@ -411,7 +422,7 @@ mod tests {
         fn write_positions(
             &mut self,
             _: &[u8],
-            _: &ServoPositionTargets,
+            _: &BackendPositionTargets,
         ) -> Result<(), ServoError> {
             self.0.lock().unwrap().push("target");
             Ok(())
@@ -471,7 +482,7 @@ mod tests {
         control
             .write_positions(
                 &[1],
-                &ServoPositionTargets {
+                &BackendPositionTargets {
                     positions: vec![1.0],
                 },
             )
@@ -479,7 +490,7 @@ mod tests {
         assert!(
             read.write_positions(
                 &[1],
-                &ServoPositionTargets {
+                &BackendPositionTargets {
                     positions: vec![1.0]
                 }
             )
@@ -581,14 +592,14 @@ mod tests {
     #[test]
     fn provider_failure_reserves_control_for_acknowledged_cleanup() {
         struct Broken;
-        impl ServoLoopDriver for Broken {
-            fn read_positions(&mut self, _: &[u8]) -> Result<ServoPositionSample, ServoError> {
+        impl ControlBackend for Broken {
+            fn read_positions(&mut self, _: &[u8]) -> Result<BackendJointSample, ServoError> {
                 Err(error("provider failed"))
             }
             fn write_positions(
                 &mut self,
                 _: &[u8],
-                _: &ServoPositionTargets,
+                _: &BackendPositionTargets,
             ) -> Result<(), ServoError> {
                 panic!("revoked provider must not run")
             }

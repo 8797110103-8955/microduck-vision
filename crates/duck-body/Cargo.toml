@@ -1,11 +1,18 @@
 [package]
 name = "duck-body"
-description = "Virtual body templates, kinematics and dynamics boundaries without real servo I/O."
-# The boundary intentionally excludes ServoDriver, serial ports, machine instances and UI policy.
+description = "Shared robot body interface for canonical joints, kinematics, and dynamics."
+# Load the pinned official body descriptions directly from vendor/ and use its kinematics API.
+# Expose the result through one typed Rust interface for body identity and version, joint order
+# and limits, actuator mounting, and reference poses. Adapt only gaps in the upstream sources.
+# Uses servo model facts and supplied calibration for coordinate transforms. loop-body runs
+# the control cycle against this body model. Applications assemble simulated and physical
+# machines, define policy observation and action layouts, and manage calibration, ONNX loading,
+# training, and preview workflows. These workflows consume the same body definition.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 duck-ipc-proto = { path = "../../vendor/microduck/duck-ipc-proto" }
@@ -13,7 +20,6 @@ kinematics = { path = "../../vendor/microduck/kinematics" }
 roxmltree = "0.21.2"
 serde.workspace = true
 serde_json.workspace = true
-specta = { version = "=2.0.0-rc.28", features = ["derive"] }
 thiserror.workspace = true
 toml.workspace = true
 servo = { path = "../servo" }

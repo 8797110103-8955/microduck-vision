@@ -5,6 +5,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useDesktopStore } from "../../store";
 import style from "./style.module.scss";
 
+const isLocal = (id: string) => id.startsWith("training:");
+
 export const PolicyPage = defineComponent(() => {
   const store = useDesktopStore();
   const busy = ref<string | null>(null);
@@ -70,7 +72,7 @@ export const PolicyPage = defineComponent(() => {
       <header class={style.policyHeader}>
         <div>
           <h1>策略</h1>
-          <p>管理当前电脑缓存的官方 ONNX 文件。</p>
+          <p>查看官方和本地训练的 ONNX 文件。</p>
         </div>
         <button ref={refreshButton} type="button" disabled={busy.value !== null}>
           刷新
@@ -79,27 +81,38 @@ export const PolicyPage = defineComponent(() => {
 
       <section class={style.policyCard}>
         <div class={style.cardTitle}>
-          <h2>官方 ONNX</h2>
-          <span>{store.state.policies.filter((policy) => policy.cached).length} 个已缓存</span>
+          <h2>ONNX 策略</h2>
+          <span>
+            {store.state.policies.filter((policy) => policy.cached && !isLocal(policy.id)).length}{" "}
+            个官方策略已缓存
+          </span>
         </div>
         {error.value && <p class={style.error}>{error.value}</p>}
         <div class={style.policyList}>
           {store.state.policies.map((policy) => (
             <article class={style.policyRow}>
               <div class={style.policyMain}>
-                <button
-                  type="button"
-                  class={style.external}
-                  onClick={() =>
-                    void openSource(policy.sourceUrl.replace("/resolve/main/", "/blob/main/"))
-                  }
-                  title="打开模型页面"
-                >
-                  <code>{policy.file}</code>
-                </button>
+                {isLocal(policy.id) ? (
+                  <span>
+                    {policy.name} · <code>{policy.file}</code>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    class={style.external}
+                    onClick={() =>
+                      void openSource(policy.sourceUrl.replace("/resolve/main/", "/blob/main/"))
+                    }
+                    title="打开模型页面"
+                  >
+                    <code>{policy.file}</code>
+                  </button>
+                )}
               </div>
               <div class={style.policyActions}>
-                {policy.cached ? (
+                {isLocal(policy.id) ? (
+                  <span class={style.cachedLabel}>本地训练</span>
+                ) : policy.cached ? (
                   <span class={style.cachedLabel}>已缓存</span>
                 ) : (
                   <PolicyDownloadButton policyId={policy.id} />

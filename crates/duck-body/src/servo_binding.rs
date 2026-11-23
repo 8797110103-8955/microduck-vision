@@ -49,7 +49,7 @@ impl ServoParameterSet {
                 .ok_or_else(|| BodyError::MissingServoBinding {
                     slot: slot.id.clone(),
                 })?;
-            let key = servo_key(params.model);
+            let key = params.model.key();
             if !slot.allowed_servo_types.is_empty()
                 && !slot
                     .allowed_servo_types
@@ -79,10 +79,14 @@ impl ServoParameterSet {
         let actuator_mass = template
             .actuators
             .iter()
-            .zip(template.actuators.iter())
-            .map(|(slot, _)| {
-                slot.mounted_mass_g
-                    .or_else(|| self.get(&slot.id).and_then(|p| p.mass_g))
+            .map(|slot| {
+                slot.mounted_mass_g.or_else(|| {
+                    if template.physical.includes_actuator_mass {
+                        Some(0.0)
+                    } else {
+                        self.get(&slot.id).and_then(|parameters| parameters.mass_g)
+                    }
+                })
             })
             .collect::<Option<Vec<_>>>()?
             .into_iter()
@@ -91,33 +95,10 @@ impl ServoParameterSet {
     }
 }
 
-fn servo_key(model: ServoModel) -> &'static str {
-    match model {
-        ServoModel::Hd1910 => "hd1910",
-        ServoModel::Xl330M288 => "xl330",
-        ServoModel::Sts3215 => "sts3215",
-        ServoModel::Scs0009 => "scs0009",
-    }
-}
-
 fn parameters_for(model: ServoModel) -> ServoParameters {
-    let capabilities = [
-        ActuatorCapability::PositionControl,
-        ActuatorCapability::PresentPosition,
-        ActuatorCapability::PresentVelocity,
-        ActuatorCapability::TorqueEnable,
-        ActuatorCapability::SetGain,
-        ActuatorCapability::PresentCurrent,
-        ActuatorCapability::PresentVoltage,
-        ActuatorCapability::PresentTemperature,
-        ActuatorCapability::Reboot,
-        ActuatorCapability::FastSyncRead,
-    ]
-    .into_iter()
-    .collect();
     ServoParameters {
         model,
-        capabilities,
-        mass_g: None,
+        capabilities: model.capabilities().0.iter().copied().collect(),
+        mass_g: model.hardware_specs().map(|specs| specs.mass_g),
     }
 }

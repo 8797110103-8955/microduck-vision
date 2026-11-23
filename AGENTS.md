@@ -8,6 +8,7 @@
 - Static assets used by the desktop UI belong in `apps/desktop/assets`; do not add UI static assets under `apps/desktop/src/assets`.
 - Put a crate's boundary with other crates in a comment right under its Cargo `description`.
 - In TypeScript, derive types from existing types and function return values; do not hand-write duplicate state or result types when inference can provide them.
+- During development, run `pnpm generate` when a Tauri IPC command is added, renamed, removed, or its arguments, return type, or shared Rust types change. Also run it when the generated types are missing after checkout. `pnpm release` runs it automatically.
 - In Vue, bind event resources to the current scope: register them in setup/composables and clean them with `onScopeDispose` directly or through VueUse; never register them during rendering or ref callbacks.
 
 # Commit rules

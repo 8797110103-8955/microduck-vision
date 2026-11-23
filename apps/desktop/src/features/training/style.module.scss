@@ -67,6 +67,10 @@
     color: $text;
     background: $surface;
   }
+
+  input[type="checkbox"] {
+    justify-self: start;
+  }
 }
 
 .actions {

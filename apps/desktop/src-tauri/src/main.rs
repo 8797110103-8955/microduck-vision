@@ -1,15 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod application;
-mod backend;
-mod commands;
-mod control;
-mod helpers;
-mod lifecycle;
-mod logging;
-mod recordings;
-mod state;
-pub use state::types;
+mod platform;
+mod runtime;
+mod training;
+
+pub use platform::state::types;
+use platform::{commands, lifecycle};
 
 pub use types::{
     ActionInput, LoopOpenInput, PhysicalMachineBindingInput, PhysicalMachineDetectInput,
@@ -32,4 +28,22 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building Microduck");
     app.run(lifecycle::handle_event);
+}
+
+#[cfg(test)]
+mod test_support {
+    pub(crate) use crate::runtime::policy::catalog::{
+        cached_policy_selections, list as policy_list,
+    };
+    pub(crate) use crate::runtime::session::contract::register_simulation;
+
+    pub(crate) fn simulation_selection(
+        model_kind: microduck_body_runtime::ModelKind,
+    ) -> microduck_body_runtime::Selection {
+        microduck_body_runtime::Selection {
+            execution_kind: microduck_body_runtime::ExecutionKind::Simulation,
+            model_kind,
+            servo_model: model_kind.servo_model(),
+        }
+    }
 }

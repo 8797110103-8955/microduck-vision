@@ -1,14 +1,14 @@
 //! Canonical sensor/target adapter for physical and virtual servo drivers.
 
+use crate::BackendPositionTargets;
 use duck_body::BodyBinding;
-use servo::ServoPositionTargets;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::{ControlBackend, LoopError, SensorFrame};
+use crate::{ControlBackend, GainCapability, LoopError, SensorFrame};
 
 pub(crate) struct ServoAdapter {
     driver: Box<dyn ControlBackend>,
@@ -341,7 +341,7 @@ impl ServoAdapter {
         let ids = self.binding.physical_ids();
         let positions = self.binding.to_servo_positions_unchecked(targets);
         self.driver
-            .write_positions(&ids, &ServoPositionTargets { positions })?;
+            .write_positions(&ids, &BackendPositionTargets { positions })?;
         Ok(())
     }
 
@@ -364,8 +364,10 @@ impl ServoAdapter {
         Ok(())
     }
 
-    pub(crate) fn set_gain(&mut self, gain: u16) -> Result<(), LoopError> {
-        self.driver.set_gain(gain)?;
+    pub(crate) fn configure_gain(&mut self, gain: u16) -> Result<(), LoopError> {
+        if self.driver.gain_capability() == GainCapability::Configurable {
+            self.driver.set_gain(gain)?;
+        }
         Ok(())
     }
 }

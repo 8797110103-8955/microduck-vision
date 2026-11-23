@@ -246,6 +246,8 @@ export class MemoryBackend {
         id: "official-hd1910",
         name: "机器 0",
         bodyId: "official",
+        executionKind: "simulation",
+        modelKind: "hd1910-compatible",
         servoModel: "hd1910",
         simulation: simulationFor(this.catalog, "hd1910"),
         startupSelected: true,
@@ -407,7 +409,16 @@ export class MemoryBackend {
     });
     if (!detected.md5 || detected.matchResult !== "new")
       throw new Error("physical machine identity is not a unique new census");
+    const detectedModel = detected.census[0]?.model;
+    const servoModel =
+      (detectedModel === "xl330" || detectedModel === "hd1910") &&
+      detected.census.every((servo) => servo.model === detectedModel)
+        ? detectedModel
+        : null;
     const machine: PhysicalMachine = {
+      executionKind: "physical",
+      modelKind: servoModel,
+      servoModel,
       id: `physical-${this.physical.length + 1}`,
       name: input.name?.trim() || detected.md5,
       usbPort: input.reconnectHint?.portName ?? "",
@@ -474,6 +485,9 @@ export class MemoryBackend {
   async createPhysicalMachine(input: PhysicalMachineInput) {
     const machine: PhysicalMachine = {
       ...input,
+      executionKind: "physical",
+      modelKind: null,
+      servoModel: null,
       census: [],
       reconnectHint: input.usbPort
         ? { portName: input.usbPort, vid: null, pid: null, adapterSerial: null, product: null }
@@ -812,7 +826,10 @@ export class MemoryBackend {
   }
 
   async createVirtualMachine(
-    input: Pick<VirtualMachine, "name" | "bodyId" | "servoModel" | "simulation">,
+    input: Pick<
+      VirtualMachine,
+      "name" | "bodyId" | "executionKind" | "modelKind" | "servoModel" | "simulation"
+    >,
   ) {
     const machine: VirtualMachine = {
       ...input,

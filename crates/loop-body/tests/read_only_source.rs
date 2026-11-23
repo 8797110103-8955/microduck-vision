@@ -1,7 +1,8 @@
 mod support;
 
+use loop_body::{BackendJointSample, BackendPositionTargets, ControlBackend};
 use loop_body::{ReadOnlySource, ReadOnlySourceConfig, SourceHealth};
-use servo::{ServoError, ServoLoopDriver, ServoModel, ServoPositionSample, ServoPositionTargets};
+use servo::{ServoError, ServoModel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -12,16 +13,16 @@ struct BlockingReader {
     release: mpsc::Receiver<()>,
 }
 
-impl ServoLoopDriver for BlockingReader {
-    fn read_positions(&mut self, _: &[u8]) -> Result<ServoPositionSample, ServoError> {
+impl ControlBackend for BlockingReader {
+    fn read_positions(&mut self, _: &[u8]) -> Result<BackendJointSample, ServoError> {
         self.started.send(()).unwrap();
         self.release.recv().unwrap();
-        Ok(ServoPositionSample {
+        Ok(BackendJointSample {
             positions: vec![0.2; 15],
             velocities: vec![0.0; 15],
         })
     }
-    fn write_positions(&mut self, _: &[u8], _: &ServoPositionTargets) -> Result<(), ServoError> {
+    fn write_positions(&mut self, _: &[u8], _: &BackendPositionTargets) -> Result<(), ServoError> {
         panic!("read-only task wrote targets")
     }
     fn set_torque(&mut self, _: bool) -> Result<(), ServoError> {
@@ -136,11 +137,11 @@ fn cancellation_reaches_a_backend_transaction_boundary_before_join() {
         cancel: Option<Arc<AtomicBool>>,
         started: mpsc::Sender<()>,
     }
-    impl ServoLoopDriver for CancellableReader {
+    impl ControlBackend for CancellableReader {
         fn set_read_cancel(&mut self, cancel: Arc<AtomicBool>) {
             self.cancel = Some(cancel);
         }
-        fn read_positions(&mut self, _: &[u8]) -> Result<ServoPositionSample, ServoError> {
+        fn read_positions(&mut self, _: &[u8]) -> Result<BackendJointSample, ServoError> {
             self.started.send(()).unwrap();
             while !self.cancel.as_ref().unwrap().load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -150,7 +151,7 @@ fn cancellation_reaches_a_backend_transaction_boundary_before_join() {
         fn write_positions(
             &mut self,
             _: &[u8],
-            _: &ServoPositionTargets,
+            _: &BackendPositionTargets,
         ) -> Result<(), ServoError> {
             panic!("write")
         }

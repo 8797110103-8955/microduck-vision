@@ -1,71 +1,24 @@
-import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
-import { createPinia } from "pinia";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
-import { disconnectPhysicalMachine } from "../../src/features/machines";
-import { App } from "../../src/features/app";
-import { useDesktopStore } from "../../src/store";
+import {
+  buttonByText,
+  mountApp,
+  setupAppTests,
+  viewerSetFrame,
+  viewerSetWorldPose,
+} from "./app-harness";
+import { flushPromises } from "@vue/test-utils";
+import { describe, expect, it, vi } from "vitest";
 import { TestBackend } from "../bridge/test-backend";
 import { memoryServoCatalog } from "../fixtures/servoCatalog.fixture";
 import * as commands from "../../generated/types";
-
-const viewerSetFrame = vi.hoisted(() => vi.fn());
-
-vi.mock("../../src/features/home/viewer", () => ({
-  DuckViewer: class {
-    onRender: (() => void) | null = null;
-    dispose() {}
-    markerScreen() {
-      return null;
-    }
-    setFrame = viewerSetFrame;
-    setSimulationFrame() {}
-    setMachineWorldPoses() {}
-    setGhosts() {}
-    setSelectedDuck() {}
-    setWorldPose() {}
-    pickDuck() {
-      return 1;
-    }
-    focusCurrentDuck() {}
-    restorePreviousView() {}
-  },
-}));
-
-function buttonByText(wrapper: VueWrapper, text: string) {
-  const button = wrapper.findAll("button").find((candidate) => candidate.text() === text);
-  if (!button) throw new Error(`button not found: ${text}`);
-  return button;
-}
+import { disconnectPhysicalMachine } from "../../src/features/machines";
+import { useDesktopStore } from "../../src/store";
 
 function encoderAngle(count: number) {
   return (count * Math.PI * 2) / 4096 - Math.PI;
 }
 
-async function mountApp(backend: TestBackend) {
-  mockWindows("main");
-  mockIPC((command, payload) => backend.invoke(command, payload), { shouldMockEvents: true });
-  const host = document.createElement("div");
-  document.body.append(host);
-  const wrapper = mount(App, {
-    attachTo: host,
-    global: { plugins: [createPinia()] },
-  });
-  await flushPromises();
-  return { host, wrapper, store: useDesktopStore() };
-}
-
 describe("desktop frontend flow", () => {
-  beforeEach(() => {
-    document.body.innerHTML = "";
-    localStorage.clear();
-    viewerSetFrame.mockClear();
-  });
-
-  afterEach(() => {
-    clearMocks();
-    vi.useRealTimers();
-  });
+  setupAppTests();
 
   it("uses the scene default pose before telemetry without projecting zero joint angles", async () => {
     const backend = new TestBackend(memoryServoCatalog);
@@ -382,6 +335,8 @@ describe("desktop frontend flow", () => {
     const second = await commands.virtualMachineCreate({
       name: "second",
       bodyId: "official",
+      executionKind: "simulation",
+      modelKind: "hd1910-compatible",
       servoModel: "hd1910",
       simulation: store.state.virtualMachines[0].simulation,
     });
@@ -1096,6 +1051,83 @@ describe("desktop frontend flow", () => {
     expect(backend.calls.map((call) => call.name)).toContain("virtual_machine_create");
     expect(store.state.virtualMachines.some((machine) => machine.name === "测试模拟机")).toBe(true);
 
+    wrapper.unmount();
+    host.remove();
+  });
+
+  it("selects the native HD1910 simulation model independently of the servo", async () => {
+    const backend = new TestBackend(memoryServoCatalog);
+    const { host, wrapper, store } = await mountApp(backend);
+    await wrapper.get('button[aria-label="设置"]').trigger("click");
+    await buttonByText(wrapper, "模拟机").trigger("click");
+    await flushPromises();
+    await wrapper.get('button[aria-label="新建模拟机"]').trigger("click");
+    const model = wrapper.get<HTMLSelectElement>('select[aria-label="仿真模型"]');
+    expect(model.element.value).toBe("hd1910-compatible");
+    await model.setValue("hd1910");
+    await wrapper.get('input[placeholder="模拟机名称"]').setValue("HD1910 测试机");
+    await buttonByText(wrapper, "创建").trigger("click");
+    await flushPromises();
+    expect(
+      store.state.virtualMachines.find((machine) => machine.name === "HD1910 测试机"),
+    ).toMatchObject({ executionKind: "simulation", servoModel: "hd1910", modelKind: "hd1910" });
+    expect(wrapper.text()).toContain("HD1910 原生");
+    wrapper.unmount();
+    host.remove();
+  });
+
+  it("keeps a recording frame and placement independent of new live feedback", async () => {
+    const backend = new TestBackend(memoryServoCatalog);
+    const { host, wrapper, store } = await mountApp(backend);
+    await buttonByText(wrapper, "VLA").trigger("click");
+    await flushPromises();
+    await wrapper.get('button[aria-label="设置"]').trigger("click");
+    await wrapper.get('button[aria-label="日志"]').trigger("click");
+    await flushPromises();
+    await buttonByText(wrapper, "开始采集").trigger("click");
+    await flushPromises();
+    await buttonByText(wrapper, "停止采集").trigger("click");
+    await flushPromises();
+
+    const recordedPositions = Array(15).fill(0.43);
+    const invoke = backend.invoke.bind(backend);
+    const intercepted = vi.spyOn(backend, "invoke").mockImplementation((name, payload) => {
+      if (name !== "recording_frames") return invoke(name, payload);
+      const frame: Awaited<ReturnType<typeof commands.recordingFrames>>[number] = {
+        recordingId: "recording-test-1",
+        duckId: "official-hd1910",
+        segmentId: 1,
+        episodeId: 1,
+        elapsedS: 0.02,
+        controlStartedS: 0.02,
+        status: {
+          ...store.state.loop!,
+          simulation: null,
+          positions: recordedPositions,
+          world: { position: [3, 4], yaw: 0.2, distanceM: 5 },
+        },
+        policy: null,
+        execution: null,
+      };
+      return Promise.resolve([frame]);
+    });
+    await buttonByText(wrapper, "查看").trigger("click");
+    await flushPromises();
+    expect(
+      backend.calls.findLast((call) => call.name === "official_scene_frame")?.payload,
+    ).toMatchObject({ positions: recordedPositions });
+    expect(viewerSetWorldPose).toHaveBeenCalledWith([3, 4], 0.2);
+
+    const from = backend.calls.length;
+    const livePositions = Array(15).fill(-0.17);
+    store.applyLoopStatus({ ...store.state.loop!, simulation: null, positions: livePositions });
+    await flushPromises();
+    expect(store.state.recordingPlayback?.status.positions).toEqual(recordedPositions);
+    const requests = backend.calls
+      .slice(from)
+      .filter((call) => call.name === "official_scene_frame");
+    expect(requests.map((request) => request.payload)).toEqual([{ positions: livePositions }]);
+    intercepted.mockRestore();
     wrapper.unmount();
     host.remove();
   });

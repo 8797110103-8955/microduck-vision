@@ -1,5 +1,8 @@
 [package]
 name = "microduck-vision-generate-types"
+description = "Build tool that generates TypeScript bindings for the desktop IPC contract."
+# Reads command signatures and types from the desktop sources. The desktop application owns
+# the IPC contract and runtime behavior; this crate owns TypeScript binding generation.
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"

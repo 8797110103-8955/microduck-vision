@@ -18,10 +18,6 @@ pub struct BodyContractSnapshot {
     pub actuator_slots: Vec<String>,
     pub home_pose_rad: Vec<f64>,
     pub reference_poses_rad: BTreeMap<String, Vec<f64>>,
-    pub obs_joint_count: usize,
-    pub action_len: usize,
-    pub canonical_action_len: usize,
-    pub policy_action_slots: Vec<usize>,
 }
 
 impl BodyContractSnapshot {
@@ -51,10 +47,6 @@ impl BodyContractSnapshot {
                 .collect(),
             home_pose_rad: template.control.home_pose.clone(),
             reference_poses_rad: template.reference_poses.clone(),
-            obs_joint_count: template.control.observation_joint_count,
-            action_len: profile.action_space().action_len(),
-            canonical_action_len: profile.action_space().canonical_len(),
-            policy_action_slots: profile.action_space().policy_action_slots().to_vec(),
         }
     }
 

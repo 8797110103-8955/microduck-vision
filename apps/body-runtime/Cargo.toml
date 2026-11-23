@@ -1,0 +1,31 @@
+[package]
+name = "microduck-body-runtime"
+description = "MicroDuck body execution profiles, official assets, and simulation backends."
+# Composes servo device facts, duck-body geometry, and loop-body execution for the product.
+# Exports body and scene parameters for training. Python runners belong to microduck-training.
+# The desktop owns Windows integration, machine selection, IPC, and policy orchestration.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+publish = false
+links = "mujoco"
+
+[workspace]
+
+[features]
+native = ["dep:tempfile"]
+
+[build-dependencies]
+sha2 = "0.10"
+tempfile = { version = "3", optional = true }
+
+[dependencies]
+base64 = "0.22"
+duck-body = { path = "../../crates/duck-body" }
+loop-body = { path = "../../crates/loop-body" }
+servo = { path = "../../crates/servo" }
+roxmltree = "0.21.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10"

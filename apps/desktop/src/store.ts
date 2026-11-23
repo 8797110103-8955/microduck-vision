@@ -1,7 +1,7 @@
 import * as commands from "../generated/types";
 import { reactive } from "vue";
 import { defineStore } from "pinia";
-import type { PreviewInput, ServoModelKey, WorldState } from "../generated/types";
+import type { PreviewInput, ServoModelKey, TrainingFrame, WorldState } from "../generated/types";
 
 const selectedServoStorageKey = "microduck.selected-servo";
 const worldCacheStorageKey = "microduck.world-cache";
@@ -95,6 +95,7 @@ export function createDesktopStore() {
     previewInput,
     worldCache: readWorldCache(),
     training: null as Awaited<ReturnType<typeof commands.trainingStatus>>,
+    trainingFrame: null as TrainingFrame | null,
     selectedVirtualMachine: null as string | null,
     selectedVirtualMachineManual: false,
     error: null as string | null,
@@ -122,7 +123,31 @@ export function createDesktopStore() {
     }
   }
 
-  return { state, applyLoopStatus };
+  function applyTrainingProgress(progress: typeof state.training) {
+    state.training = progress;
+    if (
+      progress?.runId !== state.trainingFrame?.runId ||
+      (progress?.phase !== "starting" && progress?.phase !== "running")
+    ) {
+      state.trainingFrame = null;
+    }
+  }
+
+  function applyTrainingFrame(frame: TrainingFrame) {
+    const progress = state.training;
+    if (
+      progress?.runId === frame.runId &&
+      (progress.phase === "starting" || progress.phase === "running") &&
+      (!state.trainingFrame || frame.sequence > state.trainingFrame.sequence)
+    ) {
+      state.trainingFrame = {
+        ...frame,
+        previewScene: frame.previewScene ?? state.trainingFrame?.previewScene ?? null,
+      };
+    }
+  }
+
+  return { state, applyLoopStatus, applyTrainingProgress, applyTrainingFrame };
 }
 
 export const useDesktopStore = defineStore("desktop", () => {

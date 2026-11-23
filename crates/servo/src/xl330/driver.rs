@@ -9,9 +9,105 @@ use super::{
     velocity_rad_s_from_raw,
 };
 use crate::{
-    ServoCommand, ServoError, ServoLoopDriver, ServoPositionSample, ServoPositionTargets,
+    ServoCommand, ServoDeviceDriver, ServoError, ServoPositionSample, ServoPositionTargets,
     ServoTelemetry,
 };
+
+pub fn read_position(bus: &mut impl RawBus, id: u8) -> Result<f64, ServoError> {
+    let position = register("present_position").expect("vendor XL330 register");
+    let bytes = bus.read_raw(id, position.addr, position.size)?;
+    if bytes.len() != usize::from(position.size) {
+        return Err(ServoError::ShortRead {
+            what: "XL330 position",
+            expected: usize::from(position.size),
+            got: bytes.len(),
+        });
+    }
+    let position = decode_register("present_position", &bytes)? as i32;
+    Ok(position_rad_from_raw(position))
+}
+
+pub fn set_torque(bus: &mut impl RawBus, id: u8, enabled: bool) -> Result<(), ServoError> {
+    let torque = register("torque_enable").expect("vendor XL330 register");
+    let bytes = encode_register("torque_enable", i64::from(enabled))?;
+    bus.write_raw(id, torque.addr, &bytes)
+}
+
+pub fn set_position_gain(bus: &mut impl RawBus, id: u8, gain: u16) -> Result<(), ServoError> {
+    let register = register("position_p_gain").expect("vendor XL330 register");
+    let bytes = encode_register("position_p_gain", i64::from(gain))?;
+    bus.write_raw(id, register.addr, &bytes)
+}
+
+/// Write the full XL330 position controller settings in P, I, D order.
+pub fn set_position_pid(
+    bus: &mut impl RawBus,
+    id: u8,
+    p: u16,
+    i: u16,
+    d: u16,
+) -> Result<(), ServoError> {
+    let registers = [
+        ("position_p_gain", p),
+        ("position_i_gain", i),
+        ("position_d_gain", d),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        let bytes = encode_register(name, i64::from(value))?;
+        Ok((
+            register(name).expect("XL330 position gain register").addr,
+            bytes,
+        ))
+    })
+    .collect::<Result<Vec<_>, ServoError>>()?;
+    for (address, bytes) in registers {
+        bus.write_raw(id, address, &bytes)?;
+    }
+    Ok(())
+}
+
+pub fn read_position_sample(
+    bus: &mut impl RawBus,
+    ids: &[u8],
+) -> Result<ServoPositionSample, ServoError> {
+    let velocity = register("present_velocity").expect("vendor XL330 register");
+    let position = register("present_position").expect("vendor XL330 register");
+    let start = velocity.addr;
+    let end = position.addr.saturating_add(position.size);
+    let len = end.saturating_sub(start);
+    let blocks = bus.sync_read_raw(ids, start, len)?;
+    if blocks.len() != ids.len() {
+        return Err(ServoError::CountMismatch {
+            what: "XL330 sync read",
+            expected: ids.len(),
+            got: blocks.len(),
+        });
+    }
+    let mut positions = Vec::with_capacity(ids.len());
+    let mut velocities = Vec::with_capacity(ids.len());
+    for block in blocks {
+        if block.len() != len as usize {
+            return Err(ServoError::ShortRead {
+                what: "XL330 motion block",
+                expected: len as usize,
+                got: block.len(),
+            });
+        }
+        let velocity_raw = decode_register("present_velocity", &block[..velocity.size as usize])?;
+        let position_start = position.addr.saturating_sub(start) as usize;
+        let position_raw = decode_register(
+            "present_position",
+            &block[position_start..position_start + position.size as usize],
+        )?;
+        velocities.push(velocity_rad_s_from_raw(velocity_raw as i32));
+        positions.push(position_rad_from_raw(position_raw as i32));
+    }
+    Ok(ServoPositionSample {
+        positions,
+        velocities,
+    })
+}
 
 pub trait RawBus {
     fn read_raw(&mut self, id: u8, addr: u8, len: u8) -> Result<Vec<u8>, ServoError>;
@@ -72,7 +168,7 @@ impl<B> Xl330Driver<B> {
 
 impl<B: RawBus + Send> ServoDriver for Xl330Driver<B> {
     fn read_telemetry(&mut self, id: u8) -> Result<ServoTelemetry, ServoError> {
-        self.read_position_sample(&[id])?;
+        read_position_sample(&mut self.bus, &[id])?;
         let voltage = register("present_input_voltage").expect("vendor XL330 register");
         let temperature = register("present_temperature").expect("vendor XL330 register");
         let len = temperature
@@ -84,8 +180,7 @@ impl<B: RawBus + Send> ServoDriver for Xl330Driver<B> {
     }
 
     fn read_positions(&mut self, ids: &[u8]) -> Result<Vec<f64>, ServoError> {
-        self.read_position_sample(ids)
-            .map(|sample| sample.positions)
+        read_position_sample(&mut self.bus, ids).map(|sample| sample.positions)
     }
 
     fn write_position(&mut self, _command: ServoCommand) -> Result<(), ServoError> {
@@ -99,15 +194,11 @@ impl<B: RawBus + Send> ServoDriver for Xl330Driver<B> {
     }
 
     fn set_torque(&mut self, _id: u8, _enabled: bool) -> Result<(), ServoError> {
-        let register = register("torque_enable").expect("vendor XL330 register");
-        let bytes = encode_register("torque_enable", i64::from(_enabled))?;
-        self.bus.write_raw(_id, register.addr, &bytes)
+        set_torque(&mut self.bus, _id, _enabled)
     }
 
     fn set_gain(&mut self, id: u8, gain: u16) -> Result<(), ServoError> {
-        let register = register("position_p_gain").expect("vendor XL330 register");
-        let bytes = encode_register("position_p_gain", i64::from(gain))?;
-        self.bus.write_raw(id, register.addr, &bytes)
+        set_position_gain(&mut self.bus, id, gain)
     }
 
     fn reboot(&mut self, _id: u8) -> Result<(), ServoError> {
@@ -120,46 +211,6 @@ impl<B: RawBus + Send> ServoDriver for Xl330Driver<B> {
 }
 
 impl<B: RawBus + Send> Xl330Driver<B> {
-    fn read_position_sample(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
-        let velocity = register("present_velocity").expect("vendor XL330 register");
-        let position = register("present_position").expect("vendor XL330 register");
-        let start = velocity.addr;
-        let end = position.addr.saturating_add(position.size);
-        let len = end.saturating_sub(start);
-        let blocks = self.bus.sync_read_raw(ids, start, len)?;
-        if blocks.len() != ids.len() {
-            return Err(ServoError::CountMismatch {
-                what: "XL330 sync read",
-                expected: ids.len(),
-                got: blocks.len(),
-            });
-        }
-        let mut positions = Vec::with_capacity(ids.len());
-        let mut velocities = Vec::with_capacity(ids.len());
-        for block in blocks {
-            if block.len() != len as usize {
-                return Err(ServoError::ShortRead {
-                    what: "XL330 motion block",
-                    expected: len as usize,
-                    got: block.len(),
-                });
-            }
-            let velocity_raw =
-                decode_register("present_velocity", &block[..velocity.size as usize])?;
-            let position_start = position.addr.saturating_sub(start) as usize;
-            let position_raw = decode_register(
-                "present_position",
-                &block[position_start..position_start + position.size as usize],
-            )?;
-            velocities.push(velocity_rad_s_from_raw(velocity_raw as i32));
-            positions.push(position_rad_from_raw(position_raw as i32));
-        }
-        Ok(ServoPositionSample {
-            positions,
-            velocities,
-        })
-    }
-
     fn write_position_targets(
         &mut self,
         ids: &[u8],
@@ -185,9 +236,9 @@ impl<B: RawBus + Send> Xl330Driver<B> {
     }
 }
 
-impl<B: RawBus + Send> ServoLoopDriver for Xl330Driver<B> {
+impl<B: RawBus + Send> ServoDeviceDriver for Xl330Driver<B> {
     fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
-        self.read_position_sample(ids)
+        read_position_sample(&mut self.bus, ids)
     }
 
     fn write_positions(

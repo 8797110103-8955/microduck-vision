@@ -2,7 +2,7 @@ import * as commands from "../../../generated/types";
 import { computed, defineComponent, onScopeDispose, ref, shallowRef } from "vue";
 import { useEventListener } from "@vueuse/core";
 import { listen } from "@tauri-apps/api/event";
-import type { LoopStatus, TrainingProgress } from "../../../generated/types";
+import type { LoopStatus, TrainingFrame, TrainingProgress } from "../../../generated/types";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import appIconUrl from "../../../assets/icons/icon.ico";
 import { Message } from "../../components/message";
@@ -180,6 +180,7 @@ export const App = defineComponent(() => {
   const appShell = shallowRef<HTMLDivElement>();
   let stopPhysicalMachineEvents: (() => void) | undefined;
   let stopTrainingEvents: (() => void) | undefined;
+  let stopTrainingFrameEvents: (() => void) | undefined;
   let stopLoopStatusEvents: (() => void) | undefined;
   let eventListenerDisposed = false;
   useEventListener(window, "error", (event: ErrorEvent) => {
@@ -211,10 +212,29 @@ export const App = defineComponent(() => {
         else stopPhysicalMachineEvents = unlisten;
       });
       void listen<TrainingProgress>("training-progress", (event) => {
-        if (!eventListenerDisposed) store.state.training = event.payload;
+        if (eventListenerDisposed) return;
+        const previous = store.state.training;
+        const finished =
+          event.payload.phase === "finished" &&
+          (previous?.runId !== event.payload.runId || previous.phase !== "finished");
+        store.applyTrainingProgress(event.payload);
+        if (finished) {
+          void commands
+            .policyList()
+            .then((policies) => {
+              if (!eventListenerDisposed) store.state.policies = policies;
+            })
+            .catch(() => undefined);
+        }
       }).then((unlisten) => {
         if (eventListenerDisposed) unlisten();
         else stopTrainingEvents = unlisten;
+      });
+      void listen<TrainingFrame>("training-frame", (event) => {
+        if (!eventListenerDisposed) store.applyTrainingFrame(event.payload);
+      }).then((unlisten) => {
+        if (eventListenerDisposed) unlisten();
+        else stopTrainingFrameEvents = unlisten;
       });
       void listen<LoopStatus>("loop-status", (event) => {
         if (eventListenerDisposed) return;
@@ -233,7 +253,8 @@ export const App = defineComponent(() => {
       void commands
         .trainingStatus()
         .then((progress) => {
-          if (!eventListenerDisposed) store.state.training = progress;
+          if (!eventListenerDisposed && !store.state.training)
+            store.applyTrainingProgress(progress);
         })
         .catch(() => undefined);
     }
@@ -243,6 +264,7 @@ export const App = defineComponent(() => {
     eventListenerDisposed = true;
     stopPhysicalMachineEvents?.();
     stopTrainingEvents?.();
+    stopTrainingFrameEvents?.();
     stopLoopStatusEvents?.();
   });
   useEventListener(reloadButton, "click", () => void load());

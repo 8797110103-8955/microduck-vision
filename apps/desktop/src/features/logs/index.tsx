@@ -2,7 +2,7 @@ import { computed, defineComponent, onMounted, onScopeDispose, ref } from "vue";
 import { useIntervalFn } from "@vueuse/core";
 import * as commands from "../../../generated/types";
 import { useDesktopStore } from "../../store";
-import { OfficialDuckStage } from "../home";
+import { SceneStage } from "../scene-stage";
 import style from "./style.module.scss";
 
 export const LogsPage = defineComponent(() => {
@@ -250,7 +250,7 @@ export const LogsPage = defineComponent(() => {
           <p class={style.path}>{selected.value.path}</p>
           {store.state.recordingPlayback && (
             <div class={style.viewer}>
-              <OfficialDuckStage />
+              <SceneStage playback status={store.state.recordingPlayback.status} />
             </div>
           )}
           <div class={style.controls}>

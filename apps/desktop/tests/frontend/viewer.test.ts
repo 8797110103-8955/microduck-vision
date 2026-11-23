@@ -2,7 +2,7 @@ import { flushPromises } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import type { SceneFrame, SimulationState } from "../../generated/types";
-import { DuckViewer } from "../../src/features/home/viewer";
+import { DuckViewer } from "../../src/components/duck-stage/viewer";
 
 let renderedScene: THREE.Scene | undefined;
 let renderedCamera: THREE.PerspectiveCamera | undefined;
@@ -229,6 +229,22 @@ describe("duck world coordinates", () => {
     viewer.setFrame(staticFrame);
     expect(bodyPosition(0, 0).distanceTo(trunk)).toBeLessThan(1e-12);
     expect(bodyPosition(0, 1).distanceTo(head)).toBeLessThan(1e-12);
+  });
+
+  it("renders a training environment in its own world coordinates", () => {
+    viewer.setGhosts(0, 0.25, [[0, 0, 0]]);
+    viewer.setWorldPose([2, 3], 0.5);
+    const recorded = simulation(0.2, -0.1, 0.4);
+    viewer.setSimulationFrame(recorded, true);
+    const displayed = bodyPosition(0, 0);
+    expect(displayed.x).toBeCloseTo(recorded.trunkPosition[0]!);
+    expect(displayed.y).toBeCloseTo(recorded.trunkPosition[2]!);
+    expect(displayed.z).toBeCloseTo(-recorded.trunkPosition[1]!);
+
+    viewer.setSimulationFrame(recorded);
+    const runtime = bodyPosition(0, 0);
+    expect(runtime.x).toBeCloseTo(2);
+    expect(runtime.z).toBeCloseTo(-3);
   });
 
   it("applies policy displacement once and keeps other ducks at their own saved placement", () => {

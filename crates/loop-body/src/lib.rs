@@ -1,9 +1,10 @@
 //! Shared body control-loop boundary.
 //!
 //! The crate keeps the control lifecycle and backend boundary product-agnostic. Physical and
-//! virtual callers provide a `ServoLoopDriver`; controller files and application state stay outside.
+//! virtual callers provide a `ControlBackend`; controller files and application state stay outside.
 
 mod adapter;
+mod backend;
 mod body;
 mod lifecycle;
 mod registry;
@@ -12,6 +13,9 @@ mod safety;
 mod types;
 
 pub use adapter::{ReadOnlySource, SourceHealth};
+pub use backend::{
+    BackendImuSample, BackendJointSample, BackendPositionTargets, ControlBackend, GainCapability,
+};
 pub use body::BodyLoop;
 pub use registry::{
     BackendAccess, BackendDescriptor, BackendKind, BackendRegistry, BackendSession, ExecutionGate,
@@ -24,7 +28,7 @@ pub use runtime::{
 };
 pub use types::{
     ActuatorDelaySpec, BackendLifecycleAction, BackendState, BodyCommand, BodyRuntimeView,
-    Calibration, ControlBackend, ControlTick, ControllerInput, DelayTimebase, ExecutionInterval,
-    JointCalibration, JointRangeState, LoopAction, LoopBinding, LoopConfig, LoopController,
-    LoopError, LoopPhase, LoopStatus, SampleTime, SensorFrame, ServoBinding,
+    Calibration, ControlTick, ControllerInput, DelayTimebase, ExecutionInterval, JointCalibration,
+    JointRangeState, LoopAction, LoopBinding, LoopConfig, LoopController, LoopError, LoopPhase,
+    LoopStatus, SampleTime, SensorFrame, ServoBinding,
 };

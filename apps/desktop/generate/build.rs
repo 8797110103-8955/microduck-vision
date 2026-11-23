@@ -29,19 +29,19 @@ fn shared_types(tree: &UseTree) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    const COMMAND_REGISTRY: &str = "../src-tauri/src/commands/mod.rs";
+    const COMMAND_REGISTRY: &str = "../src-tauri/src/platform/commands/mod.rs";
     const COMMAND_FILES: &[&str] = &[
-        "../src-tauri/src/commands/actions.rs",
-        "../src-tauri/src/commands/loop_control.rs",
-        "../src-tauri/src/commands/logs.rs",
-        "../src-tauri/src/commands/machines.rs",
-        "../src-tauri/src/commands/machines/physical.rs",
-        "../src-tauri/src/commands/machines/registers.rs",
-        "../src-tauri/src/commands/machines/virtual_machine.rs",
-        "../src-tauri/src/commands/policy.rs",
-        "../src-tauri/src/commands/scene.rs",
-        "../src-tauri/src/commands/training.rs",
-        "../src-tauri/src/state/types.rs",
+        "../src-tauri/src/platform/commands/actions.rs",
+        "../src-tauri/src/platform/commands/loop_control.rs",
+        "../src-tauri/src/platform/commands/logs.rs",
+        "../src-tauri/src/platform/commands/machines.rs",
+        "../src-tauri/src/platform/commands/machines/physical.rs",
+        "../src-tauri/src/platform/commands/machines/registers.rs",
+        "../src-tauri/src/platform/commands/machines/virtual_machine.rs",
+        "../src-tauri/src/platform/commands/policy.rs",
+        "../src-tauri/src/platform/commands/scene.rs",
+        "../src-tauri/src/platform/commands/training.rs",
+        "../src-tauri/src/platform/state/types.rs",
     ];
     println!("cargo:rerun-if-changed={COMMAND_REGISTRY}");
     for path in COMMAND_FILES {
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen_imports = HashSet::new();
     let mut commands = Vec::new();
     for path in COMMAND_FILES {
-        if *path == "../src-tauri/src/state/types.rs" {
+        if *path == "../src-tauri/src/platform/state/types.rs" {
             continue;
         }
         let source = syn::parse_file(&fs::read_to_string(path)?)?;

@@ -7,11 +7,19 @@ use serialport::SerialPort;
 
 use super::{decode_motion_block, position_steps_from_rad};
 use crate::{
-    Gain, ServoCommand, ServoError, ServoIdentity, ServoLoopDriver, ServoPositionSample,
+    Gain, ServoCommand, ServoDeviceDriver, ServoError, ServoIdentity, ServoPositionSample,
     ServoPositionTargets, ServoTelemetry,
 };
 
 const DEFAULT_MOVE_SPEED: i64 = 1_000;
+
+pub fn read_configuration(
+    bus: &mut impl FeetechRawBus,
+    id: u8,
+) -> Result<super::protocol::Hd1910Configuration, ServoError> {
+    let bytes = bus.read_raw(id, 0, super::protocol::HD1910_CONFIGURATION_WIDTH)?;
+    super::protocol::Hd1910Configuration::parse(&bytes)
+}
 
 /// Send exactly one calibration request. A timeout is an uncertain result, never a reason
 /// to repeat an EEPROM-changing instruction. Readback/recovery belong to the caller.
@@ -57,6 +65,58 @@ pub fn position_target_block(position: f64) -> Result<[u8; 7], ServoError> {
     let position = super::encode_register("goal_position", i64::from(steps))?;
     let speed = super::encode_register("goal_speed", DEFAULT_MOVE_SPEED)?;
     Ok([0, position[0], position[1], 0, 0, speed[0], speed[1]])
+}
+
+pub fn read_position(bus: &mut impl FeetechRawBus, id: u8) -> Result<f64, ServoError> {
+    let bytes = bus.read_raw(id, super::protocol::HD1910_PRESENT_POSITION, 2)?;
+    if bytes.len() != 2 {
+        return Err(ServoError::ShortRead {
+            what: "HD1910 position",
+            expected: 2,
+            got: bytes.len(),
+        });
+    }
+    let position = super::decode_register("present_position", &bytes)? as i32;
+    Ok(super::position_rad_from_steps(
+        crate::ServoModel::Hd1910,
+        position,
+    ))
+}
+
+pub fn set_torque(bus: &mut impl FeetechRawBus, id: u8, enabled: bool) -> Result<(), ServoError> {
+    let bytes = super::encode_register("torque_enable", i64::from(enabled))?;
+    bus.write_raw(id, super::protocol::HD1910_TORQUE_ENABLE, &bytes)
+}
+
+pub fn set_position_gain(
+    bus: &mut impl FeetechRawBus,
+    id: u8,
+    gain: u16,
+) -> Result<(), ServoError> {
+    let bytes = super::encode_register("p_coefficient", i64::from(gain.min(255)))?;
+    bus.write_raw(id, super::protocol::HD1910_P_GAIN, &bytes)
+}
+
+pub fn read_position_sample(
+    bus: &mut impl FeetechRawBus,
+    ids: &[u8],
+) -> Result<ServoPositionSample, ServoError> {
+    let mut positions = Vec::with_capacity(ids.len());
+    let mut velocities = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let block = bus.read_raw(
+            id,
+            super::protocol::HD1910_PRESENT_POSITION,
+            super::protocol::HD1910_MOTION_WIDTH,
+        )?;
+        let (position, velocity) = decode_motion_block(&block)?;
+        positions.push(position);
+        velocities.push(velocity);
+    }
+    Ok(ServoPositionSample {
+        positions,
+        velocities,
+    })
 }
 
 pub trait FeetechRawBus {
@@ -255,9 +315,8 @@ impl<B: FeetechRawBus + Send> FeetechDriver for Hd1910Driver<B> {
     }
 
     fn set_torque(&mut self, _enabled: bool) -> Result<(), ServoError> {
-        let bytes = super::encode_register("torque_enable", i64::from(_enabled))?;
         for id in self.ids.clone() {
-            self.bus.write_raw(id, 40, &bytes)?;
+            set_torque(&mut self.bus, id, _enabled)?;
         }
         Ok(())
     }
@@ -282,21 +341,6 @@ impl<B: FeetechRawBus + Send> FeetechDriver for Hd1910Driver<B> {
 }
 
 impl<B: FeetechRawBus + Send> Hd1910Driver<B> {
-    fn read_position_sample(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
-        let mut positions = Vec::with_capacity(ids.len());
-        let mut velocities = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let block = self.bus.read_raw(id, 56, 4)?;
-            let (position, velocity) = decode_motion_block(&block)?;
-            positions.push(position);
-            velocities.push(velocity);
-        }
-        Ok(ServoPositionSample {
-            positions,
-            velocities,
-        })
-    }
-
     fn write_position_targets(
         &mut self,
         ids: &[u8],
@@ -328,9 +372,9 @@ impl<B: FeetechRawBus + Send> Hd1910Driver<B> {
     }
 }
 
-impl<B: FeetechRawBus + Send> ServoLoopDriver for Hd1910Driver<B> {
+impl<B: FeetechRawBus + Send> ServoDeviceDriver for Hd1910Driver<B> {
     fn read_positions(&mut self, ids: &[u8]) -> Result<ServoPositionSample, ServoError> {
-        self.read_position_sample(ids)
+        read_position_sample(&mut self.bus, ids)
     }
 
     fn write_positions(
@@ -347,8 +391,7 @@ impl<B: FeetechRawBus + Send> ServoLoopDriver for Hd1910Driver<B> {
 
     fn set_gain(&mut self, _gain: u16) -> Result<(), ServoError> {
         for id in self.ids.clone() {
-            let bytes = super::encode_register("p_coefficient", i64::from(_gain.min(255)))?;
-            self.bus.write_raw(id, 21, &bytes)?;
+            set_position_gain(&mut self.bus, id, _gain)?;
         }
         Ok(())
     }

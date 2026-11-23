@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BodyActionCodec, BodyActionSpace, BodyBinding, BodyContractSnapshot, BodyError, BodyTemplate,
+    AssetResolver, BodyAssets, BodyBinding, BodyContractSnapshot, BodyError, BodyTemplate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,21 +16,16 @@ pub struct BodyIdentity {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyProfile {
     template: BodyTemplate,
-    action_space: BodyActionSpace,
 }
 
 impl BodyProfile {
-    pub fn official() -> Result<Self, BodyError> {
-        Self::from_template(BodyTemplate::official()?)
+    pub fn official(assets: BodyAssets, resolver: &dyn AssetResolver) -> Result<Self, BodyError> {
+        Self::from_template(BodyTemplate::official(assets, resolver)?)
     }
 
     pub fn from_template(template: BodyTemplate) -> Result<Self, BodyError> {
         template.validate()?;
-        let action_space = BodyActionSpace::from_template(&template)?;
-        Ok(Self {
-            template,
-            action_space,
-        })
+        Ok(Self { template })
     }
 
     pub fn identity(&self) -> BodyIdentity {
@@ -78,14 +73,6 @@ impl BodyProfile {
 
     pub fn template(&self) -> &BodyTemplate {
         &self.template
-    }
-
-    pub fn action_space(&self) -> &BodyActionSpace {
-        &self.action_space
-    }
-
-    pub fn action_codec(&self) -> BodyActionCodec {
-        BodyActionCodec::new(self.action_space.clone())
     }
 
     pub fn bind(&self, binding: BodyBinding) -> Result<BoundBody<'_>, BodyError> {

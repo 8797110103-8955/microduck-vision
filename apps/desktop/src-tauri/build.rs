@@ -5,25 +5,39 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+#[path = "../../../.cargo/output_paths.rs"]
+mod output_paths;
+
+use output_paths::output_root;
+
 const ORT_VERSION: &str = "1.28.0";
 const ORT_SHA256: &str = "769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db";
 const DOWNLOAD_ATTEMPTS: u8 = 3;
 
-fn executable_directory(profile: &Path) -> PathBuf {
-    std::env::var_os("DUCK_RELEASE_OUTPUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| profile.to_path_buf())
-}
-
-fn workspace_target_directory() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn main() {
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
-        .expect("desktop crate is under apps/desktop/src-tauri")
-        .join("target")
-}
+        .expect("repository directory");
+    let profile = out.ancestors().nth(3).expect("Cargo profile directory");
+    let target = profile.parent().expect("Cargo target directory");
+    let root = output_root(repo, target);
+    println!(
+        "cargo:rustc-env=DUCK_DESKTOP_TEST_DIR={}",
+        root.join("tests").display()
+    );
+    let release_dir = root.join("bin");
+    let output = if cfg!(feature = "desktop-distribution") {
+        println!(
+            "cargo:rustc-env=DUCK_DESKTOP_RELEASE_DIR={}",
+            release_dir.display()
+        );
+        release_dir.as_path()
+    } else {
+        profile
+    };
 
-fn main() {
     let attrs = tauri_build::Attributes::new()
         .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
     tauri_build::try_build(attrs).expect("tauri build");
@@ -36,76 +50,29 @@ fn main() {
             .join("assets");
         let manifest = assets.join("windows-app-manifest.xml");
         println!("cargo:rerun-if-changed={}", manifest.display());
-        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+        println!("cargo:rustc-link-arg-bin=microduck-vision=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-bin=microduck-vision=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
     }
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=DUCK_ORT_ZIP");
-    println!("cargo:rerun-if-env-changed=DUCK_RELEASE_OUTPUT");
     if windows {
-        deploy_onnxruntime();
-        deploy_mujoco();
+        deploy_onnxruntime(&out, profile, &root, output);
+        deploy_mujoco(profile, output);
     }
 }
 
-// The C binding is built from these exact headers and the matching runtime is deployed with
-// the executable. Override only the archive location, never its version or checksum.
-fn deploy_mujoco() {
-    const VERSION: &str = "3.10.0";
-    const SHA: &str = "5d938c7558490d6f7332307212a41c9c5d5bf39009590e4ca5cf1ff0762da91c";
-    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let profile = out.ancestors().nth(3).expect("OUT_DIR layout");
-    let cache = workspace_target_directory().join("mujoco").join(VERSION);
-    let sdk = cache.join("sdk");
-    println!("cargo:rerun-if-env-changed=DUCK_MUJOCO_ZIP");
-    println!("cargo:rerun-if-changed=native/mujoco_bridge.c");
-    if !sdk.join("include/mujoco/mujoco.h").is_file() {
-        std::fs::create_dir_all(&sdk).expect("create MuJoCo SDK cache");
-        let archive = match std::env::var_os("DUCK_MUJOCO_ZIP") {
-            Some(path) => PathBuf::from(path),
-            None => {
-                let path = cache.join("download.zip");
-                if !path.is_file() {
-                    download_file(&format!("https://github.com/google-deepmind/mujoco/releases/download/{VERSION}/mujoco-{VERSION}-windows-x86_64.zip"), &path).expect("download pinned MuJoCo SDK");
-                }
-                path
-            }
-        };
-        use sha2::Digest;
-        let hash = format!(
-            "{:x}",
-            sha2::Sha256::digest(std::fs::read(&archive).expect("read MuJoCo archive"))
-        );
-        assert_eq!(hash, SHA, "MuJoCo archive checksum mismatch");
-        let status = Command::new(system_tool("tar.exe"))
-            .arg("-xf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&sdk)
-            .status()
-            .expect("extract MuJoCo SDK");
-        assert!(status.success(), "MuJoCo SDK extraction failed");
-        assert!(
-            sdk.join("include/mujoco/mujoco.h").is_file(),
-            "MuJoCo SDK layout mismatch"
-        );
-    }
-    cc::Build::new()
-        .file("native/mujoco_bridge.c")
-        .include(sdk.join("include"))
-        .debug(false)
-        .warnings(true)
-        .compile("duck_mujoco_bridge");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        sdk.join("lib").display()
+// The product package links MuJoCo. The desktop deploys the same SDK runtime.
+fn deploy_mujoco(profile: &Path, output: &Path) {
+    let sdk = PathBuf::from(
+        std::env::var_os("DEP_MUJOCO_SDK").expect("body-runtime must provide the MuJoCo SDK"),
     );
-    println!("cargo:rustc-link-lib=dylib=mujoco");
-    println!("cargo:rustc-env=DUCK_MUJOCO_VERSION={VERSION}");
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let output = executable_directory(profile);
     let dll = sdk.join("bin/mujoco.dll");
+    println!("cargo:rerun-if-changed={}", dll.display());
     for destination in [
         output.join("mujoco.dll"),
         profile.join("mujoco.dll"),
@@ -125,54 +92,52 @@ fn deploy_mujoco() {
         std::fs::copy(sdk.join(name), notices.join(name)).expect("deploy MuJoCo license notices");
         println!("cargo:rerun-if-changed={}", notices.join(name).display());
     }
-    // Copy the pinned vendor model at build time. The source of truth stays in vendor;
-    // the executable profile receives a runnable copy with its relative include/mesh paths.
-    let assets = root.join("../../../vendor/microduck_rl/src/mjlab_microduck/robot/microduck");
+    // Three.js loads STL through the Tauri asset protocol. Rust uses embedded MJCF and meshes.
+    let assets =
+        root.join("../../../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/assets");
     let model_license = root.join("../../../vendor/microduck_rl/LICENSE-MODELS.md");
     let deployed = output.join("resources/microduck");
-    println!("cargo:rerun-if-changed={}", deployed.display());
-    if deployed.is_dir() {
-        std::fs::remove_dir_all(&deployed).expect("clear deployed model resources");
-    }
-    copy_model_resources(&assets, &deployed, &model_license);
-}
-
-fn copy_model_resources(source: &Path, destination: &Path, model_license: &Path) {
-    std::fs::create_dir_all(destination).expect("create model asset directory");
-    for entry in std::fs::read_dir(source).expect("read official model resources") {
-        let entry = entry.expect("model resource");
-        let path = entry.path();
-        let target = destination.join(entry.file_name());
-        if path.is_dir() {
-            copy_model_resources(&path, &target, model_license);
-        } else if path.extension().is_some_and(|e| e == "xml" || e == "stl") {
-            println!("cargo:rerun-if-changed={}", path.display());
-            if !same_file(&path, &target) {
-                std::fs::copy(path, target).expect("deploy model resource");
+    if let Ok(entries) = std::fs::read_dir(&deployed) {
+        for entry in entries {
+            let entry = entry.expect("read old deployed model resource");
+            if entry.file_type().expect("model resource type").is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "xml")
+            {
+                std::fs::remove_file(entry.path()).expect("remove old deployed MuJoCo XML");
             }
         }
     }
-    let license_target = destination.join("LICENSE-MODELS.md");
-    if source
-        == Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../vendor/microduck_rl/src/mjlab_microduck/robot/microduck")
-        && !same_file(model_license, &license_target)
-    {
-        println!("cargo:rerun-if-changed={}", model_license.display());
+    copy_display_meshes(&assets, &deployed.join("assets"));
+    println!("cargo:rerun-if-changed={}", model_license.display());
+    let license_target = deployed.join("LICENSE-MODELS.md");
+    if !same_file(&model_license, &license_target) {
         std::fs::copy(model_license, license_target).expect("deploy model license");
     }
 }
 
-fn deploy_onnxruntime() {
-    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let profile = out
-        .ancestors()
-        .nth(3)
-        .expect("OUT_DIR layout")
-        .to_path_buf();
-    let cache = workspace_target_directory()
-        .join("onnxruntime")
-        .join(ORT_VERSION);
+fn copy_display_meshes(source: &Path, destination: &Path) {
+    println!("cargo:rerun-if-changed={}", source.display());
+    std::fs::create_dir_all(destination).expect("create model asset directory");
+    for entry in std::fs::read_dir(source).expect("read official display meshes") {
+        let entry = entry.expect("display mesh");
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("display mesh type").is_dir() {
+            copy_display_meshes(&path, &target);
+        } else if path.extension().is_some_and(|extension| extension == "stl") {
+            println!("cargo:rerun-if-changed={}", path.display());
+            if !same_file(&path, &target) {
+                std::fs::copy(path, target).expect("deploy display mesh");
+            }
+        }
+    }
+}
+
+fn deploy_onnxruntime(out: &Path, profile: &Path, root: &Path, output: &Path) {
+    let cache = root.join("onnxruntime").join(ORT_VERSION);
     let dll = cache.join("onnxruntime.dll");
 
     if !dll.is_file()
@@ -188,7 +153,6 @@ fn deploy_onnxruntime() {
     }
 
     println!("cargo:rustc-env=DUCK_ORT_VERSION={ORT_VERSION}");
-    let output = executable_directory(&profile);
     // Tauri launches the executable from the profile root. Keep a copy there in addition to
     // the build-script and deps directories used by cargo test and direct crate binaries.
     for target in [

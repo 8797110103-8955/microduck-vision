@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "microduck-vision",
   "build": {
-    "beforeDevCommand": "cargo run --manifest-path generate/Cargo.toml && node node_modules/vite/bin/vite.js",
-    "beforeBuildCommand": "cargo run --manifest-path generate/Cargo.toml && node node_modules/vite/bin/vite.js build",
+    "beforeDevCommand": "node node_modules/vite/bin/vite.js",
+    "beforeBuildCommand": "node node_modules/vite/bin/vite.js build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },

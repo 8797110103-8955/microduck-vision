@@ -8,12 +8,14 @@ import {
   debugPhysicalMachineFor,
   defaultDebugVirtualMachineId,
 } from "../../src/features/debug";
-import { physicalMarkerState } from "../../src/features/home";
+import { physicalMarkerState } from "../../src/features/scene-stage";
 
 const virtualMachine = (id: string, name: string): VirtualMachine => ({
   id,
   name,
   bodyId: "official",
+  executionKind: "simulation",
+  modelKind: "hd1910-compatible",
   servoModel: "hd1910",
   simulation: {
     damping: 0,
@@ -36,6 +38,9 @@ const physicalMachine = (
   name,
   usbPort: id,
   machineCode: id,
+  executionKind: "physical",
+  modelKind: "hd1910",
+  servoModel: "hd1910",
   census: [{ servoId: 1, model: "hd1910" }],
   reconnectHint: null,
   virtualMachineId,

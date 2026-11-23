@@ -1,13 +1,15 @@
 [package]
 name = "loop-body"
-description = "Product-agnostic servo-backed body control loop and backend boundary."
-# The boundary excludes body assets, servo register facts, policy files, policy contracts, and UI
-# state. Product applications inject canonical targets or a controller around the body loop.
-# The instance registry owns generic factories and access leases; product backends stay in apps.
+description = "Reusable body control loops, body backend contracts, and execution access control."
+# Consumes duck-body models and servo I/O through adapters. Owns body feedback and target
+# delivery, tick and execution rules, generic backend registration, and read/write leases.
+# Applications provide concrete real and simulated backends, timing settings, and canonical
+# joint targets or a controller. Policy models and observation/action formats stay in the application.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 duck-body = { path = "../duck-body" }
@@ -21,3 +23,7 @@ serde_json.workspace = true
 [[test]]
 name = "body_loop"
 path = "tests/body_loop.rs"
+
+[[test]]
+name = "read_only_source"
+path = "tests/read_only_source.rs"

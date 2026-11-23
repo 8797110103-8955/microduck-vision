@@ -46,6 +46,24 @@ fn arming_holds_feedback_before_torque_and_waits_for_explicit_drive() {
 }
 
 #[test]
+fn arming_a_fixed_or_unsupported_gain_backend_keeps_the_measured_hold() {
+    for capability in [
+        loop_body::GainCapability::FixedModel,
+        loop_body::GainCapability::Unsupported,
+    ] {
+        let mut driver = FakeDriver::new(15);
+        driver.gain_capability = Some(capability);
+        driver.positions[1] = 0.12;
+        let events = driver.event_log();
+        let mut body_loop = loop_with(driver);
+        body_loop.arm_at_current_pose().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["read", "write", "torque"]);
+        assert_eq!(body_loop.status().phase, LoopPhase::Holding);
+        assert_eq!(body_loop.status().targets[1], 0.12);
+    }
+}
+
+#[test]
 fn failed_arm_feedback_does_not_enable_torque_or_write_a_target() {
     let mut driver = FakeDriver::new(15);
     driver.fail_reads = 1;

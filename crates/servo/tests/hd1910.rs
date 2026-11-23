@@ -10,7 +10,7 @@ use servo::hd1910::{
     voltage_v_from_raw,
 };
 use servo::{
-    Gain, ServoCommand, ServoError, ServoIdentity, ServoLoopDriver, ServoModel,
+    Gain, ServoCommand, ServoDeviceDriver, ServoError, ServoIdentity, ServoModel,
     ServoPositionTargets, ServoTelemetry,
 };
 use std::collections::VecDeque;
@@ -111,9 +111,9 @@ impl FeetechRawBus for DriverBus {
 #[test]
 fn hd1910_driver_uses_feetech_motion_registers_for_loop_io() {
     let mut driver = Hd1910Driver::new(DriverBus::default()).with_ids([1]);
-    let sample = ServoLoopDriver::read_positions(&mut driver, &[1]).unwrap();
+    let sample = ServoDeviceDriver::read_positions(&mut driver, &[1]).unwrap();
     assert_eq!(sample.positions.len(), 1);
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[1],
         &ServoPositionTargets {
@@ -121,8 +121,8 @@ fn hd1910_driver_uses_feetech_motion_registers_for_loop_io() {
         },
     )
     .unwrap();
-    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
-    ServoLoopDriver::set_gain(&mut driver, 200).unwrap();
+    ServoDeviceDriver::set_torque(&mut driver, true).unwrap();
+    ServoDeviceDriver::set_gain(&mut driver, 200).unwrap();
     let bus = driver.into_inner();
     assert_eq!(bus.goal_addr, Some(41));
     assert_eq!(bus.goal, vec![0, 0, 8, 0, 0, 232, 3]);
@@ -137,7 +137,7 @@ fn hd1910_reads_each_position_and_velocity_block_in_id_order() {
         ..DriverBus::default()
     };
     let mut driver = Hd1910Driver::new(bus).with_ids([3, 4]);
-    let sample = ServoLoopDriver::read_positions(&mut driver, &[3, 4]).unwrap();
+    let sample = ServoDeviceDriver::read_positions(&mut driver, &[3, 4]).unwrap();
     let bus = driver.into_inner();
 
     assert_eq!(bus.reads, [(3, 56, 4), (4, 56, 4)]);
@@ -145,6 +145,34 @@ fn hd1910_reads_each_position_and_velocity_block_in_id_order() {
     assert!(sample.velocities[0] > 0.0);
     assert!(sample.velocities[1] < 0.0);
     assert!((sample.velocities[0] + sample.velocities[1]).abs() < 1e-12);
+}
+
+#[test]
+fn hd1910_configuration_reads_one_device_and_preserves_its_position_domain() {
+    let mut bytes = vec![0; 60];
+    bytes[11..13].copy_from_slice(&4095_u16.to_le_bytes());
+    bytes[30] = 1;
+    bytes[33] = 4;
+    let mut multi_turn = bytes.clone();
+    multi_turn[11..13].copy_from_slice(&[0, 0]);
+    let mut bus = DriverBus {
+        read_answers: VecDeque::from([bytes, multi_turn]),
+        ..DriverBus::default()
+    };
+    let single = servo::hd1910::read_configuration(&mut bus, 9).unwrap();
+    let multi = servo::hd1910::read_configuration(&mut bus, 4).unwrap();
+    assert_eq!(bus.reads, [(9, 0, 60), (4, 0, 60)]);
+    let position = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, 4301);
+    assert_eq!(
+        single.domain.validate(position),
+        Err(ServoError::PositionOutsideHardwareLimits {
+            min: 0,
+            max: 4095,
+            count: 4301,
+            mode: 4,
+        })
+    );
+    multi.domain.validate(position).unwrap();
 }
 
 #[test]
@@ -159,7 +187,7 @@ fn hd1910_motion_packets_use_hls_velocity_units_with_signed_counts() {
             ..DriverBus::default()
         };
         let mut driver = Hd1910Driver::new(bus).with_ids([4]);
-        let sample = ServoLoopDriver::read_positions(&mut driver, &[4]).unwrap();
+        let sample = ServoDeviceDriver::read_positions(&mut driver, &[4]).unwrap();
         let magnitude = f64::from(raw & 0x7fff);
         let signed_counts = if raw & 0x8000 == 0 {
             magnitude
@@ -198,7 +226,7 @@ fn hd1910_short_motion_block_is_rejected_before_any_target_write() {
         ..DriverBus::default()
     };
     let mut driver = Hd1910Driver::new(bus).with_ids([1]);
-    let error = ServoLoopDriver::read_positions(&mut driver, &[1]).unwrap_err();
+    let error = ServoDeviceDriver::read_positions(&mut driver, &[1]).unwrap_err();
     let bus = driver.into_inner();
     assert_eq!(
         error,
@@ -215,7 +243,7 @@ fn hd1910_short_motion_block_is_rejected_before_any_target_write() {
 fn hd1910_writes_one_complete_motion_block_per_servo_id() {
     let bus = DriverBus::default();
     let mut driver = Hd1910Driver::new(bus).with_ids([7, 8]);
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[7, 8],
         &ServoPositionTargets {
@@ -238,7 +266,7 @@ fn hd1910_writes_one_complete_motion_block_per_servo_id() {
 fn hd1910_rejects_invalid_target_shapes_without_writing() {
     let bus = DriverBus::default();
     let mut driver = Hd1910Driver::new(bus).with_ids([1, 2]);
-    let mismatch = ServoLoopDriver::write_positions(
+    let mismatch = ServoDeviceDriver::write_positions(
         &mut driver,
         &[1, 2],
         &ServoPositionTargets {
@@ -247,7 +275,7 @@ fn hd1910_rejects_invalid_target_shapes_without_writing() {
     )
     .unwrap_err();
     assert!(matches!(mismatch, ServoError::CountMismatch { .. }));
-    let nonfinite = ServoLoopDriver::write_positions(
+    let nonfinite = ServoDeviceDriver::write_positions(
         &mut driver,
         &[1],
         &ServoPositionTargets {
@@ -267,9 +295,9 @@ fn hd1910_rejects_invalid_target_shapes_without_writing() {
 fn hd1910_torque_gain_and_reboot_apply_to_all_configured_ids() {
     let bus = DriverBus::default();
     let mut driver = Hd1910Driver::new(bus).with_ids([4, 9]);
-    ServoLoopDriver::set_torque(&mut driver, true).unwrap();
-    ServoLoopDriver::set_gain(&mut driver, 400).unwrap();
-    ServoLoopDriver::reboot(&mut driver, 9).unwrap();
+    ServoDeviceDriver::set_torque(&mut driver, true).unwrap();
+    ServoDeviceDriver::set_gain(&mut driver, 400).unwrap();
+    ServoDeviceDriver::reboot(&mut driver, 9).unwrap();
     let bus = driver.into_inner();
 
     assert_eq!(
@@ -436,7 +464,7 @@ fn hd1910_prepares_the_entire_target_frame_before_any_servo_write() {
     let mut driver = Hd1910Driver::new(DriverBus::default()).with_ids([9, 1]);
     let too_far = servo::hd1910::position_rad_from_steps(ServoModel::Hd1910, 32768);
     assert!(
-        ServoLoopDriver::write_positions(
+        ServoDeviceDriver::write_positions(
             &mut driver,
             &[9, 1],
             &ServoPositionTargets {
@@ -457,7 +485,7 @@ fn hd1910_encodes_the_calibrated_goals_from_the_reported_failure() {
         4.150952012018545,
         -3.3011266555298997,
     ];
-    ServoLoopDriver::write_positions(
+    ServoDeviceDriver::write_positions(
         &mut driver,
         &[9, 4, 5, 11],
         &ServoPositionTargets {

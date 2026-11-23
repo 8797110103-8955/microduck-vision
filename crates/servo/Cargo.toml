@@ -1,7 +1,9 @@
 [package]
 name = "servo"
-description = "Product-agnostic servo definitions, protocol adapters, drivers and test doubles; body and UI policy stay above this crate."
-# The boundary intentionally excludes body templates, joint order, IMU wiring and UI policy.
+description = "Servo model definitions, register protocols, device drivers, and test doubles."
+# Owns device facts and servo I/O, including units, capabilities, and register behavior.
+# duck-body owns joint geometry and actuator mounting. loop-body owns the body backend
+# contract, including body feedback and execution timing. Applications assemble devices.
 autotests = false
 version.workspace = true
 edition.workspace = true
@@ -11,6 +13,7 @@ license.workspace = true
 [dependencies]
 rustypot.workspace = true
 serialport.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

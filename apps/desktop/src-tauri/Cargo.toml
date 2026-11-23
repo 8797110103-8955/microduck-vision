@@ -1,5 +1,10 @@
 [package]
 name = "microduck-vision"
+description = "Desktop application for configuring, simulating, and controlling MicroDuck machines."
+# Assembles servo I/O and loop-body sessions with microduck-body-runtime execution models.
+# Starts microduck-training and adapts desktop body selections, previews, and ONNX contracts.
+# Owns machine instances, backend and controller selection, MicroDuck policy workflows,
+# persistence, Windows integration, and the desktop IPC surface.
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
@@ -8,13 +13,10 @@ default-run = "microduck-vision"
 
 [workspace]
 
-[profile.dev]
-# The installed MSVC compiler fails while ring's C build emits /Z7 in dev mode.
-# Development PDB/debug information is intentionally disabled for this desktop crate.
-debug = 0
+[features]
+desktop-distribution = ["tauri/custom-protocol"]
 
 [build-dependencies]
-cc = "1.4"
 tauri-build = { version = "2.7.4", features = [] }
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
@@ -25,9 +27,12 @@ sha2 = "0.10"
 
 [dependencies]
 duck-body = { path = "../../../crates/duck-body" }
+microduck-body-runtime = { path = "../../body-runtime", features = ["native"] }
+microduck-training = { path = "../../training" }
 loop-body = { path = "../../../crates/loop-body" }
 servo = { path = "../../../crates/servo" }
 duck-control = { path = "../../../vendor/microduck/duck-control" }
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.9.8"
@@ -51,4 +56,9 @@ mcap = { version = "0.26.0", default-features = false }
 [[bin]]
 name = "microduck-vision"
 path = "src/main.rs"
+
+[[bin]]
+name = "stage-desktop-release"
+path = "release.rs"
+required-features = ["desktop-distribution"]
 

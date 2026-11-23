@@ -18,11 +18,116 @@ pub struct XdatImage {
 pub const HD1910: FeetechProtocol = FeetechProtocol;
 pub const STS3215: FeetechProtocol = FeetechProtocol;
 
+pub(super) const HD1910_TORQUE_ENABLE: u8 = 40;
+pub(super) const HD1910_P_GAIN: u8 = 21;
+pub(super) const HD1910_PRESENT_POSITION: u8 = 56;
+pub(super) const HD1910_MOTION_WIDTH: u8 = 4;
+pub const HD1910_MODEL_NUMBER: u16 = u16::from_le_bytes([10, 31]);
+pub const HD1910_RESOLUTION: u32 = 4096;
+pub const HD1910_BAUD_RATES: [u32; 8] = [
+    1_000_000, 500_000, 250_000, 128_000, 115_200, 76_800, 57_600, 38_400,
+];
+pub const HD1910_VOLTAGE_PER_COUNT: f64 = 0.1;
+pub const HD1910_CURRENT_MA_PER_COUNT: f64 = 6.5;
+pub(super) const HD1910_CONFIGURATION_WIDTH: u8 = 60;
+pub const HD1910_MOVE_BLOCK: &[&str] =
+    &["acceleration", "goal_position", "goal_time", "goal_speed"];
+
 /// HLS present velocity (address 58), in RPM per signed count.
 /// https://ftservo.github.io/ftservo-wiki/reference/parameter/memory-hls/
 pub const HD1910_VELOCITY_RPM_PER_COUNT: f64 = 0.732;
 pub const HD1910_VELOCITY_RAD_PER_SEC_PER_COUNT: f64 =
     HD1910_VELOCITY_RPM_PER_COUNT * 2.0 * PI / 60.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionDomain {
+    pub limits: [u16; 2],
+    pub mode: u8,
+    pub resolution: u8,
+}
+
+impl PositionDomain {
+    pub fn validate(self, position: f64) -> Result<(), ServoError> {
+        // HD's custom mode 4 is a position mode.
+        if !matches!(self.mode, 0 | 4) || self.resolution != 1 {
+            return Err(ServoError::UnsupportedPositionMode {
+                mode: self.mode,
+                resolution: self.resolution,
+            });
+        }
+        let count = position_steps_from_rad(ServoModel::Hd1910, position)?;
+        let [min, max] = self.limits;
+        if min == 0 && max == 0 {
+            // The codec has already validated the signed multi-turn register.
+            return Ok(());
+        }
+        if min >= max || u32::from(max) >= HD1910_RESOLUTION {
+            return Err(ServoError::InvalidPositionLimits { min, max });
+        }
+        if !(i32::from(min)..=i32::from(max)).contains(&count) {
+            return Err(ServoError::PositionOutsideHardwareLimits {
+                min,
+                max,
+                count,
+                mode: self.mode,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hd1910Configuration {
+    pub bytes: [u8; HD1910_CONFIGURATION_WIDTH as usize],
+    pub firmware: [u8; 2],
+    pub model_version: [u8; 2],
+    pub domain: PositionDomain,
+    pub phase: u8,
+    pub configured_gains: [u8; 3],
+    pub protection_current_raw: u16,
+    pub torque_enable_raw: u8,
+    pub goal_position_raw: u16,
+    pub target_current_raw: u16,
+    pub goal_speed_raw: u16,
+    pub torque_limit_raw: u16,
+    pub runtime_gains: [u8; 3],
+    pub eeprom_lock: u8,
+    pub present_position_raw: u16,
+    pub present_velocity_raw: u16,
+}
+
+impl Hd1910Configuration {
+    pub fn parse(bytes: &[u8]) -> Result<Self, ServoError> {
+        let raw = bytes.try_into().map_err(|_| ServoError::ShortRead {
+            what: "HD1910 configuration snapshot",
+            expected: usize::from(HD1910_CONFIGURATION_WIDTH),
+            got: bytes.len(),
+        })?;
+        let word = |offset| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        Ok(Self {
+            bytes: raw,
+            firmware: [bytes[0], bytes[1]],
+            model_version: [bytes[3], bytes[4]],
+            domain: PositionDomain {
+                limits: [word(9), word(11)],
+                mode: bytes[33],
+                resolution: bytes[30],
+            },
+            phase: bytes[18],
+            configured_gains: [bytes[21], bytes[22], bytes[23]],
+            protection_current_raw: word(28),
+            torque_enable_raw: bytes[40],
+            goal_position_raw: word(42),
+            target_current_raw: word(44),
+            goal_speed_raw: word(46),
+            torque_limit_raw: word(48),
+            runtime_gains: [bytes[50], bytes[51], bytes[52]],
+            eeprom_lock: bytes[55],
+            present_position_raw: word(56),
+            present_velocity_raw: word(58),
+        })
+    }
+}
 
 pub fn protocol_for_model(model: ServoModel) -> Option<FeetechProtocol> {
     matches!(
@@ -33,18 +138,10 @@ pub fn protocol_for_model(model: ServoModel) -> Option<FeetechProtocol> {
 }
 
 pub fn baud_code(_model: ServoModel, baud: u32) -> Option<u8> {
-    [
-        (1_000_000, 0),
-        (500_000, 1),
-        (250_000, 2),
-        (128_000, 3),
-        (115_200, 4),
-        (76_800, 5),
-        (57_600, 6),
-        (38_400, 7),
-    ]
-    .into_iter()
-    .find_map(|(rate, code)| (rate == baud).then_some(code))
+    HD1910_BAUD_RATES
+        .iter()
+        .position(|&rate| rate == baud)
+        .map(|code| code as u8)
 }
 
 pub fn reset_instruction(model: ServoModel) -> Option<u8> {
@@ -73,7 +170,7 @@ pub fn motion_registers(model: ServoModel) -> &'static [&'static str] {
 pub fn position_steps_from_rad(model: ServoModel, radians: f64) -> Result<i32, ServoError> {
     let resolution = match model {
         ServoModel::Scs0009 => 1024.0,
-        ServoModel::Hd1910 | ServoModel::Sts3215 => 4096.0,
+        ServoModel::Hd1910 | ServoModel::Sts3215 => f64::from(HD1910_RESOLUTION),
         ServoModel::Xl330M288 => return Err(ServoError::UnknownRegister("model".into())),
     };
     if !radians.is_finite() {
@@ -105,8 +202,8 @@ pub fn position_steps_from_rad(model: ServoModel, radians: f64) -> Result<i32, S
 pub fn position_rad_from_steps(model: ServoModel, steps: i32) -> f64 {
     let resolution = match model {
         ServoModel::Scs0009 => 1024.0,
-        ServoModel::Hd1910 | ServoModel::Sts3215 => 4096.0,
-        ServoModel::Xl330M288 => 4096.0,
+        ServoModel::Hd1910 | ServoModel::Sts3215 => f64::from(HD1910_RESOLUTION),
+        ServoModel::Xl330M288 => f64::from(crate::xl330::XL330_RESOLUTION),
     };
     (f64::from(steps) * (2.0 * PI) / resolution) - PI
 }
@@ -125,10 +222,10 @@ pub fn velocity_rad_s_from_counts(model: ServoModel, counts: i16) -> f64 {
 
 /// The shared HD1910 live-telemetry decode path, including register sign and units.
 pub fn decode_motion_block(bytes: &[u8]) -> Result<(f64, f64), ServoError> {
-    if bytes.len() != 4 {
+    if bytes.len() != usize::from(HD1910_MOTION_WIDTH) {
         return Err(ServoError::ShortRead {
             what: "HD1910 motion block",
-            expected: 4,
+            expected: usize::from(HD1910_MOTION_WIDTH),
             got: bytes.len(),
         });
     }
@@ -141,11 +238,11 @@ pub fn decode_motion_block(bytes: &[u8]) -> Result<(f64, f64), ServoError> {
 }
 
 pub fn current_ma_from_raw(_model: ServoModel, raw: i16) -> f64 {
-    f64::from(raw) * 6.5
+    f64::from(raw) * HD1910_CURRENT_MA_PER_COUNT
 }
 
 pub fn voltage_v_from_raw(_model: ServoModel, raw: u8) -> f64 {
-    f64::from(raw) * 0.1
+    f64::from(raw) * HD1910_VOLTAGE_PER_COUNT
 }
 
 pub fn temperature_c_from_raw(_model: ServoModel, raw: u8) -> f64 {

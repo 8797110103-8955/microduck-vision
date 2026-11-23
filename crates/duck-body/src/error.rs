@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::model::ActuatorCapability;
+use crate::ActuatorCapability;
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum BodyError {
@@ -26,8 +26,6 @@ pub enum BodyError {
     MissingActuator { joint: String, actuator: String },
     #[error("control contract joint order does not match template order")]
     ControlOrderMismatch,
-    #[error("control contract action size {actual} does not match actuator count {expected}")]
-    ActionSizeMismatch { actual: usize, expected: usize },
     #[error(
         "body control contract home pose does not match joint count or contains non-finite values"
     )]
@@ -38,6 +36,8 @@ pub enum BodyError {
     InvalidReferencePose { name: String },
     #[error("body asset does not exist: {0}")]
     MissingAsset(PathBuf),
+    #[error("cannot read body asset {0}: {1}")]
+    AssetRead(PathBuf, String),
     #[error("MJCF parse failed: {0}")]
     Mjcf(String),
     #[error("MJCF joint {0:?} is not present in the kinematics model")]

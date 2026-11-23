@@ -22,7 +22,7 @@ pub struct BodyLoop {
     last_error: Option<String>,
     last_velocities: Vec<f64>,
     pending_velocities: Option<Vec<f64>>,
-    last_imu: Option<servo::ServoImuSample>,
+    last_imu: Option<crate::BackendImuSample>,
     valid: Vec<bool>,
     joint_range_states: Vec<JointRangeState>,
 }
@@ -113,7 +113,7 @@ impl BodyLoop {
                     return Err(LoopError::InvalidAction(self.phase));
                 }
                 self.adapter.set_torque(true)?;
-                self.adapter.set_gain(self.config.gain)?;
+                self.adapter.configure_gain(self.config.gain)?;
                 self.phase = if self.config.homing_ticks == 0 {
                     LoopPhase::Ready
                 } else {
@@ -302,7 +302,7 @@ impl BodyLoop {
         if self.phase == LoopPhase::Reconnecting {
             self.phase = LoopPhase::Homing;
             self.adapter.set_torque(true)?;
-            self.adapter.set_gain(self.config.gain)?;
+            self.adapter.configure_gain(self.config.gain)?;
             self.homing_ticks = 0;
         }
         let sample = match self.adapter.read() {

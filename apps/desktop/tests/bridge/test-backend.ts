@@ -8,7 +8,7 @@ import type {
   PolicyEntry,
   ReconnectHint,
   RecordingInfo,
-  RecordingFrame,
+  RecordingPreviewFrame,
   SceneFrame,
   SceneInfo,
   ServoCatalogEntry,
@@ -190,6 +190,8 @@ export class TestBackend {
         id: "official-hd1910",
         name: "机器 0",
         bodyId: "official",
+        executionKind: "simulation",
+        modelKind: "hd1910-compatible",
         servoModel: "hd1910",
         simulation: simulationFor(this.catalog, "hd1910"),
         startupSelected: true,
@@ -249,7 +251,7 @@ export class TestBackend {
         const status = this.previewStatus ?? this.status;
         if (!status) return [];
         const window = payloadRecord(payloadRecord(payload).window);
-        const rows: RecordingFrame[] = [0, 1].map((tick) => ({
+        const rows: RecordingPreviewFrame[] = [0, 1].map((tick) => ({
           recordingId: String(window.id),
           duckId: "official-hd1910",
           segmentId: 1,
@@ -258,6 +260,7 @@ export class TestBackend {
           controlStartedS: tick * 0.02,
           status: { ...status, tick },
           policy: null,
+          execution: null,
         }));
         return rows;
       }
@@ -756,7 +759,16 @@ export class TestBackend {
     if (!sameCensus(this.detectedCensus, found))
       throw new Error("physical machine identity is invalid");
     const hint = reconnectHint(input.reconnectHint);
+    const detectedModel = found[0]?.model;
+    const servoModel =
+      (detectedModel === "xl330" || detectedModel === "hd1910") &&
+      found.every((servo) => servo.model === detectedModel)
+        ? detectedModel
+        : null;
     const machine: PhysicalMachine = {
+      executionKind: "physical",
+      modelKind: servoModel,
+      servoModel,
       id: `physical-${this.physical.length + 1}`,
       name:
         typeof input.name === "string" && input.name.trim() ? input.name.trim() : "test-census-1-2",
@@ -815,11 +827,21 @@ export class TestBackend {
 
   private createVirtualMachine(value: unknown): VirtualMachine {
     const input = isRecord(value) ? value : {};
+    const { executionKind, modelKind, servoModel } = input;
+    if (
+      executionKind !== "simulation" ||
+      (!(servoModel === "xl330" && modelKind === "xl330") &&
+        !(servoModel === "hd1910" && (modelKind === "hd1910" || modelKind === "hd1910-compatible")))
+    ) {
+      throw new Error("invalid simulation selection");
+    }
     const machine: VirtualMachine = {
       id: `virtual-${this.virtual.length + 1}`,
       name: stringValue(input.name, "name"),
       bodyId: stringValue(input.bodyId, "bodyId"),
-      servoModel: input.servoModel === "xl330" ? "xl330" : "hd1910",
+      executionKind,
+      modelKind,
+      servoModel,
       simulation: {
         damping: numberValue(
           input.simulation && isRecord(input.simulation) ? input.simulation.damping : 0,
