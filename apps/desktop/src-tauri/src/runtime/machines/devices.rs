@@ -65,32 +65,6 @@ pub(crate) fn set_auto_reconnect_enabled(
     Ok(enabled)
 }
 
-pub(crate) fn open_logs(state: &DesktopState) -> Result<(), String> {
-    let file = crate::platform::logging::current_log_file(state.config_dir.as_deref());
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    if !file.exists() {
-        std::fs::File::create(&file).map_err(|error| error.to_string())?;
-    }
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]).arg(&file);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-    #[cfg(not(target_os = "windows"))]
-    command.arg(&file);
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("打开日志文件失败：{error}"))
-}
-
 pub(crate) fn ports() -> Result<Vec<SerialPortCandidate>, String> {
     serialport::available_ports()
         .map_err(|error| error.to_string())

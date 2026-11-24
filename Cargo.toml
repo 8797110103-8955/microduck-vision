@@ -1,7 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/servo", "crates/duck-body", "crates/loop-body"]
-exclude = ["vendor", "old", "apps"]
+members = [
+  "crates/servo",
+  "crates/duck-body",
+  "crates/loop-body",
+  "apps/body-runtime",
+  "apps/desktop/generate",
+  "apps/desktop/src-tauri",
+  "apps/training",
+]
+exclude = ["vendor", "old"]
 
 [workspace.package]
 version = "0.1.0"

@@ -8,7 +8,7 @@ use crate::models::profile::{
     BamParameters, BodyExecutionProfile, BodyPeriods, DeviceFacts, ExecutionKind, GainMode,
     ModelKind, PhysicalGains, ResolvedSimulationProfile, Selection, SimulationTuning,
 };
-use crate::models::scene_recipe::SceneOperation;
+use crate::models::scene_recipe::{SceneOperation, SceneRecipe};
 use crate::training::TaskBodyDescription;
 
 pub use super::xl330::profile::{TRAINING_REFERENCE as XL330_REFERENCE, TrainingReference};
@@ -30,8 +30,8 @@ pub fn nominal_motor(model: ModelKind) -> BamParameters {
 
 pub fn physical_gains(model: ModelKind) -> Option<PhysicalGains> {
     match model {
-        ModelKind::Xl330 => Some(xl330::physical::GAINS),
-        ModelKind::Hd1910 => Some(hd1910::physical::GAINS),
+        ModelKind::Xl330 => Some(xl330::PHYSICAL_GAINS),
+        ModelKind::Hd1910 => Some(hd1910::PHYSICAL_GAINS),
         ModelKind::Hd1910Compatible => None,
     }
 }
@@ -57,11 +57,11 @@ pub(crate) fn resolve_simulation_profile(
         return Err("expected a simulation selection".into());
     }
     let nominal = nominal_motor(selection.model_kind);
-    let (mut scenario, mut response, compatibility_revision) = match selection.model_kind {
-        ModelKind::Xl330 => (xl330::scene::scene(), xl330::profile::RESPONSE, None),
-        ModelKind::Hd1910 => (hd1910::scene::scene(), hd1910::profile::RESPONSE, None),
+    let mut scenario = SceneRecipe::native(selection.model_kind);
+    let (mut response, compatibility_revision) = match selection.model_kind {
+        ModelKind::Xl330 => (xl330::profile::RESPONSE, None),
+        ModelKind::Hd1910 => (hd1910::profile::RESPONSE, None),
         ModelKind::Hd1910Compatible => (
-            hd1910_compatible::scene::scene(),
             hd1910_compatible::profile::response(xl330::profile::MOTOR, nominal),
             Some(hd1910_compatible::profile::REVISION),
         ),
@@ -87,7 +87,11 @@ pub(crate) fn resolve_simulation_profile(
             response.encoder_through_backlash = task.requires_backlash;
         }
     }
-    let motor = apply_tuning(nominal, defaults(selection.model_kind), tuning)?;
+    let mut motor = apply_tuning(nominal, defaults(selection.model_kind), tuning)?;
+    if selection.model_kind == ModelKind::Hd1910Compatible && task.is_none() {
+        response = hd1910_compatible::profile::desktop_response(xl330::profile::MOTOR, nominal);
+        motor = hd1910_compatible::profile::desktop_motor(motor);
+    }
     let resources = scenario
         .resources(source)
         .map_err(|error| error.to_string())?;
@@ -123,24 +127,8 @@ pub fn resolve_physical(
     if selection.execution_kind != ExecutionKind::Physical {
         return Err("expected a physical selection".into());
     }
-    let source = match selection.model_kind {
-        ModelKind::Xl330 => xl330::physical::SOURCE,
-        ModelKind::Hd1910 => hd1910::physical::SOURCE,
-        ModelKind::Hd1910Compatible => {
-            return Err(hd1910_compatible::physical::UNSUPPORTED.into());
-        }
-    };
     let mut profile = base(selection, body);
     profile.physical_gains = physical_gains(selection.model_kind);
-    profile.parameter_sources.push(ParameterSource {
-        parameter: "physical_gains",
-        class: ParameterClass::Fact,
-        source,
-        assumption: Some(
-            "Configured through the device driver. Dynamic response has not been measured",
-        ),
-        real_machine_mapping: RealMachineMapping::Implemented,
-    });
     profile.finalize()
 }
 
@@ -354,6 +342,28 @@ fn simulation_sources(model: ModelKind, training: bool) -> Vec<ParameterSource> 
                 ),
                 real_machine_mapping: PhysicalEffect,
             });
+        }
+    }
+    if model == ModelKind::Hd1910Compatible && !training {
+        for entry in &mut sources {
+            if matches!(
+                entry.parameter,
+                "motor.max_pwm"
+                    | "position_gain_scale"
+                    | "back_emf_scale"
+                    | "friction_scale"
+                    | "passive_backlash"
+                    | "encoder_through_backlash"
+                    | "position_feedback"
+                    | "velocity_feedback"
+                    | "delay_steps"
+            ) {
+                entry.class = CompatibilityMeasure;
+                entry.source = "Multi-motion XL330 recording fit, HD1910 compatibility revision 2";
+                entry.assumption =
+                    Some("Simulation-only response fit; physical HD1910 behavior is unverified");
+                entry.real_machine_mapping = SimulationOnly;
+            }
         }
     }
     sources

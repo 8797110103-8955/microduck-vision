@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use duck_body::{BodyProfile, OFFICIAL_BODY_ID};
 #[cfg(test)]
-use microduck_body_runtime::BodyExecutionProfile;
-use microduck_body_runtime::{ExecutionKind, ModelKind, Selection};
+use microduck_body_runtime::{BodyExecutionProfile, ModelKind};
+use microduck_body_runtime::{ExecutionKind, Selection};
 #[cfg(test)]
 use servo::ServoModel;
 
@@ -52,11 +52,7 @@ pub(crate) fn model_selection(
             ExecutionKindKey::Simulation => ExecutionKind::Simulation,
             ExecutionKindKey::Physical => ExecutionKind::Physical,
         },
-        model_kind: match model_kind {
-            ModelKindKey::Xl330 => ModelKind::Xl330,
-            ModelKindKey::Hd1910 => ModelKind::Hd1910,
-            ModelKindKey::Hd1910Compatible => ModelKind::Hd1910Compatible,
-        },
+        model_kind: model_kind.into(),
         servo_model: crate::platform::helpers::model(&servo_model),
     };
     selection.validate()?;

@@ -131,7 +131,7 @@ describe("desktop training flow", () => {
     });
     await emit("training-progress", { ...progress, phase: "finished" });
     await flushPromises();
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     expect(buttonByText(wrapper, local.name).exists()).toBe(true);
     expect(store.state.selectedPolicyId).toBe("alpha-walking");

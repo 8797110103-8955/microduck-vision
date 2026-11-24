@@ -31,7 +31,7 @@ pub(crate) fn app_session_id() -> &'static str {
 }
 
 pub(crate) fn root(config: Option<&Path>) -> PathBuf {
-    logging::log_directory(config).join("recordings")
+    logging::log_directory(config).with_file_name("recordings")
 }
 
 enum Packet {
@@ -128,8 +128,21 @@ impl Recorder {
             .ok_or("运行中的鸭子没有身份")?
             .clone();
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let prefix: String = name
+            .chars()
+            .take(64)
+            .map(|character| {
+                if is_id_character(character) {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let prefix = prefix.trim_matches(['-', '.', '_']);
+        let prefix = if prefix.is_empty() { "onnx" } else { prefix };
         let id = format!(
-            "recording-{}-{}-{}",
+            "{prefix}-{}-{}-{}",
             app_session_id(),
             now_ms() as u64,
             SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -313,6 +326,10 @@ impl Recorder {
             .ok()
             .map(|info| info.clone())
     }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.lock().is_ok_and(|active| active.is_some())
+    }
 }
 
 fn write_recording(
@@ -323,12 +340,16 @@ fn write_recording(
     config: Option<&Path>,
 ) -> Result<String, String> {
     let initial = info.lock().map_err(|e| e.to_string())?.clone();
-    let file = File::create(Path::new(&initial.path).join("runtime.mcap")).map(BufWriter::new);
-    let opened = file.map_err(|e| e.to_string()).and_then(McapLog::new);
-    let mut writer = match opened {
-        Ok(writer) => {
+    let path = Path::new(&initial.path);
+    let opened = (|| {
+        let raw = File::create(path.join("runtime.mcap")).map_err(|error| error.to_string())?;
+        let motion = File::create(path.join("motion.jsonl")).map_err(|error| error.to_string())?;
+        Ok::<_, String>((McapLog::new(BufWriter::new(raw))?, BufWriter::new(motion)))
+    })();
+    let (mut writer, mut motion) = match opened {
+        Ok(writers) => {
             let _ = ready.send(Ok(()));
-            writer
+            writers
         }
         Err(error) => {
             let _ = ready.send(Err(error.clone()));
@@ -366,9 +387,15 @@ fn write_recording(
                         "tick":frame.status.tick,"duck_id":frame.duck_id});
                 }
                 writer.frame(&frame)?;
+                if let Some(sample) = motion_sample(&frame) {
+                    serde_json::to_writer(&mut motion, &sample)
+                        .map_err(|error| error.to_string())?;
+                    writeln!(motion).map_err(|error| error.to_string())?;
+                }
                 info.lock().map_err(|e| e.to_string())?.frames += 1;
                 if last_save.elapsed().as_secs() >= 1 {
                     writer.writer.flush().map_err(|e| e.to_string())?;
+                    motion.flush().map_err(|error| error.to_string())?;
                     let snapshot = info.lock().map_err(|e| e.to_string())?.clone();
                     save_info(&snapshot)?;
                     last_save = Instant::now();
@@ -392,7 +419,9 @@ fn write_recording(
         "recording_stopped",
         json!({"reason":reason,"context":last_context}),
     );
-    writer.finish()?;
+    let raw_result = writer.finish();
+    let motion_result = motion.flush().map_err(|error| error.to_string());
+    raw_result.and(motion_result)?;
     Ok(reason)
 }
 
@@ -492,12 +521,26 @@ pub(crate) fn report_reference(report: &Value) {
     }
 }
 
+fn is_id_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '-' | '_' | '.')
+}
+
 fn recording_path(config: Option<&Path>, id: &str) -> Result<PathBuf, String> {
-    if !id.starts_with("recording-") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    if id.is_empty() || matches!(id, "." | "..") || !id.chars().all(is_id_character) {
         return Err("无效的采集 ID".into());
     }
     Ok(root(config).join(id))
+}
+
+pub(crate) fn reveal_file(config: Option<&Path>, id: &str, motion: bool) -> Result<(), String> {
+    let file = if motion {
+        "motion.jsonl"
+    } else {
+        "runtime.mcap"
+    };
+    let path = recording_path(config, id)?.join(file);
+    tauri_plugin_opener::reveal_item_in_dir(path)
+        .map_err(|error| format!("定位采集文件失败：{error}"))
 }
 
 pub(crate) fn list(
@@ -767,6 +810,22 @@ pub(crate) fn accumulate(
     }
 }
 
+fn motion_sample(frame: &RecordingFrame) -> Option<Value> {
+    let policy = frame.policy.as_ref()?;
+    (frame.status.runtime_state == crate::types::RuntimeState::Running
+        && frame.status.sensor_failures == 0
+        && frame.status.active_body.is_some()
+        && policy.valid.iter().any(|valid| *valid)
+        && !frame.status.positions.is_empty()
+        && frame.status.positions.iter().all(|value| value.is_finite()))
+    .then(|| {
+        json!({"recording_id":frame.recording_id,"duck_id":frame.duck_id,
+            "segment_id":frame.segment_id,"episode_id":frame.episode_id,
+            "tick":frame.status.tick,"time_s":frame.elapsed_s,"positions":frame.status.positions,
+            "velocities":policy.velocities,"valid":policy.valid,"simulation":frame.status.simulation})
+    })
+}
+
 pub(crate) fn export(
     config: Option<&Path>,
     window: RecordingWindow,
@@ -828,20 +887,13 @@ pub(crate) fn export(
                     "tick":frame.status.tick,"time_s":frame.elapsed_s,
                     "observation":policy.observation,"teacher_action":policy.action})
             }
-            (_, "motion")
-                if good
-                    && frame.policy.as_ref().is_some_and(|policy| {
-                        !policy.valid.is_empty() && policy.valid.iter().all(|v| *v)
-                    })
-                    && !frame.status.positions.is_empty()
-                    && frame.status.positions.iter().all(|v| v.is_finite()) =>
-            {
-                json!({"recording_id":frame.recording_id,"duck_id":frame.duck_id,
-                    "segment_id":frame.segment_id,"episode_id":frame.episode_id,
-                    "tick":frame.status.tick,"time_s":frame.elapsed_s,"positions":frame.status.positions,
-                    "velocities":frame.policy.as_ref().map(|p| &p.velocities),
-                    "simulation":frame.status.simulation})
-            }
+            (_, "motion") => match motion_sample(&frame) {
+                Some(sample) => sample,
+                None => {
+                    excluded += 1;
+                    continue;
+                }
+            },
             _ => {
                 excluded += 1;
                 continue;
@@ -1022,8 +1074,10 @@ mod tests {
         let recorder = Recorder::default();
         let metadata = json!({"policy_contract":{"obs_len":2,"action_len":1,"recurrent":false}});
         let info = recorder
-            .start(Some(&config), &status, "test".into(), metadata.clone())
+            .start(Some(&config), &status, "velstand".into(), metadata.clone())
             .unwrap();
+        assert!(info.id.starts_with("velstand-"));
+        assert_eq!(root(Some(&config)), directory.join("recordings"));
         let trace = PolicyTrace {
             phase: loop_body::LoopPhase::Driving,
             command: duck_control::obs::Command::default(),
@@ -1048,14 +1102,25 @@ mod tests {
             stages: vec!["read", "write"],
         };
         let mut status = status;
+        let mut trace = trace;
         for tick in 0..4 {
             status.tick = tick;
             status.execution_generation = if tick < 2 { 1 } else { 2 };
+            trace.backend_state.valid_positions[9] = tick != 3;
             recorder.capture(&status, Some(&trace), || metadata.clone(), Instant::now());
         }
         let stopped = recorder.stop("stopped").unwrap().unwrap();
         assert_eq!(stopped.state, "complete");
         assert_eq!(stopped.frames, 4);
+        let motion = fs::read_to_string(Path::new(&info.path).join("motion.jsonl")).unwrap();
+        let samples: Vec<Value> = motion
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(samples.len(), 4);
+        assert_eq!(samples[3]["tick"], 3);
+        assert_eq!(samples[3]["episode_id"], 2);
+        assert_eq!(samples[3]["valid"][9], false);
         let window = RecordingWindow {
             id: info.id,
             segment_id: 0,
@@ -1071,7 +1136,7 @@ mod tests {
         assert_eq!(report.matched_frames, 4);
         assert!(report.metrics.iter().all(|metric| metric.max_error == 0.0));
         let exported = export(Some(&config), window, "policy").unwrap();
-        assert_eq!(exported.samples, 4);
+        assert_eq!(exported.samples, 3);
         let samples = fs::read_to_string(Path::new(&exported.path).join("samples.jsonl")).unwrap();
         let sample: Value = serde_json::from_str(samples.lines().next().unwrap()).unwrap();
         assert_eq!(sample["teacher_action"][0].as_f64().unwrap() as f32, 0.7);

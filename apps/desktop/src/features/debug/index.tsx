@@ -727,7 +727,7 @@ export const DebugPage = defineComponent(() => {
             </button>
           </div>
           <p>托住机身并保持肢体静止。校准会关闭力矩并保存到电机，保留当前关节角度与方向。</p>
-          {mappingOwnedByExecution.value && <p>请先在 VLA 切回模拟机，再执行校准。</p>}
+          {mappingOwnedByExecution.value && <p>请先在 ONNX 切回模拟机，再执行校准。</p>}
         </article>
       )}
       <article class={style.panelCard}>

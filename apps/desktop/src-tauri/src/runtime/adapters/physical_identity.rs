@@ -9,7 +9,7 @@ use md5::{Digest, Md5};
 
 use crate::types::{
     DetectedPhysicalMachine, DiagnosticCode, MatchResult, PhysicalMachine, ReconnectHint,
-    ServoIdentity,
+    ServoIdentity, ServoModelKey,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,18 @@ pub fn normalize_model(model: &str) -> Result<String, CensusError> {
         "hd1910" | "xl330" => Ok(normalized),
         _ => Err(CensusError::UnknownModel(model.trim().to_owned())),
     }
+}
+
+pub(crate) fn census_model(census: &[ServoIdentity]) -> Result<ServoModelKey, String> {
+    let first = census.first().ok_or("真机没有舵机清单")?;
+    let key = crate::platform::helpers::model_key(&first.model.to_ascii_lowercase())?;
+    if census
+        .iter()
+        .any(|servo| !servo.model.eq_ignore_ascii_case(&first.model))
+    {
+        return Err("当前真机总线只支持同型号舵机".into());
+    }
+    Ok(key)
 }
 
 /// Calculate the lowercase MD5 required by the PRD.  USB data and names never

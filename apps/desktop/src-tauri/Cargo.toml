@@ -11,8 +11,6 @@ rust-version = "1.90"
 publish = false
 default-run = "microduck-vision"
 
-[workspace]
-
 [features]
 desktop-distribution = ["tauri/custom-protocol"]
 

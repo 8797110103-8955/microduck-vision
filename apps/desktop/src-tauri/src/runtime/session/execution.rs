@@ -852,6 +852,7 @@ impl PolicyExecution {
         let status = self.loop_state.status();
         LoopStatus {
             has_execution: true,
+            recording: false,
             active_body: (!self.detached).then(|| crate::types::ActiveBody {
                 virtual_machine_id: Some(self.virtual_machine_id.clone()),
                 physical_machine_id: self.physical_id.clone(),

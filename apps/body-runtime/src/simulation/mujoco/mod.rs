@@ -434,12 +434,13 @@ mod tests {
             }
         );
         assert_eq!(hd.id, "body-drive-hd1910");
-        assert_eq!(hd.response.delay_steps, [0, 0]);
-        assert!(!hd.response.encoder_through_backlash);
+        assert_eq!(hd.response.delay_steps, [3, 6]);
+        assert!(hd.response.encoder_through_backlash);
         assert!(
             (hd.response.position_gain_scale
-                - xl.nominal_motor.position_stiffness() / hd.nominal_motor.position_stiffness())
-            .abs()
+                - xl.nominal_motor.position_stiffness() / hd.nominal_motor.position_stiffness()
+                    * 0.989)
+                .abs()
                 < 1e-12
         );
     }

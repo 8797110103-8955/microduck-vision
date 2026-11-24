@@ -310,6 +310,7 @@ impl DesktopState {
                         }
                     };
                     status.runtime_generation = generation.load(Ordering::Acquire);
+                    status.recording = recorder.is_active();
                     status.execution_generation = execution_generation.load(Ordering::Acquire);
                     status.config_revision = revision.load(Ordering::Acquire);
                     if let Some(error) = fault.lock().ok().and_then(|fault| fault.clone()) {
@@ -594,6 +595,7 @@ impl RuntimeInstance {
         let sample = source.latest();
         crate::types::LoopStatus {
             has_execution: false,
+            recording: false,
             active_body: None,
             runtime_state: crate::types::RuntimeState::Running,
             simulation: None,
@@ -675,6 +677,69 @@ impl Drop for DesktopState {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn startup_defaults_missing_machine_selection_from_the_saved_servo_models() {
+        let root = crate::platform::helpers::test_directory().join(
+            crate::platform::helpers::new_machine_id("machine-defaults-test"),
+        );
+        let config = root.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let virtual_machine = |id, servo_model| {
+            format!(
+                r#"
+[[machine]]
+id = "{id}"
+name = "{id}"
+bodyId = "official"
+servoModel = "{servo_model}"
+startupSelected = false
+referencedBy = []
+simulation = {{ damping = 0.1, frictionLoss = 0.2, armature = 0.3, kp = 4.0, forceRange = 5.0 }}
+"#
+            )
+        };
+        std::fs::write(
+            config.join("machines.toml"),
+            format!(
+                "default = \"hd\"\n{}{}",
+                virtual_machine("hd", "hd1910"),
+                virtual_machine("xl", "xl330")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("robots.toml"),
+            r#"
+[[robot]]
+id = "robot"
+name = "robot"
+virtualMachineId = "hd"
+census = [{ servoId = 1, model = "hd1910" }]
+jointBindings = [{ slotId = "left_hip_yaw", zeroOffsetRad = 0.2 }]
+"#,
+        )
+        .unwrap();
+
+        let state = DesktopState::load(root.clone()).unwrap();
+        let machines = state.virtual_machines.lock().unwrap();
+        assert_eq!(machines[0].execution_kind, ExecutionKindKey::Simulation);
+        assert_eq!(machines[0].model_kind, ModelKindKey::Hd1910Compatible);
+        assert!(machines[0].startup_selected);
+        assert_eq!(machines[0].simulation.damping, 0.1);
+        assert_eq!(machines[0].referenced_by, ["robot"]);
+        assert_eq!(machines[1].execution_kind, ExecutionKindKey::Simulation);
+        assert_eq!(machines[1].model_kind, ModelKindKey::Xl330);
+        let robots = state.physical_machines.lock().unwrap();
+        assert_eq!(robots[0].execution_kind, ExecutionKindKey::Physical);
+        assert_eq!(robots[0].model_kind, Some(ModelKindKey::Hd1910));
+        assert_eq!(robots[0].servo_model, Some(ServoModelKey::Hd1910));
+        assert_eq!(robots[0].joint_bindings[0].zero_offset_rad, 0.2);
+        drop(robots);
+        drop(machines);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn generated_default_identity_survives_reload_and_invalid_files_are_preserved() {
         let root = crate::platform::helpers::test_directory().join(
             crate::platform::helpers::new_machine_id("machine-config-test"),
@@ -732,7 +797,8 @@ direction = 1
 
     use super::{DesktopState, machine_store};
     use crate::types::{
-        PhysicalMachine, ReconnectHint, ServoIdentity, ServoJointCalibration, ServoJointDirection,
+        ExecutionKindKey, ModelKindKey, PhysicalMachine, ReconnectHint, ServoIdentity,
+        ServoJointCalibration, ServoJointDirection, ServoModelKey,
     };
 
     fn servo(id: u8, model: &str) -> ServoIdentity {

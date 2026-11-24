@@ -27,9 +27,14 @@ export const PreviewPage = defineComponent(() => {
   const busy = ref<string | null>(null);
   const error = ref<string | null>(null);
   const loopBusy = ref(false);
+  const recording = computed(() => store.state.loop?.recording === true);
   const selectedMachine = computed(() =>
     store.state.virtualMachines.find(
-      (machine) => machine.id === store.state.selectedVirtualMachine,
+      (machine) =>
+        machine.id ===
+        (recording.value
+          ? store.state.loop?.activeBody?.virtualMachineId
+          : store.state.selectedVirtualMachine),
     ),
   );
   const physicalMachine = computed(() =>
@@ -114,15 +119,6 @@ export const PreviewPage = defineComponent(() => {
     }
   };
 
-  const openLogs = async () => {
-    try {
-      await commands.openLogs();
-      error.value = null;
-    } catch (reason) {
-      error.value = reason instanceof Error ? reason.message : String(reason);
-    }
-  };
-
   const resetWorld = async () => {
     const machineId = runtime.value?.activeBody?.virtualMachineId ?? selectedMachine.value?.id;
     if (!machineId || physicalSyncEnabled.value) return;
@@ -182,7 +178,7 @@ export const PreviewPage = defineComponent(() => {
   };
 
   const selectPolicy = async (id: string) => {
-    if (loopBusy.value || busy.value) return;
+    if (recording.value || loopBusy.value || busy.value) return;
     busy.value = id;
     try {
       const selected = await commands.policySelect(id);
@@ -258,11 +254,34 @@ export const PreviewPage = defineComponent(() => {
     }
   };
 
+  const startRecording = async () => {
+    const virtualId = selectedMachine.value?.id;
+    const policyId = selectedPolicy.value?.id;
+    if (!virtualId || !policyId || recording.value || loopBusy.value || busy.value) return;
+    loopBusy.value = true;
+    try {
+      const status = await commands.recordingStart(virtualId, policyId, previewInput.value);
+      store.state.requestedPhysicalMachine = null;
+      updateWorldStatus(status);
+      error.value = null;
+    } catch (reason) {
+      await reportLoopError(reason);
+    } finally {
+      loopBusy.value = false;
+    }
+  };
+
   const stopLoop = async () => {
     if (loopBusy.value || busy.value) return;
     loopBusy.value = true;
     try {
-      await pauseControl();
+      const loop = store.state.loop;
+      if (loop?.recording) {
+        await commands.recordingStop(loop.runtimeGeneration);
+        store.state.loop = null;
+      } else {
+        await pauseControl();
+      }
       error.value = null;
     } catch (reason) {
       await reportLoopError(reason);
@@ -272,7 +291,7 @@ export const PreviewPage = defineComponent(() => {
   };
 
   const toggleLoop = () => {
-    if (controlRunning.value) void stopLoop();
+    if (controlRunning.value || recording.value) void stopLoop();
     else void startLoop();
   };
 
@@ -328,6 +347,7 @@ export const PreviewPage = defineComponent(() => {
     const virtualId = selectedMachine.value?.id;
     if (
       !virtualId ||
+      recording.value ||
       loopBusy.value ||
       busy.value ||
       (!detached.value && !physicalSyncEnabled.value && !physicalSyncAvailable.value)
@@ -366,7 +386,7 @@ export const PreviewPage = defineComponent(() => {
   watch(
     [() => selectedMachine.value?.id, () => store.state.loading],
     async ([id, loading]) => {
-      if (!id || loading || loopBusy.value) return;
+      if (!id || loading || recording.value || loopBusy.value) return;
       loopBusy.value = true;
       try {
         const loop = runtime.value;
@@ -407,6 +427,7 @@ export const PreviewPage = defineComponent(() => {
           class={[style.previewSource, physicalSyncEnabled.value ? style.syncOn : undefined]}
           aria-pressed={physicalSyncEnabled.value}
           disabled={
+            recording.value ||
             (!detached.value && !physicalSyncEnabled.value && !physicalSyncAvailable.value) ||
             loopBusy.value ||
             !!busy.value
@@ -424,7 +445,7 @@ export const PreviewPage = defineComponent(() => {
           <button
             class={store.state.selectedPolicyId === policy.id ? style.selected : undefined}
             type="button"
-            disabled={busy.value !== null}
+            disabled={recording.value || loopBusy.value || busy.value !== null}
             onClick={() => void selectPolicy(policy.id)}
           >
             {policy.name}
@@ -629,22 +650,32 @@ export const PreviewPage = defineComponent(() => {
           type="button"
           disabled={
             loopBusy.value ||
-            runtime.value?.runtimeState === "faulted" ||
-            (!controlRunning.value &&
-              (!selectedPolicy.value ||
-                (physicalSyncEnabled.value &&
-                  (!torqueEnabled.value || !physicalSyncAvailable.value))))
+            !!busy.value ||
+            (!recording.value &&
+              (runtime.value?.runtimeState === "faulted" ||
+                (!controlRunning.value &&
+                  (!selectedPolicy.value ||
+                    (physicalSyncEnabled.value &&
+                      (!torqueEnabled.value || !physicalSyncAvailable.value))))))
           }
           onClick={toggleLoop}
         >
-          {controlRunning.value
+          {controlRunning.value || recording.value
             ? "停止控制环"
             : physicalSyncEnabled.value
               ? "开启真机控制环"
               : "开启控制环"}
         </button>
-        <button type="button" onClick={() => void openLogs()}>
-          打开日志
+        <button
+          type="button"
+          disabled={
+            loopBusy.value ||
+            !!busy.value ||
+            (!recording.value && (!selectedMachine.value || !selectedPolicy.value))
+          }
+          onClick={() => void (recording.value ? stopLoop() : startRecording())}
+        >
+          {recording.value ? "停止采集" : "开始采集"}
         </button>
         {runtime.value?.runtimeState === "faulted" && (
           <button type="button" disabled={loopBusy.value} onClick={() => void resetFaultedLoop()}>

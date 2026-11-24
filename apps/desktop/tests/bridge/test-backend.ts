@@ -220,15 +220,24 @@ export class TestBackend {
       case "frontend_diagnostic":
         return null;
       case "recording_start": {
-        const status = this.previewStatus ?? this.status;
-        if (!status?.activeBody) throw new Error("请先启动控制环");
-        const id = `recording-test-${this.recordings.length + 1}`;
+        const input = payloadRecord(payload);
+        const virtualMachineId = stringValue(input.virtualMachineId, "virtualMachineId");
+        const policy = this.policies.find((entry) => entry.id === input.policyId);
+        if (!policy?.cached || !policy.selected) throw new Error("请选择已缓存的 ONNX 策略");
+        if (this.previewStatus?.recording) throw new Error("采集已启动");
+        this.status = null;
+        this.openPreviewLoop(virtualMachineId);
+        this.previewPolicy(policy.id);
+        this.previewCommand(input.input);
+        this.previewStatus = { ...this.previewStatus!, recording: true };
+        const name = policy.name;
+        const id = `${name.replaceAll(" ", "-")}-test-${this.recordings.length + 1}`;
         const record: RecordingInfo = {
           id,
           appSessionId: "test",
-          duckId: status.activeBody.physicalMachineId ?? status.activeBody.virtualMachineId ?? "",
-          name: stringValue(payloadRecord(payload).name, "name") || id,
-          path: `logs/recordings/${id}`,
+          duckId: virtualMachineId,
+          name,
+          path: `recordings/${id}`,
           startedAtMs: Date.now(),
           endedAtMs: null,
           state: "recording",
@@ -237,7 +246,7 @@ export class TestBackend {
           error: null,
         };
         this.recordings.push(record);
-        return { ...record };
+        return cloneStatus(this.previewStatus);
       }
       case "recording_stop": {
         const record = this.recordings.find((candidate) => candidate.state === "recording");
@@ -245,8 +254,12 @@ export class TestBackend {
         record.state = "complete";
         record.frames = 2;
         record.endedAtMs = Date.now();
-        return { ...record };
+        this.previewStatus = null;
+        this.status = null;
+        return null;
       }
+      case "recording_reveal":
+        return null;
       case "recording_frames": {
         const status = this.previewStatus ?? this.status;
         if (!status) return [];
@@ -387,6 +400,7 @@ export class TestBackend {
       case "policy_download":
         return this.downloadPolicy(stringValue(payloadRecord(payload).id, "id"));
       case "policy_select":
+        if (this.previewStatus?.recording) throw new Error("请先停止采集，再切换 ONNX");
         return this.selectPolicy(stringValue(payloadRecord(payload).id, "id"));
       case "policy_open_folder":
         return null;
@@ -1020,6 +1034,7 @@ export class TestBackend {
     this.status = {
       runtimeState: "running",
       hasExecution: input.access === "control",
+      recording: false,
       activeBody:
         input.access === "control"
           ? { virtualMachineId: null, physicalMachineId: String(input.physicalMachineId) }
@@ -1112,6 +1127,7 @@ export class TestBackend {
     this.previewStatus = {
       runtimeState: "running",
       hasExecution: true,
+      recording: false,
       activeBody: { virtualMachineId, physicalMachineId: null },
       simulation: null,
       readSources: [],

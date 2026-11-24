@@ -2,9 +2,19 @@
 
 use crate::runtime::session::state::DesktopState;
 use crate::types::{
-    RecordingComparison, RecordingExport, RecordingInfo, RecordingPreviewFrame, RecordingWindow,
+    PreviewInput, RecordingComparison, RecordingExport, RecordingInfo, RecordingPreviewFrame,
+    RecordingWindow,
 };
 use tauri::State;
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn open_logs(state: State<'_, DesktopState>) -> Result<(), String> {
+    let directory = crate::platform::logging::log_directory(state.config_dir.as_deref());
+    std::fs::create_dir_all(&directory).map_err(|error| format!("创建日志文件夹失败：{error}"))?;
+    tauri_plugin_opener::open_path(&directory, None::<&str>)
+        .map_err(|error| format!("打开日志文件夹失败：{error}"))
+}
 
 #[tauri::command]
 #[specta::specta]
@@ -22,55 +32,37 @@ pub(crate) async fn recording_list(
 
 #[tauri::command]
 #[specta::specta]
-pub(crate) async fn recording_start(
+pub(crate) fn recording_start(
     state: State<'_, DesktopState>,
-    name: String,
-) -> Result<RecordingInfo, String> {
-    let status = crate::runtime::session::loop_service::status(&state)?.ok_or("请先启动控制环")?;
-    let metadata = {
-        let runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
-        let runtime = runtime.as_ref().ok_or("控制环已关闭")?;
-        serde_json::json!({
-            "runtime_id":status.runtime_generation,"execution_generation":status.execution_generation,
-            "runtime":runtime.recording_metadata(),
-            "virtual_machines":*state.virtual_machines.lock().map_err(|e| e.to_string())?,
-            "physical_machines":*state.physical_machines.lock().map_err(|e| e.to_string())?,
-            "body":duck_body::BodyContractSnapshot::from_profile(
-                crate::runtime::machines::body_catalog::official()?
-            ),
-            "product_version":env!("CARGO_PKG_VERSION"),
-        })
-    };
-    let config = state.config_dir.clone();
-    let recorder = std::sync::Arc::clone(&state.recorder);
-    let expected = status.runtime_generation;
-    let info = tauri::async_runtime::spawn_blocking(move || {
-        recorder.start(config.as_deref(), &status, name, metadata)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    if state.current_runtime_generation() != expected
-        || state
-            .runtime_loop
-            .lock()
-            .map_err(|e| e.to_string())?
-            .is_none()
-    {
-        state.recorder.stop("runtime_changed")?;
-        return Err("采集启动时控制环已变化，请重新启动采集".into());
-    }
-    Ok(info)
+    virtual_machine_id: String,
+    policy_id: String,
+    input: PreviewInput,
+) -> Result<crate::types::LoopStatus, String> {
+    crate::runtime::session::loop_service::start_recording(
+        state.inner(),
+        virtual_machine_id,
+        policy_id,
+        input,
+    )
 }
 
 #[tauri::command]
 #[specta::specta]
-pub(crate) async fn recording_stop(
+pub(crate) fn recording_stop(
     state: State<'_, DesktopState>,
-) -> Result<Option<RecordingInfo>, String> {
-    let recorder = std::sync::Arc::clone(&state.recorder);
-    tauri::async_runtime::spawn_blocking(move || recorder.stop("stopped"))
-        .await
-        .map_err(|e| e.to_string())?
+    generation: u32,
+) -> Result<(), String> {
+    crate::runtime::session::loop_service::stop_recording(state.inner(), u64::from(generation))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) fn recording_reveal(
+    state: State<'_, DesktopState>,
+    id: String,
+    motion: bool,
+) -> Result<(), String> {
+    crate::runtime::recordings::reveal_file(state.config_dir.as_deref(), &id, motion)
 }
 
 #[tauri::command]

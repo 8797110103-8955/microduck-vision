@@ -11,8 +11,6 @@ license = "Apache-2.0"
 publish = false
 links = "mujoco"
 
-[workspace]
-
 [features]
 native = ["dep:tempfile"]
 

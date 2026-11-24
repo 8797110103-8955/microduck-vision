@@ -4,6 +4,7 @@ use duck_body::{AssetResolver, BodyError};
 use serde::Serialize;
 
 use crate::models::assets::AssetBundle;
+use crate::models::profile::ModelKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,13 +24,19 @@ pub struct SceneRecipe {
 }
 
 impl SceneRecipe {
-    pub(crate) fn native(scene_xml: &'static str, robot_xml: &'static str) -> Self {
-        Self {
-            scene_xml: Some(scene_xml),
-            robot_xml: robot_xml.to_owned(),
+    pub(crate) fn native(model: ModelKind) -> Self {
+        let mut recipe = Self {
+            scene_xml: Some("scene_backlash.xml"),
+            robot_xml: "robot_groundcontact_backlash.xml".to_owned(),
             task_id: None,
             derived_scene_operations: vec![SceneOperation::ConfigureBamActuators],
+        };
+        if model == ModelKind::Hd1910Compatible {
+            recipe
+                .derived_scene_operations
+                .push(SceneOperation::MatchXl330PositionStiffness);
         }
+        recipe
     }
 
     pub fn resources<'a>(
@@ -37,10 +44,7 @@ impl SceneRecipe {
         source: &'a dyn AssetResolver,
     ) -> Result<AssetBundle<'a>, BodyError> {
         match self.scene_xml {
-            Some(scene_xml) => AssetBundle::read(
-                source,
-                &[scene_xml, &self.robot_xml, "robot_walk.xml", "scene.xml"],
-            ),
+            Some(scene_xml) => AssetBundle::read(source, &[scene_xml, &self.robot_xml]),
             None => AssetBundle::read(source, &[&self.robot_xml]),
         }
     }

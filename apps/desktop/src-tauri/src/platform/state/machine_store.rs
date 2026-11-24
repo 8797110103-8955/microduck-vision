@@ -5,12 +5,15 @@ use std::path::Path;
 use duck_body::JointCalibration;
 use serde::{Deserialize, Serialize};
 
-use crate::platform::helpers::default_simulation;
+use crate::platform::helpers::{
+    default_physical_model, default_simulation, default_simulation_model,
+};
 use crate::runtime::adapters::encoder_calibration::EncoderSnapshot;
 use crate::runtime::adapters::physical_identity;
 use crate::types::{
     ExecutionKindKey, ModelKindKey, PhysicalMachine, ReconnectHint, ServoIdentity,
-    ServoJointCalibration, ServoJointDirection, ServoModelKey, VirtualMachine,
+    ServoJointCalibration, ServoJointDirection, ServoModelKey, SimulationParameters,
+    VirtualJointBinding, VirtualMachine,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,8 +68,53 @@ struct PersistedMachineTable {
     auto_mount: bool,
     #[serde(default = "default_auto_reconnect")]
     auto_reconnect: bool,
-    #[serde(rename = "machine", default)]
+    #[serde(
+        rename = "machine",
+        default,
+        deserialize_with = "deserialize_virtual_machines"
+    )]
     virtual_machines: Vec<VirtualMachine>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedVirtualMachine {
+    id: String,
+    name: String,
+    body_id: String,
+    execution_kind: Option<ExecutionKindKey>,
+    model_kind: Option<ModelKindKey>,
+    servo_model: ServoModelKey,
+    simulation: SimulationParameters,
+    startup_selected: bool,
+    referenced_by: Vec<String>,
+    #[serde(default)]
+    joint_bindings: Vec<VirtualJointBinding>,
+}
+
+fn deserialize_virtual_machines<'de, D>(deserializer: D) -> Result<Vec<VirtualMachine>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Vec::<PersistedVirtualMachine>::deserialize(deserializer)?
+        .into_iter()
+        .map(|machine| VirtualMachine {
+            id: machine.id,
+            name: machine.name,
+            body_id: machine.body_id,
+            execution_kind: machine
+                .execution_kind
+                .unwrap_or(ExecutionKindKey::Simulation),
+            model_kind: machine
+                .model_kind
+                .unwrap_or_else(|| default_simulation_model(machine.servo_model)),
+            servo_model: machine.servo_model,
+            simulation: machine.simulation,
+            startup_selected: machine.startup_selected,
+            referenced_by: machine.referenced_by,
+            joint_bindings: machine.joint_bindings,
+        })
+        .collect())
 }
 
 fn default_auto_mount() -> bool {
@@ -88,7 +136,7 @@ pub(crate) struct PersistedRobotTable {
 pub(crate) struct PersistedPhysicalMachine {
     id: String,
     name: String,
-    execution_kind: ExecutionKindKey,
+    execution_kind: Option<ExecutionKindKey>,
     model_kind: Option<ModelKindKey>,
     servo_model: Option<ServoModelKey>,
     census: Vec<PersistedServoIdentity>,
@@ -122,7 +170,7 @@ impl From<&PhysicalMachine> for PersistedPhysicalMachine {
         Self {
             id: machine.id.clone(),
             name: machine.name.clone(),
-            execution_kind: machine.execution_kind,
+            execution_kind: Some(machine.execution_kind),
             model_kind: machine.model_kind,
             servo_model: machine.servo_model,
             census: machine
@@ -168,6 +216,9 @@ impl From<PersistedPhysicalMachine> for PhysicalMachine {
             })
             .collect::<Vec<_>>();
         let machine_code = physical_identity::census_md5(&census).unwrap_or_default();
+        let servo_model = machine
+            .servo_model
+            .or_else(|| physical_identity::census_model(&census).ok());
         let name = if machine.name.trim().is_empty() {
             machine_code.clone()
         } else {
@@ -176,9 +227,11 @@ impl From<PersistedPhysicalMachine> for PhysicalMachine {
         Self {
             id: machine.id,
             name,
-            execution_kind: machine.execution_kind,
-            model_kind: machine.model_kind,
-            servo_model: machine.servo_model,
+            execution_kind: machine.execution_kind.unwrap_or(ExecutionKindKey::Physical),
+            model_kind: machine
+                .model_kind
+                .or_else(|| servo_model.map(default_physical_model)),
+            servo_model,
             usb_port: reconnect_hint
                 .as_ref()
                 .map(|hint| hint.port_name.clone())
@@ -220,7 +273,7 @@ pub(crate) fn load_machines(config_dir: Option<&Path>) -> Result<LoadedMachines,
                 name: "机器 0".into(),
                 body_id: "official".into(),
                 execution_kind: ExecutionKindKey::Simulation,
-                model_kind: ModelKindKey::Hd1910Compatible,
+                model_kind: default_simulation_model(ServoModelKey::Hd1910),
                 servo_model: ServoModelKey::Hd1910,
                 simulation: default_simulation(ServoModelKey::Hd1910),
                 startup_selected: true,

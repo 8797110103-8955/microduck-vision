@@ -52,7 +52,7 @@ impl Selection {
         if self.execution_kind == ExecutionKind::Physical
             && self.model_kind == ModelKind::Hd1910Compatible
         {
-            return Err(super::hd1910_compatible::physical::UNSUPPORTED.into());
+            return Err(super::hd1910_compatible::UNSUPPORTED.into());
         }
         Ok(())
     }

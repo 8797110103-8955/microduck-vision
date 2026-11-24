@@ -674,6 +674,7 @@ pub struct ActiveBody {
 #[serde(rename_all = "camelCase")]
 pub struct LoopStatus {
     pub has_execution: bool,
+    pub recording: bool,
     pub active_body: Option<ActiveBody>,
     pub runtime_state: RuntimeState,
     pub simulation: Option<SimulationState>,

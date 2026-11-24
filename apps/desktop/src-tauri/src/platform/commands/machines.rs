@@ -223,12 +223,6 @@ pub(crate) fn set_auto_reconnect_enabled(
     service::set_auto_reconnect_enabled(state.inner(), enabled)
 }
 
-#[tauri::command]
-#[specta::specta]
-pub(crate) fn open_logs(state: State<'_, DesktopState>) -> Result<(), String> {
-    service::open_logs(state.inner())
-}
-
 #[cfg(test)]
 mod register_table_tests {
     use super::{

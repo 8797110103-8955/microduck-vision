@@ -132,7 +132,7 @@ def _parse(envelope: dict) -> SimulationProfile:
             raise ValueError(f"invalid {key}")
     if type(response["encoder_through_backlash"]) is not bool:
         raise ValueError("invalid backlash feedback flag")
-    if model != "xl330" and (response["encoder_through_backlash"] or [lo, hi] != [0, 0]):
+    if model == "hd1910" and (response["encoder_through_backlash"] or [lo, hi] != [0, 0]):
         raise ValueError("HD1910 simulation requires native encoder feedback and zero-step target delay")
 
     source = simulation["scenario"]

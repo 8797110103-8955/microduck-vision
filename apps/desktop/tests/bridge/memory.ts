@@ -911,6 +911,7 @@ export class MemoryBackend {
     this.status = {
       runtimeState: "running",
       hasExecution: true,
+      recording: false,
       activeBody: { virtualMachineId: null, physicalMachineId: input.physicalMachineId },
       simulation: null,
       readSources: [],
@@ -1080,6 +1081,7 @@ export class MemoryBackend {
     this.previewStatus = {
       runtimeState: "running",
       hasExecution: true,
+      recording: false,
       activeBody: { virtualMachineId, physicalMachineId: null },
       simulation: null,
       readSources: [],

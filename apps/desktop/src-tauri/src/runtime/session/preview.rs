@@ -271,6 +271,7 @@ pub(crate) fn with_runtime_generation(
     state: &DesktopState,
     mut status: FrontendLoopStatus,
 ) -> FrontendLoopStatus {
+    status.recording = state.recorder.is_active();
     status.runtime_generation = state.current_runtime_generation();
     status.execution_generation = state.current_execution_generation();
     status.config_revision = state.current_config_revision();

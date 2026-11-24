@@ -42,4 +42,8 @@ fn live_gain_tuning_scales_the_hd_motor_once_and_preserves_nominal_compensation(
     assert_eq!(tuned.motor.kp, stock.motor.kp * 2.0);
     assert_eq!(stock.nominal_motor, tuned.nominal_motor);
     assert_eq!(stock.source_assets, native.source_assets);
+    assert_eq!(stock.response.delay_steps, [3, 6]);
+    assert!(stock.response.encoder_through_backlash);
+    assert!(stock.motor.max_pwm < native.motor.max_pwm);
+    assert_eq!(stock.nominal_motor, native.nominal_motor);
 }

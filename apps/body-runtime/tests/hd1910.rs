@@ -16,8 +16,11 @@ fn native_hd_uses_its_own_response_with_unverified_link_inertials() {
     };
     let profile = resolve_simulation(selection, &body, &source, defaults(model)).unwrap();
     let simulation = profile.simulation.as_ref().unwrap();
-    assert_eq!(simulation.scenario.scene_xml, Some("scene.xml"));
-    assert_eq!(simulation.scenario.robot_xml, "robot_groundcontact.xml");
+    assert_eq!(simulation.scenario.scene_xml, Some("scene_backlash.xml"));
+    assert_eq!(
+        simulation.scenario.robot_xml,
+        "robot_groundcontact_backlash.xml"
+    );
     assert_eq!(
         simulation.scenario.derived_scene_operations,
         [SceneOperation::ConfigureBamActuators]

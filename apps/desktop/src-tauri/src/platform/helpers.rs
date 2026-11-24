@@ -1,6 +1,7 @@
 //! Small pure conversions shared by the client command layer and state.
 
-use crate::types::ServoModelKey;
+use crate::types::{ModelKindKey, ServoModelKey};
+use microduck_body_runtime::ModelKind;
 use servo::ServoModel;
 
 use crate::types::{
@@ -38,12 +39,33 @@ pub(crate) fn model_key(key: &str) -> Result<ServoModelKey, String> {
     }
 }
 
+impl From<ModelKindKey> for ModelKind {
+    fn from(key: ModelKindKey) -> Self {
+        match key {
+            ModelKindKey::Xl330 => Self::Xl330,
+            ModelKindKey::Hd1910 => Self::Hd1910,
+            ModelKindKey::Hd1910Compatible => Self::Hd1910Compatible,
+        }
+    }
+}
+
+pub(crate) fn default_simulation_model(key: ServoModelKey) -> ModelKindKey {
+    match key {
+        ServoModelKey::Xl330 => ModelKindKey::Xl330,
+        ServoModelKey::Hd1910 => ModelKindKey::Hd1910Compatible,
+    }
+}
+
+pub(crate) fn default_physical_model(key: ServoModelKey) -> ModelKindKey {
+    match key {
+        ServoModelKey::Xl330 => ModelKindKey::Xl330,
+        ServoModelKey::Hd1910 => ModelKindKey::Hd1910,
+    }
+}
+
 pub(crate) fn default_simulation(key: ServoModelKey) -> SimulationParameters {
-    let kind = match key {
-        ServoModelKey::Xl330 => microduck_body_runtime::ModelKind::Xl330,
-        ServoModelKey::Hd1910 => microduck_body_runtime::ModelKind::Hd1910Compatible,
-    };
-    let tuning = microduck_body_runtime::models::resolve::defaults(kind);
+    let tuning =
+        microduck_body_runtime::models::resolve::defaults(default_simulation_model(key).into());
     SimulationParameters {
         damping: tuning.damping,
         friction_loss: tuning.friction_loss,
@@ -58,6 +80,7 @@ impl From<loop_body::LoopStatus> for FrontendLoopStatus {
     fn from(status: loop_body::LoopStatus) -> Self {
         Self {
             has_execution: true,
+            recording: false,
             active_body: None,
             simulation: None,
             runtime_state: crate::types::RuntimeState::Running,

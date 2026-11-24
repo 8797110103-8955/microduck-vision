@@ -3,9 +3,14 @@
 > _A tiny biped robot that moves using reinforcement learning policies._
 > —— [Microduck](https://github.com/pollen-robotics/microduck)
 
+一个面向 MicroDuck 的桌面实验终端，把官方策略运行、MuJoCo 仿真、不同舵机测试、本地训练和实机控制放在同一个工作流里。  
+核心目标是：**在本机用运动轨迹作为教师，训练适配其他舵机与动力学条件的新策略模型，并探索更复杂的运动控制。**
+
+复现官方 ONNX + XL330 的运动轨迹是前期基准，HD1910 Compatible 接入官方 ONNX，用来验证仿真与执行流程可跨电机匹配，并为后续训练积累参考数据。
+
 ## 快速开始
 
-安装 rust node
+当前桌面构建面向 Windows x64。准备 Rust 1.90 或更新版本、Node.js、pnpm、MSVC C++ 构建工具和 WebView2 运行时，然后在仓库根目录运行：
 
 ```bash
 pnpm install
@@ -13,49 +18,63 @@ pnpm generate
 pnpm dev
 ```
 
-- 检查运行 `pnpm lint`、`pnpm test`。发布运行 `pnpm release`，EXE、DLL 和 `resources/` 会放到 Cargo `target-dir` 一级目录下的 `bin/`，默认为 `target/bin/`。分发时保留整个目录结构。
-- 运行官方策略：在策略页面按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 官方 ONNX。
-- 运行官方策略：VLA预览中开启控制环
-- 本地 RL 训练需要 `uv`。在训练页选择模拟机，并填写同版本 `vendor/microduck_rl` 的项目目录。桌面用该项目的锁文件准备 Python 环境，训练结果目录内的 `simulation-profile.json` 提供本次身体与资源。完成后的 `artifact.json` 记录 ONNX 路径、输入输出和执行指纹。
+首次构建会下载锁定版本的 MuJoCo SDK 和 ONNX Runtime，需要网络连接。只运行桌面预览和官方 ONNX 策略，无需准备 Python 训练环境。
 
-场景位置统一使用右手 Z 向上的世界坐标，单位为米；3D 显示时才转换成 Three.js 的 `(x, z, -y)`。每只模拟机的配置位置是场景放置偏移，运行中的平移和朝向只累计策略执行期间的实际仿真增量。开启空控制环、落地稳定、切换真机同步和重开控制环都不会归零场景位置；只有“归零”明确清除位移、朝向和累计距离。位移按机器 ID 保留，停止时写入配置目录的 `world-placements.json`。仿真状态和运行记录仍保留原始物理坐标、身体高度及姿态；真机没有定位反馈时保持已有场景位置。
+### 运行官方策略
+
+1. 创建或选择一台模拟机，选择要测试的模型。复现官方行为时先使用 XL330。
+2. 在“策略”页按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 提供的官方 ONNX。
+3. 回到 VLA 预览，选择模拟机和已缓存的策略，设置运动指令后开启控制环。
+
+接入实机时，先在机器与调试页面确认连接、关节映射、方向和零位，再在 VLA 预览中切换真机同步、开启力矩和真机控制环。
+
+### 本地训练
+
+本地 RL 训练还需要 `uv`，以及满足所选 MJLab 任务要求的 GPU 和驱动环境。
+
+### 检查与发布
+
+```bash
+pnpm release # 默认发布目录 `target/bin/`
+```
 
 ## 和官方的关系
 
-官方代码在 `vendor/microduck` 和 `vendor/microduck_rl`，固定在发布版本。  
-当前项目可以理解为同时支持模拟训练和真机控制的集成终端。
+官方代码保存在 [vendor/microduck](vendor/microduck) 和 [vendor/microduck_rl](vendor/microduck_rl)，固定在发布版本并直接复用。桌面端围绕这些实现组织机器配置、执行、预览和训练流程。
 
-### 复用了哪些部分
+### 直接复用
 
-- `microduck_rl` 的 MJCF 和网格在编译时从 pinned vendor 读取。MuJoCo 从内存加载，3D 视图读取随应用分发的同源 STL。
-- `duck-control` 核心loop(模块级复用) + MoJoCo 模拟计算逻辑。
+- `microduck_rl` 的 MJCF、网格和训练环境。MJCF 与网格在编译时从锁定的 vendor 版本读取；MuJoCo 从内存加载资源，3D 视图读取随应用分发的同源 STL。
+- `microduck` 的标准关节定义、运动学，以及 `duck-control` 中的观测构建、策略执行等模块。
 
-### 演进了哪些部分
+官方运行逻辑分布在机器人运行端、仿真和训练工具中。  
+本项目把执行流程整理为桌面端可以共同使用的控制环：读取反馈、构建观测、执行策略、生成关节目标，再交给模拟或实机后端。  
+机体定义和策略输入输出约定保持一致，具体设备 I/O、仿真参数和生命周期由各自的层负责。
 
-- 重实现loop
-  - 官方其实有完备的逻辑，但是因为最终运行端不一致分散在不同的代码里
-  - 纯Web版可参考 [microduck-simulator](https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md)
-  - 仓库本意是 学习 > 完备的把机器运行起来 -> 单终端MoJoCo跑训练、不同舵机测试、模拟环境看效果、实机接入
-- 能重实现loop的基准
-  - onnx 驱动只在意关节反馈，且本身输出稳定
-  - 几何动力学完全由代码控制
-    - 身体树统一 (舵机长宽高一致，舵机宽高的小变化被随机化参数吃掉了，重量独立计算，影响的是)
-    -
-  - 身体动力学完全取决于真实电机 [crates\servo](./crates/servo)
-  - 即：
-    - s2r 部分纯代码构建的模拟环境基本能还原任意电机条件下的官方场景
-    - 接受官方onnx + 非XL330 电机的鸭子可能抽搐
+纯 Web 仿真也可参考官方的 [microduck-simulator](https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md)。
 
-> 核心是：复现官方onnx + XL330 的运动轨迹数据
+### 仿真与不同舵机
 
-### ON MY WAY
+策略通过约定的观测和动作接口工作，观测包含关节位置与速度、机体角速度、重力方向、上一帧动作及运动指令；底层可以用仿真反馈或实机反馈提供这些数据。  
+因此可以复用同一套策略执行流程，比较不同模型的表现；当前模型统一使用 vendor 提供的 `scene_backlash.xml` 和 `robot_groundcontact_backlash.xml`，包含每个舵机关节的被动背隙。  
+模型差异集中在 [models](apps/body-runtime/src/models)：
 
-> 单终端跑意味着：所有性能极限取决于我自己的显卡 -> 用轨迹数据当老师，尝试些复杂的机械控制方案
+| 模型              | 用途                                                                  |
+| ----------------- | --------------------------------------------------------------------- |
+| XL330             | 官方策略与运动轨迹的参考模型。                                        |
+| HD1910 Compatible | 在 HD1910 参数上加入位置刚度补偿及响应拟合，尝试接近 XL330 的运动模型 |
+| HD1910            | 使用 HD1910 电机参数，观察原生响应。                                  |
 
-- [ ] DeepMimic
+运动结果同时取决于机体几何、质量与惯量、接触、电机响应、反馈和控制时序。  
+更换舵机后，机械尺寸、质量分布和动力学差异需要测量与验证，域随机化也需要覆盖相应变化。  
+当前沿用官方机体几何与惯性数据，HD1910 兼容模型的轨迹拟合是仿真中的近似。复用官方 ONNX 并不意味着舵机的实机会产生相同运动，但实机验证几乎能做到大致相同；
+
+## ON MY WAY
+
+- [ ] DeepMimic 风格的运动模仿训练。
 
 ---
 
-核心开发约定见 [AGENTS](AGENTS.md)
+开发约定见 [AGENTS.md](AGENTS.md)。
 
-每个 crate 的作用自行查看`Cargo.toml`~`description`
+各 crate 的职责与边界见对应 `Cargo.toml` 中的 `description` 和紧随其后的注释。

@@ -86,7 +86,6 @@ export function createDesktopStore() {
     selectedPolicyId: null as string | null,
     actions: [] as Awaited<ReturnType<typeof commands.actions>>,
     loop: null as Awaited<ReturnType<typeof commands.loopStatus>>,
-    recordingPlayback: null as Awaited<ReturnType<typeof commands.recordingFrames>>[number] | null,
     teacherDatasetPath: "",
     debugPose: null as number[] | null,
     debugMappingPending: false,

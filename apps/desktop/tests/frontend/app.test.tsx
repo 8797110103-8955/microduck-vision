@@ -1,10 +1,4 @@
-import {
-  buttonByText,
-  mountApp,
-  setupAppTests,
-  viewerSetFrame,
-  viewerSetWorldPose,
-} from "./app-harness";
+import { buttonByText, mountApp, setupAppTests, viewerSetFrame } from "./app-harness";
 import { flushPromises } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
 import { TestBackend } from "../bridge/test-backend";
@@ -40,7 +34,7 @@ describe("desktop frontend flow", () => {
     expect(store.state.catalog.map((entry) => entry.key)).toEqual(["hd1910", "xl330"]);
     expect(store.state.selectedVirtualMachine).toBe("official-hd1910");
     expect(backend.calls.filter((call) => call.name === "servo_catalog")).toHaveLength(1);
-    expect(wrapper.text()).toContain("VLA");
+    expect(wrapper.text()).toContain("ONNX");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     expect(wrapper.text()).toContain("策略");
@@ -739,7 +733,7 @@ describe("desktop frontend flow", () => {
     const backend = new TestBackend(memoryServoCatalog);
     const { host, wrapper, store } = await mountApp(backend);
 
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("当前电脑还没有已缓存的 ONNX");
@@ -747,9 +741,7 @@ describe("desktop frontend flow", () => {
     await flushPromises();
     expect(store.state.loop).toMatchObject({ phase: "ready", torque: false });
     expect(backend.calls.map((call) => call.name)).toContain("runtime_open");
-    await buttonByText(wrapper, "打开日志").trigger("click");
-    await flushPromises();
-    expect(backend.calls.map((call) => call.name)).toContain("open_logs");
+    expect(buttonByText(wrapper, "开始采集").attributes("disabled")).toBeDefined();
     const resetWorldButton = buttonByText(wrapper, "归零");
     expect((resetWorldButton.element as HTMLButtonElement).disabled).toBe(true);
     store.state.loop = {
@@ -769,7 +761,7 @@ describe("desktop frontend flow", () => {
     expect(wrapper.text()).toContain("已缓存");
 
     await wrapper.get('button[aria-label="设置"]').trigger("click");
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     expect(store.state.tab).toBe("preview");
     expect(wrapper.text()).toContain("Alpha Walking");
@@ -829,7 +821,7 @@ describe("desktop frontend flow", () => {
       ]),
     );
     const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     const generation = store.state.loop!.runtimeGeneration;
     const virtualId = store.state.selectedVirtualMachine!;
@@ -911,7 +903,7 @@ describe("desktop frontend flow", () => {
     const probe = await backend.invoke("physical_machine_probe", { input: {} });
     await backend.invoke("physical_machine_save", { input: probe });
     const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     await buttonByText(wrapper, "真机同步").trigger("click");
     await flushPromises();
@@ -940,7 +932,7 @@ describe("desktop frontend flow", () => {
     const probe = await backend.invoke("physical_machine_probe", { input: {} });
     await backend.invoke("physical_machine_save", { input: probe });
     const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     const generation = store.state.loop!.runtimeGeneration;
     await backend.invoke("physical_machine_disconnect", { id: "physical-1" });
@@ -961,7 +953,7 @@ describe("desktop frontend flow", () => {
   it("resets a faulted runtime into sampling without automatically starting ONNX", async () => {
     const backend = new TestBackend(memoryServoCatalog);
     const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     store.state.loop = {
       ...store.state.loop!,
@@ -981,7 +973,7 @@ describe("desktop frontend flow", () => {
   it("does not reopen a faulted runtime when torque-off cannot be confirmed", async () => {
     const backend = new TestBackend(memoryServoCatalog);
     const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
+    await buttonByText(wrapper, "ONNX").trigger("click");
     await flushPromises();
     store.state.loop = {
       ...store.state.loop!,
@@ -1006,34 +998,86 @@ describe("desktop frontend flow", () => {
     host.remove();
   });
 
-  it("records from settings, replays the result and exports teacher motion without stopping control", async () => {
+  it("opens the log folder from settings and displays shell errors", async () => {
     const backend = new TestBackend(memoryServoCatalog);
-    const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
-    await flushPromises();
-    await buttonByText(wrapper, "开启控制环").trigger("click");
-    await flushPromises();
+    const { host, wrapper } = await mountApp(backend);
     await wrapper.get('button[aria-label="设置"]').trigger("click");
     await wrapper.get('button[aria-label="日志"]').trigger("click");
     await flushPromises();
-    await wrapper.get('input[aria-label="采集名称"]').setValue("模拟老师");
-    await buttonByText(wrapper, "开始采集").trigger("click");
+
+    const button = buttonByText(wrapper, "打开日志文件夹");
+    await button.trigger("click");
     await flushPromises();
-    expect(wrapper.text()).toContain("正在采集 模拟老师");
-    await buttonByText(wrapper, "停止采集").trigger("click");
+    expect(backend.calls.map((call) => call.name)).toContain("open_logs");
+
+    const invoke = backend.invoke.bind(backend);
+    vi.spyOn(backend, "invoke").mockImplementation((name, payload) => {
+      if (name === "open_logs") return Promise.reject("打开日志文件夹失败：访问被拒绝");
+      return invoke(name, payload);
+    });
+    await button.trigger("click");
     await flushPromises();
-    await buttonByText(wrapper, "查看").trigger("click");
-    await flushPromises();
-    expect(store.state.recordingPlayback?.recordingId).toBe("recording-test-1");
-    await buttonByText(wrapper, "动作轨迹数据").trigger("click");
-    await flushPromises();
-    expect(wrapper.text()).toContain("已导出 2 个样本");
-    expect(backend.calls.map((call) => call.name)).not.toContain("runtime_close");
-    expect(store.state.loop?.hasExecution).toBe(true);
+    expect(wrapper.findAll('[role="alert"]').map((alert) => alert.text())).toContain(
+      "打开日志文件夹失败：访问被拒绝",
+    );
+
     wrapper.unmount();
-    expect(store.state.recordingPlayback).toBeNull();
     host.remove();
   });
+
+  it.each(["停止采集", "停止控制环"])(
+    "records in VLA and closes the runtime with %s",
+    async (stop) => {
+      const backend = new TestBackend(memoryServoCatalog);
+      await backend.invoke("policy_download", { id: "alpha-walking" });
+      await backend.invoke("policy_download", { id: "alpha-stand" });
+      await backend.invoke("policy_select", { id: "alpha-walking" });
+      const { host, wrapper, store } = await mountApp(backend);
+      await buttonByText(wrapper, "ONNX").trigger("click");
+      await flushPromises();
+      store.state.loop = {
+        ...store.state.loop!,
+        world: { position: [2, 1], yaw: 0.4, distanceM: 3 },
+      };
+      await buttonByText(wrapper, "开始采集").trigger("click");
+      await flushPromises();
+      expect(store.state.loop).toMatchObject({
+        recording: true,
+        phase: "driving",
+        activeBody: { physicalMachineId: null },
+        world: { position: [0, 0], yaw: 0, distanceM: 0 },
+      });
+      const policies = wrapper.get('[aria-label="已缓存 ONNX 策略"]').findAll("button");
+      expect(policies).toHaveLength(2);
+      expect(policies.every((button) => button.attributes("disabled") !== undefined)).toBe(true);
+
+      await buttonByText(wrapper, stop).trigger("click");
+      await flushPromises();
+      expect(store.state.loop).toBeNull();
+      expect(await commands.loopStatus()).toBeNull();
+      await wrapper.get('button[aria-label="设置"]').trigger("click");
+      await wrapper.get('button[aria-label="日志"]').trigger("click");
+      await flushPromises();
+      const [record] = await commands.recordingList();
+      expect(record).toMatchObject({ state: "complete", name: "Alpha Walking" });
+      expect(record.id).toMatch(/^Alpha-Walking-/);
+      expect(wrapper.text()).toContain(record.name);
+      expect(wrapper.text()).not.toContain("诊断事件");
+      await buttonByText(wrapper, "原始日志").trigger("click");
+      await buttonByText(wrapper, "动作轨迹数据").trigger("click");
+      await flushPromises();
+      expect(
+        backend.calls
+          .filter((call) => call.name === "recording_reveal")
+          .map((call) => call.payload),
+      ).toEqual([
+        { id: record.id, motion: false },
+        { id: record.id, motion: true },
+      ]);
+      wrapper.unmount();
+      host.remove();
+    },
+  );
 
   it("creates a virtual machine from the simulation panel", async () => {
     const backend = new TestBackend(memoryServoCatalog);
@@ -1072,62 +1116,6 @@ describe("desktop frontend flow", () => {
       store.state.virtualMachines.find((machine) => machine.name === "HD1910 测试机"),
     ).toMatchObject({ executionKind: "simulation", servoModel: "hd1910", modelKind: "hd1910" });
     expect(wrapper.text()).toContain("HD1910 原生");
-    wrapper.unmount();
-    host.remove();
-  });
-
-  it("keeps a recording frame and placement independent of new live feedback", async () => {
-    const backend = new TestBackend(memoryServoCatalog);
-    const { host, wrapper, store } = await mountApp(backend);
-    await buttonByText(wrapper, "VLA").trigger("click");
-    await flushPromises();
-    await wrapper.get('button[aria-label="设置"]').trigger("click");
-    await wrapper.get('button[aria-label="日志"]').trigger("click");
-    await flushPromises();
-    await buttonByText(wrapper, "开始采集").trigger("click");
-    await flushPromises();
-    await buttonByText(wrapper, "停止采集").trigger("click");
-    await flushPromises();
-
-    const recordedPositions = Array(15).fill(0.43);
-    const invoke = backend.invoke.bind(backend);
-    const intercepted = vi.spyOn(backend, "invoke").mockImplementation((name, payload) => {
-      if (name !== "recording_frames") return invoke(name, payload);
-      const frame: Awaited<ReturnType<typeof commands.recordingFrames>>[number] = {
-        recordingId: "recording-test-1",
-        duckId: "official-hd1910",
-        segmentId: 1,
-        episodeId: 1,
-        elapsedS: 0.02,
-        controlStartedS: 0.02,
-        status: {
-          ...store.state.loop!,
-          simulation: null,
-          positions: recordedPositions,
-          world: { position: [3, 4], yaw: 0.2, distanceM: 5 },
-        },
-        policy: null,
-        execution: null,
-      };
-      return Promise.resolve([frame]);
-    });
-    await buttonByText(wrapper, "查看").trigger("click");
-    await flushPromises();
-    expect(
-      backend.calls.findLast((call) => call.name === "official_scene_frame")?.payload,
-    ).toMatchObject({ positions: recordedPositions });
-    expect(viewerSetWorldPose).toHaveBeenCalledWith([3, 4], 0.2);
-
-    const from = backend.calls.length;
-    const livePositions = Array(15).fill(-0.17);
-    store.applyLoopStatus({ ...store.state.loop!, simulation: null, positions: livePositions });
-    await flushPromises();
-    expect(store.state.recordingPlayback?.status.positions).toEqual(recordedPositions);
-    const requests = backend.calls
-      .slice(from)
-      .filter((call) => call.name === "official_scene_frame");
-    expect(requests.map((request) => request.payload)).toEqual([{ positions: livePositions }]);
-    intercepted.mockRestore();
     wrapper.unmount();
     host.remove();
   });
@@ -1177,7 +1165,7 @@ describe("desktop frontend flow", () => {
 
     expect(store.state.error).toBeNull();
     expect(store.state.catalog).toHaveLength(2);
-    expect(wrapper.text()).toContain("VLA");
+    expect(wrapper.text()).toContain("ONNX");
 
     wrapper.unmount();
     host.remove();

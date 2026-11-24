@@ -3,10 +3,10 @@
 //! This service owns persisted machine lifecycle and binding orchestration. Serial ownership and
 //! device-specific behavior remain in backend modules; Tauri command files only adapt arguments.
 
-use crate::types::{ExecutionKindKey, ModelKindKey, ServoModelKey};
+use crate::types::{ExecutionKindKey, ServoModelKey};
 use microduck_body_runtime::Selection;
 
-use crate::platform::helpers::{model, model_key};
+use crate::platform::helpers::{default_physical_model, model, model_key};
 use crate::runtime::adapters::physical_identity as physical_backend;
 use crate::runtime::adapters::servo_bus::{
     ConnectedBus, move_pending_bus, open_for_model, try_open_feetech, try_open_xl330,
@@ -36,7 +36,7 @@ pub(crate) fn physical_machine_save(
     };
     let hint = input.reconnect_hint;
     let census = physical_backend::canonicalize_census(&input.census).map_err(|e| e.to_string())?;
-    let servo_model = census_model(&census).ok();
+    let servo_model = physical_backend::census_model(&census).ok();
     let machine = PhysicalMachine {
         id: crate::platform::helpers::new_machine_id("physical"),
         name: input
@@ -49,10 +49,7 @@ pub(crate) fn physical_machine_save(
             .unwrap_or_default(),
         machine_code: md5,
         execution_kind: ExecutionKindKey::Physical,
-        model_kind: servo_model.map(|key| match key {
-            ServoModelKey::Xl330 => ModelKindKey::Xl330,
-            ServoModelKey::Hd1910 => ModelKindKey::Hd1910,
-        }),
+        model_kind: servo_model.map(default_physical_model),
         servo_model,
         census,
         reconnect_hint: hint.clone(),
@@ -86,7 +83,7 @@ pub(crate) fn physical_selection(machine: &PhysicalMachine) -> Result<Selection,
     if machine.execution_kind != ExecutionKindKey::Physical {
         return Err("physical machines require physical execution".into());
     }
-    let detected = census_model(&machine.census)?;
+    let detected = physical_backend::census_model(&machine.census)?;
     let saved = machine.servo_model.ok_or("真机未保存舵机型号")?;
     if detected != saved {
         return Err("真机保存的型号与舵机清单不一致".into());
@@ -96,18 +93,6 @@ pub(crate) fn physical_selection(machine: &PhysicalMachine) -> Result<Selection,
         machine.model_kind.ok_or("真机未保存执行模型")?,
         saved,
     )
-}
-
-fn census_model(census: &[ServoIdentity]) -> Result<ServoModelKey, String> {
-    let first = census.first().ok_or("真机没有舵机清单")?;
-    let key = crate::platform::helpers::model_key(&first.model.to_ascii_lowercase())?;
-    if census
-        .iter()
-        .any(|servo| !servo.model.eq_ignore_ascii_case(&first.model))
-    {
-        return Err("当前真机总线只支持同型号舵机".into());
-    }
-    Ok(key)
 }
 
 pub(crate) fn physical_machine_disconnect(

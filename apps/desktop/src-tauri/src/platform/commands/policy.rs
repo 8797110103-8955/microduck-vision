@@ -30,6 +30,13 @@ pub(crate) fn policy_select(
     state: State<'_, DesktopState>,
     id: String,
 ) -> Result<PolicyEntry, String> {
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if state.recorder.is_active() {
+        return Err("请先停止采集，再切换 ONNX".into());
+    }
     policy::select(state.config_dir.as_deref(), &id)
 }
 

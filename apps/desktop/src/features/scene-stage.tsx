@@ -36,17 +36,15 @@ export function physicalMarkerState(
 }
 
 export const SceneStage = defineComponent(
-  (props: { status?: LoopStatus; playback?: boolean; training?: TrainingFrame | null }) => {
+  (props: { status?: LoopStatus; training?: TrainingFrame | null }) => {
     const store = useDesktopStore();
     const viewerReady = ref(false);
     const scene = ref<Awaited<ReturnType<typeof commands.officialSceneModel>> | null>(null);
     const frame = ref<DisplayFrame>();
-    const debug = computed(() => !props.playback && store.state.tab === "debug");
+    const debug = computed(() => store.state.tab === "debug");
     const activeLoop = computed(() => props.status);
     const previewPhysicalId = computed(() =>
-      !props.playback && store.state.tab === "preview"
-        ? store.state.requestedPhysicalMachine
-        : null,
+      store.state.tab === "preview" ? store.state.requestedPhysicalMachine : null,
     );
     const displayingSimulation = computed(
       () =>
@@ -60,7 +58,6 @@ export const SceneStage = defineComponent(
       return machineId ? store.state.worldCache[machineId] : undefined;
     });
     const displayWorld = computed(() => {
-      if (props.playback) return activeLoop.value?.world;
       const body = activeLoop.value?.activeBody;
       return body?.virtualMachineId &&
         (!debug.value || body.virtualMachineId === store.state.selectedVirtualMachine)
@@ -75,7 +72,6 @@ export const SceneStage = defineComponent(
     );
     const activePositions = computed(() => {
       const loop = activeLoop.value;
-      if (props.playback) return loop?.positions;
       if (!debug.value) {
         if (previewPhysicalId.value)
           return loop?.activeBody?.physicalMachineId === previewPhysicalId.value
@@ -94,7 +90,6 @@ export const SceneStage = defineComponent(
     const frameContext = computed(() =>
       JSON.stringify([
         debug.value,
-        props.playback,
         previewPhysicalId.value,
         store.state.debugMappingPending,
         selectedMachine.value?.jointBindings,
@@ -304,7 +299,7 @@ export const SceneStage = defineComponent(
 
     const tabs = computed(() =>
       [
-        { id: "preview" as const, label: "VLA", active: store.state.tab === "preview" },
+        { id: "preview" as const, label: "ONNX", active: store.state.tab === "preview" },
         { id: "training" as const, label: "训练", active: store.state.tab === "training" },
         { id: "debug" as const, label: "调试", active: debug.value },
       ].map(({ id, label, active }) => ({
@@ -379,5 +374,5 @@ export const SceneStage = defineComponent(
       />
     );
   },
-  { props: ["status", "playback", "training"] },
+  { props: ["status", "training"] },
 );

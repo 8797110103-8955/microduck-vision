@@ -36,6 +36,82 @@ use crate::runtime::session::contract::{
 use crate::runtime::session::state::DesktopState;
 use crate::types::{LoopOpenInput, LoopStatus as FrontendLoopStatus, PhysicalMachine};
 
+pub(crate) fn start_recording(
+    state: &DesktopState,
+    virtual_machine_id: String,
+    policy_id: String,
+    input: crate::types::PreviewInput,
+) -> Result<FrontendLoopStatus, String> {
+    use crate::runtime::session::preview;
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if state.recorder.is_active() {
+        return Err("已有运行采集，请先停止".into());
+    }
+    let policy = policy::list(state.config_dir.as_deref())?
+        .into_iter()
+        .find(|entry| entry.id == policy_id && entry.cached && entry.selected)
+        .ok_or("请选择已缓存的 ONNX 策略")?;
+    let name = if policy::is_training_policy(&policy.id) {
+        std::path::Path::new(&policy.file)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or(&policy.name)
+            .to_owned()
+    } else {
+        policy.name
+    };
+    let machine =
+        crate::runtime::machines::machine_resolution::virtual_machine(state, &virtual_machine_id)?;
+    let body = crate::runtime::machines::machine_resolution::body_profile(&machine.body_id)?;
+    close_locked(state, crate::types::RuntimeCloseScope::Runtime)?;
+    let start = (|| {
+        preview::open_locked(state, virtual_machine_id)?;
+        state.stop_loop_clock()?;
+        preview::reset_world(state)?;
+        let mut status = preview::select_policy(state, policy_id, input)?;
+        let runtime = state
+            .runtime_loop
+            .lock()
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .ok_or("模拟机控制环未启动")?
+            .recording_metadata();
+        let metadata = serde_json::json!({
+            "runtime_id": status.runtime_generation,
+            "execution_generation": status.execution_generation,
+            "runtime": runtime,
+            "virtual_machine": machine,
+            "body": duck_body::BodyContractSnapshot::from_profile(body),
+            "product_version": env!("CARGO_PKG_VERSION"),
+        });
+        state
+            .recorder
+            .start(state.config_dir.as_deref(), &status, name, metadata)?;
+        status.recording = true;
+        state.start_loop_clock()?;
+        Ok(status)
+    })();
+    if start.is_err() {
+        close_locked(state, crate::types::RuntimeCloseScope::Runtime)?;
+    }
+    start
+}
+
+pub(crate) fn stop_recording(state: &DesktopState, generation: u64) -> Result<(), String> {
+    let _transition = state
+        .execution_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if state.recorder.is_active() {
+        state.validate_runtime_generation(Some(generation))?;
+        close_locked(state, crate::types::RuntimeCloseScope::Runtime)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn start(
     state: &DesktopState,
     input: crate::types::RuntimeOpenInput,
@@ -51,6 +127,9 @@ fn start_locked(
     state: &DesktopState,
     input: crate::types::RuntimeOpenInput,
 ) -> Result<FrontendLoopStatus, String> {
+    if state.recorder.is_active() {
+        return Err("请先停止采集，再切换控制环".into());
+    }
     if matches!(input.access, crate::types::LoopAccess::ReadOnly)
         && input.policy_id.is_none()
         && let Some(id) = input.physical_machine_id.as_deref()
@@ -97,6 +176,9 @@ pub(crate) fn reconfigure(
         .execution_transition
         .lock()
         .map_err(|e| e.to_string())?;
+    if state.recorder.is_active() {
+        return Err("请先停止采集，再切换控制环".into());
+    }
     state.validate_runtime_generation(Some(generation))?;
     state.ensure_runtime_healthy()?;
     if state.current_config_revision() != config_revision {
@@ -132,6 +214,9 @@ pub(crate) fn select_body(
         .execution_transition
         .lock()
         .map_err(|e| e.to_string())?;
+    if state.recorder.is_active() {
+        return Err("请先停止采集，再切换机器".into());
+    }
     state.validate_runtime_generation(Some(generation))?;
     let (old_physical_id, old_virtual_id) = {
         let mut runtime = state.runtime_loop.lock().map_err(|e| e.to_string())?;
@@ -403,6 +488,9 @@ pub(crate) fn command(
         .store(sequence, std::sync::atomic::Ordering::Release);
     use crate::types::RuntimeCommand;
     match request {
+        RuntimeCommand::Policy { .. } if state.recorder.is_active() => {
+            Err("请先停止采集，再切换 ONNX".into())
+        }
         RuntimeCommand::Input { input } if managed_policy => {
             crate::runtime::session::preview::set_input(state, input)
         }
@@ -1131,6 +1219,7 @@ fn open_locked(state: &DesktopState, input: LoopOpenInput) -> Result<FrontendLoo
         );
         let status = FrontendLoopStatus {
             has_execution: false,
+            recording: false,
             active_body: None,
             runtime_state: crate::types::RuntimeState::Running,
             simulation: None,
@@ -2301,6 +2390,7 @@ fn read_only_status(
 ) -> Result<FrontendLoopStatus, String> {
     let mut status = FrontendLoopStatus {
         has_execution: false,
+        recording: false,
         active_body: None,
         runtime_state: crate::types::RuntimeState::Running,
         simulation: None,
@@ -2412,6 +2502,7 @@ pub(crate) fn status(state: &DesktopState) -> Result<Option<FrontendLoopStatus>,
     {
         status = Some(FrontendLoopStatus {
             has_execution: false,
+            recording: false,
             active_body: None,
             runtime_state: crate::types::RuntimeState::Faulted,
             simulation: None,
@@ -2516,6 +2607,7 @@ pub(crate) fn action(
 }
 
 fn decorate_status(state: &DesktopState, status: &mut FrontendLoopStatus) {
+    status.recording = state.recorder.is_active();
     status.runtime_generation = state.current_runtime_generation();
     status.config_revision = state.current_config_revision();
     status.execution_generation = state.current_execution_generation();
@@ -2567,9 +2659,11 @@ pub(crate) fn close_backend_locked(state: &DesktopState) -> Result<(), String> {
     let source_only = guard
         .as_ref()
         .is_some_and(|runtime| runtime.is_simulation() && runtime.read_source().is_some());
-    if !source_only {
-        state.recorder.stop("runtime_closed")?;
-    }
+    let recording_result = if source_only {
+        Ok(())
+    } else {
+        state.recorder.stop("runtime_closed").map(|_| ())
+    };
     if let Some(source) = guard.as_mut().and_then(|runtime| runtime.read_source_mut())
         && let Err(error) = source.stop()
     {
@@ -2643,7 +2737,7 @@ pub(crate) fn close_backend_locked(state: &DesktopState) -> Result<(), String> {
     if source_only {
         state.start_loop_clock()?;
     }
-    restore_result
+    restore_result.and(recording_result)
 }
 
 /// A disappearing connection revokes its sessions before releasing transport ownership. It

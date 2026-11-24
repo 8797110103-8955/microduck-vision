@@ -1,4 +1,3 @@
-pub(crate) mod compensation;
-pub(crate) mod physical;
 pub(crate) mod profile;
-pub(crate) mod scene;
+
+pub(crate) const UNSUPPORTED: &str = "HD1910 compatibility is only available in simulation";
