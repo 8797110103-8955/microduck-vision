@@ -25,9 +25,6 @@ use microduck_body_runtime::{
     simulation::mujoco::runtime_version,
 };
 
-#[cfg(test)]
-mod training_tests;
-
 const PERIOD: Duration = Duration::from_millis(20);
 
 pub(crate) fn simulation_loop_config() -> LoopConfig {
@@ -96,6 +93,12 @@ struct SimulationBody {
 impl PolicyExecution {
     pub(crate) fn control_period(&self) -> Duration {
         self.loop_state.control_period()
+    }
+
+    pub(crate) fn simulation_fingerprint(&self) -> Option<&str> {
+        self.simulation_body
+            .as_ref()
+            .map(|body| body.profile.execution_fingerprint.as_str())
     }
 
     pub(crate) fn recording_metadata(&self) -> serde_json::Value {
@@ -606,12 +609,6 @@ impl PolicyExecution {
         }
     }
 
-    #[cfg(test)]
-    fn activate_policy(&mut self, selection: PreviewPolicySelection) -> Result<(), String> {
-        let prepared = self.prepare_activation(selection)?;
-        self.activate_prepared(prepared)
-    }
-
     fn prepare_activation(
         &self,
         selection: PreviewPolicySelection,
@@ -623,6 +620,18 @@ impl PolicyExecution {
             return Err("当前真机后端无法提供该策略所需的 IMU 反馈".into());
         }
         let runtime = if let Some(training) = &selection.training {
+            if training.requires_backlash
+                && !self.simulation_body.as_ref().is_some_and(|body| {
+                    body.profile.model_kind
+                        == microduck_body_runtime::models::profile::ModelKind::Xl330
+                        && body.actuator_response.encoder_through_backlash
+                        && body.profile.simulation.as_ref().is_some_and(|simulation| {
+                            simulation.scenario.robot_xml == "robot_groundcontact_backlash.xml"
+                        })
+                })
+            {
+                return Err("Backlash 学生需要匹配的 XL330 groundcontact/backlash 模拟机".into());
+            }
             if policy_sha256 != training.sha256 {
                 return Err("训练 ONNX 文件摘要与产物清单不一致".into());
             }
@@ -917,5 +926,5 @@ impl From<BodyLoopPhase> for LoopPhase {
 }
 
 #[cfg(test)]
-#[path = "execution/tests.rs"]
+#[path = "execution_tests.rs"]
 mod tests;

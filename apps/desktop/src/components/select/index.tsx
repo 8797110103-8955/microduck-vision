@@ -1,4 +1,4 @@
-import { defineComponent, useAttrs } from "vue";
+import { defineComponent, shallowRef, useAttrs } from "vue";
 import style from "./style.module.scss";
 
 /** Native select with one shared shell and option content supplied by the caller. */
@@ -11,17 +11,23 @@ export const Select = defineComponent({
     onChange: Function,
     onClick: Function,
   },
-  setup(props, { slots }) {
+  emits: {
+    selectionChange: (_select: HTMLSelectElement) => true,
+  },
+  setup(props, { emit, slots }) {
     const attrs = useAttrs();
+    const select = shallowRef<HTMLSelectElement>();
     return () => {
       const { class: className, ...selectAttrs } = attrs;
       return (
         <span class={[style.select, className]}>
           <select
             {...selectAttrs}
+            ref={select}
             value={props.value}
             disabled={props.disabled}
             onChange={(event: Event) => {
+              if (select.value) emit("selectionChange", select.value);
               if (typeof props.onChange === "function") props.onChange(event);
             }}
             onClick={(event: PointerEvent) => {

@@ -9,6 +9,7 @@ rust-version = "1.90"
 publish = false
 
 [dependencies]
+microduck-training = { path = "../../training" }
 serde = { version = "1.0.228", features = ["derive"] }
 specta = { version = "=2.0.0-rc.28", features = ["derive", "function"] }
 specta-typescript = "0.0.15"

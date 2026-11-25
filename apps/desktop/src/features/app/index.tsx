@@ -183,6 +183,17 @@ export const App = defineComponent(() => {
   let stopTrainingFrameEvents: (() => void) | undefined;
   let stopLoopStatusEvents: (() => void) | undefined;
   let eventListenerDisposed = false;
+  void commands
+    .trainingTasks()
+    .then((tasks) => {
+      if (eventListenerDisposed) return;
+      if (!tasks.length) throw new Error("Python 未返回已注册的任务");
+      store.state.trainingTasks = tasks;
+    })
+    .catch((reason) => {
+      if (!eventListenerDisposed)
+        store.state.trainingTasksError = reason instanceof Error ? reason.message : String(reason);
+    });
   useEventListener(window, "error", (event: ErrorEvent) => {
     void commands
       .frontendDiagnostic(

@@ -1,3 +1,4 @@
+import { taskConfiguration } from "../fixtures/taskConfiguration.fixture";
 import type {
   ActionRecord,
   DetectedPhysicalMachine,
@@ -206,6 +207,12 @@ export class TestBackend {
       return command === "plugin:window|is_maximized" ? false : null;
 
     switch (command) {
+      case "training_rounds":
+        return [];
+      case "training_tasks":
+        return ["Mjlab-Velocity-Flat-MicroDuck", "Microduck-DeepMimic-Velstand-Flat-v1"];
+      case "training_task_configuration":
+        return taskConfiguration(stringValue(payloadRecord(payload).taskId, "taskId"));
       case "recording_list":
         return this.recordings.map((record) => ({ ...record }));
       case "diagnostic_tail":

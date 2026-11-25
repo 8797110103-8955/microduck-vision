@@ -31,7 +31,6 @@ describe("desktop training flow", () => {
     const input = {
       program: "uv",
       args: ["run", "train", "task"],
-      workingDir: "vendor/microduck_rl",
       virtualMachineId: "official-hd1910",
       policyId: null,
       experimentId: null,
@@ -122,7 +121,6 @@ describe("desktop training flow", () => {
     const progress = await training.trainingStart({
       program: "uv",
       args: ["run", "train", "fixture"],
-      workingDir: "vendor/microduck_rl",
       virtualMachineId: "official-hd1910",
       policyId: null,
       experimentId: null,
@@ -139,20 +137,9 @@ describe("desktop training flow", () => {
     host.remove();
   });
 
-  it("requests teacher evaluation with the chosen task, body and seed", async () => {
+  it("hides teacher evaluation while DeepMimic is the only enabled task", async () => {
     const backend = new TestBackend(memoryServoCatalog);
     const invoke = backend.invoke.bind(backend);
-    const training = new MemoryBackend(memoryServoCatalog);
-    const progress = await training.trainingStart({
-      program: "uv",
-      args: ["run", "train", "walk"],
-      workingDir: "vendor/microduck_rl",
-      virtualMachineId: "official-hd1910",
-      policyId: null,
-      experimentId: null,
-      recipe: "teacher-evaluation",
-      teacherMotionProvenance: "training:student-1",
-    });
     const teacher: commands.PolicyEntry = {
       id: "training:student-1",
       name: "教师学生模型",
@@ -166,31 +153,13 @@ describe("desktop training flow", () => {
       durationS: null,
       command: null,
     };
-    const mock = vi.spyOn(backend, "invoke").mockImplementation((command, payload) => {
+    vi.spyOn(backend, "invoke").mockImplementation((command, payload) => {
       if (command === "policy_list") return Promise.resolve([teacher]);
-      if (command === "training_evaluate_teacher") return Promise.resolve(progress);
       return invoke(command, payload);
     });
-    const { wrapper, host, store } = await mountApp(backend);
+    const { wrapper, host } = await mountApp(backend);
     await buttonByText(wrapper, "训练").trigger("click");
-    const evaluation = wrapper.get('section[aria-label="教师仿真评估"]');
-    await evaluation.get("select").setValue(teacher.id);
-    const [steps, seed] = evaluation.findAll("input");
-    await steps.setValue("48");
-    await seed.setValue("7");
-    await buttonByText(wrapper, "评估所选教师产物").trigger("click");
-    await flushPromises();
-    expect(mock).toHaveBeenCalledWith("training_evaluate_teacher", {
-      input: {
-        workingDir: "vendor/microduck_rl",
-        virtualMachineId: "official-hd1910",
-        teacherPolicyId: teacher.id,
-        taskId: "Mjlab-Velocity-Flat-MicroDuck",
-        steps: 48,
-        seed: 7,
-      },
-    });
-    expect(store.state.training?.metadata.recipe).toBe("teacher-evaluation");
+    expect(wrapper.find('section[aria-label="教师仿真评估"]').exists()).toBe(false);
     wrapper.unmount();
     host.remove();
   });

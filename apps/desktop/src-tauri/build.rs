@@ -23,10 +23,7 @@ fn main() {
     let profile = out.ancestors().nth(3).expect("Cargo profile directory");
     let target = profile.parent().expect("Cargo target directory");
     let root = output_root(repo, target);
-    println!(
-        "cargo:rustc-env=DUCK_DESKTOP_TEST_DIR={}",
-        root.join("tests").display()
-    );
+    output_paths::export_test_directory(repo, &root);
     let release_dir = root.join("bin");
     let output = if cfg!(feature = "desktop-distribution") {
         println!(

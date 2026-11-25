@@ -1,5 +1,5 @@
 import * as commands from "../../../generated/types";
-import { defineComponent, onMounted, ref, shallowRef, watch } from "vue";
+import { defineComponent, onMounted, ref, watch } from "vue";
 import type {
   PhysicalMachineDetectInput,
   PhysicalMachineProbeInput,
@@ -7,6 +7,7 @@ import type {
   PhysicalMachineSaveInput,
   PhysicalServoRegister,
 } from "../../../generated/types";
+import { Checkbox } from "../../components/checkbox";
 import { Select } from "../../components/select";
 import { Slider } from "../../components/slider";
 import { useDesktopStore } from "../../store";
@@ -158,7 +159,6 @@ export const PhysicalMachinesPage = defineComponent(() => {
   const registerDrafts = ref<Record<string, string>>({});
   const registerErrors = ref<Record<string, string>>({});
   const selectedServoIds = ref<Record<string, number>>({});
-  const autoReconnectInput = shallowRef<HTMLInputElement>();
   const nameInputs = new Map<string, HTMLInputElement>();
 
   const canSaveDetected = () => {
@@ -345,17 +345,12 @@ export const PhysicalMachinesPage = defineComponent(() => {
         <span class={style.tag}>
           {detecting.value ? "正在检测" : port.value ? "未连接" : "未选择端口"}
         </span>
-        <label class={style.physicalAutoReconnect}>
-          自动重连{" "}
-          <input
-            ref={autoReconnectInput}
-            type="checkbox"
-            checked={store.state.autoReconnectEnabled}
-            onChange={() =>
-              void setAutoReconnectEnabled(autoReconnectInput.value?.checked === true)
-            }
-          />
-        </label>
+        <Checkbox
+          class={style.physicalAutoReconnect}
+          label="自动重连"
+          checked={store.state.autoReconnectEnabled}
+          onChange={(checked) => void setAutoReconnectEnabled(checked)}
+        />
       </section>
       {store.state.detectedPhysicalMachine && (
         <section

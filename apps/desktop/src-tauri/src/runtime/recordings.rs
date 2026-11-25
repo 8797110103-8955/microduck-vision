@@ -11,6 +11,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::platform::logging;
+
+pub(crate) mod deepmimic;
+pub(crate) mod deepmimic_jobs;
 use crate::runtime::policy::inference::PolicyTrace;
 use crate::types::{
     LoopStatus, RecordingComparison, RecordingExecution, RecordingExport, RecordingFrame,
@@ -485,42 +488,6 @@ impl<W: Write + std::io::Seek> McapLog<W> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn write_trace(
-    path: &Path,
-    frames: &[RecordingFrame],
-    metadata: Value,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut log = McapLog::new(BufWriter::new(
-        File::create(path).map_err(|e| e.to_string())?,
-    ))?;
-    log.event(
-        "segment_started",
-        json!({"segment_id":1,"metadata":metadata}),
-    )?;
-    for frame in frames {
-        log.frame(frame)?;
-    }
-    log.event("recording_stopped", json!({"reason":"test_completed"}))?;
-    log.finish()
-}
-
-#[cfg(test)]
-pub(crate) fn report_reference(report: &Value) {
-    eprintln!("{report}");
-    if let Ok(path) = std::env::var("MICRODUCK_COMPARISON_REPORT") {
-        let path = PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("create report directory");
-        }
-        fs::write(path, serde_json::to_vec_pretty(report).unwrap())
-            .expect("write requested comparison report");
-    }
-}
-
 fn is_id_character(character: char) -> bool {
     character.is_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
@@ -605,7 +572,7 @@ fn frame_stream(
             if message.channel.topic != "/duck/runtime" {
                 return None;
             }
-            let frame: RecordingFrame = match serde_json::from_slice(&message.data) {
+            let frame: RecordingFrame = match decode_frame(&message.data) {
                 Ok(frame) => frame,
                 Err(error) => return Some(Err(error.to_string())),
             };
@@ -615,6 +582,10 @@ fn frame_stream(
                 .then_some(Ok(frame))
         }),
     )
+}
+
+fn decode_frame(data: &[u8]) -> Result<RecordingFrame, serde_json::Error> {
+    serde_json::from_slice(data)
 }
 
 #[cfg(test)]

@@ -2,9 +2,9 @@
   "name": "microduck-vision",
   "private": true,
   "scripts": {
+    "release": "pnpm run generate && pnpm --dir apps/desktop exec vite build && cargo build-desktop-release && cargo stage-desktop-release",
     "dev": "pnpm --dir apps/desktop exec tauri dev",
     "generate": "cargo run --manifest-path apps/desktop/generate/Cargo.toml",
-    "release": "pnpm run generate && pnpm --dir apps/desktop exec vite build && cargo build-desktop-release && cargo stage-desktop-release",
     "lint": "oxfmt && oxlint --deny-warnings && cargo fmt && cargo clippy --workspace --all-targets -- -D warnings",
     "test": "pnpm --dir apps/desktop exec vitest run tests && cargo test --workspace"
   },

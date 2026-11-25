@@ -94,6 +94,8 @@ export function createDesktopStore() {
     previewInput,
     worldCache: readWorldCache(),
     training: null as Awaited<ReturnType<typeof commands.trainingStatus>>,
+    trainingTasks: null as Awaited<ReturnType<typeof commands.trainingTasks>> | null,
+    trainingTasksError: null as string | null,
     trainingFrame: null as TrainingFrame | null,
     selectedVirtualMachine: null as string | null,
     selectedVirtualMachineManual: false,

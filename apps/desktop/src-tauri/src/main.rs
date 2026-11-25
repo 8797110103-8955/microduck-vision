@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cli;
 mod platform;
 mod runtime;
 mod training;
@@ -15,6 +16,10 @@ pub use types::{
 };
 
 fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(cli::run(&args));
+    }
     let builder = commands::command_builder::<tauri::Wry>();
     let app = tauri::Builder::default()
         .setup(lifecycle::setup)
@@ -32,9 +37,7 @@ fn main() {
 
 #[cfg(test)]
 mod test_support {
-    pub(crate) use crate::runtime::policy::catalog::{
-        cached_policy_selections, list as policy_list,
-    };
+    pub(crate) use crate::runtime::policy::catalog::cached_policy_selections;
     pub(crate) use crate::runtime::session::contract::register_simulation;
 
     pub(crate) fn simulation_selection(

@@ -11,6 +11,17 @@ mod policy;
 mod policy_input;
 mod policy_output;
 
+pub(crate) fn validate_candidate(
+    bytes: &[u8],
+    spec: &local_onnx::LocalPolicySpec,
+) -> Result<(), String> {
+    let mut policy = local_onnx::LocalPolicy::load(bytes, spec).map_err(|e| e.to_string())?;
+    policy
+        .infer(&duck_control::obs::Observation::zeroed())
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub(crate) use contract::PolicyDescriptor;
 pub(crate) use core::{ControlTickInput, PolicyConfig, PolicyControlCore};
 pub(crate) use local_onnx::{LocalPolicySpec, TensorSpec};

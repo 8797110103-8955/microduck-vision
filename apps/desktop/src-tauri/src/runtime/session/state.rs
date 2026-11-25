@@ -24,6 +24,7 @@ use crate::types::{
 };
 
 pub(crate) struct DesktopState {
+    pub(crate) deepmimic_jobs: Arc<crate::runtime::recordings::deepmimic_jobs::Manager>,
     pub(crate) recorder: Arc<crate::runtime::recordings::Recorder>,
     pub(crate) backend_registry: Mutex<BackendRegistry>,
     pub(crate) execution_gate: ExecutionGate,
@@ -95,7 +96,7 @@ impl DesktopState {
         Ok(())
     }
 
-    fn try_new(config_dir: Option<PathBuf>) -> Result<Self, String> {
+    pub(crate) fn try_new(config_dir: Option<PathBuf>) -> Result<Self, String> {
         let machine_store::LoadedMachines {
             mut virtual_machines,
             physical_machines,
@@ -106,6 +107,9 @@ impl DesktopState {
         let backend_registry = BackendRegistry::default();
         let execution_gate = backend_registry.gate();
         Ok(Self {
+            deepmimic_jobs: Arc::new(crate::runtime::recordings::deepmimic_jobs::Manager::new(
+                config_dir.as_deref(),
+            )),
             backend_registry: Mutex::new(backend_registry),
             execution_gate,
             execution_transition: Mutex::new(()),

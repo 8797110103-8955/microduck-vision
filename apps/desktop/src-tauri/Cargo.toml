@@ -12,7 +12,7 @@ publish = false
 default-run = "microduck-vision"
 
 [features]
-desktop-distribution = ["tauri/custom-protocol"]
+desktop-distribution = ["tauri/custom-protocol", "microduck-training/packaged-python"]
 
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }
@@ -24,6 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 sha2 = "0.10"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
 duck-body = { path = "../../../crates/duck-body" }
 microduck-body-runtime = { path = "../../body-runtime", features = ["native"] }
 microduck-training = { path = "../../training" }
@@ -50,6 +51,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tauri-plugin-opener = "2.7.3"
 mcap = { version = "0.26.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[dev-dependencies]
+tauri = { version = "2.12.5", features = ["test"] }
 
 [[bin]]
 name = "microduck-vision"

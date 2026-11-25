@@ -11,3 +11,14 @@ pub fn output_root(repo: &Path, target_dir: &Path) -> PathBuf {
     // An external target directory already provides an explicit output boundary.
     target_dir.to_path_buf()
 }
+
+pub fn export_test_directory(repo: &Path, output: &Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo.join(".cargo/output_paths.rs").display()
+    );
+    println!(
+        "cargo:rustc-env=MICRODUCK_TEST_DIR={}",
+        output.join("tests").display()
+    );
+}

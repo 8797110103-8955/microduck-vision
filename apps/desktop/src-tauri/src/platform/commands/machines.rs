@@ -584,9 +584,11 @@ mod training_tests {
         let state = DesktopState::new(None);
         let virtual_machine_id = virtual_machines(&state).unwrap()[0].id.clone();
         let input = TrainingStartInput {
+            initialization: None,
+            replace_existing_experiment: false,
+            deepmimic: None,
             program: "uv".into(),
             args: vec!["run".into(), "train".into()],
-            working_dir: ".".into(),
             virtual_machine_id,
             policy_id: None,
             experiment_id: Some("experiment-1".into()),

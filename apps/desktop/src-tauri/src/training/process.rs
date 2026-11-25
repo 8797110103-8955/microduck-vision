@@ -1,6 +1,6 @@
 //! Application service for training process orchestration and progress events.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::Stdio;
@@ -20,7 +20,6 @@ use microduck_body_runtime::training::{TaskBodyDescription, resolve_training_bod
 use microduck_training::launch::{MjlabRun, install_evaluation, teacher_command};
 use microduck_training::progress::{
     TrainingMetrics, new_training_run_id, parse_training_metrics, save_evaluation_error,
-    training_runs_root,
 };
 
 struct TrainingFrameSource {
@@ -69,7 +68,17 @@ fn prepare_mjlab_command(
     result_dir: &Path,
     operation: &str,
 ) -> Result<(ProcessCommand, Option<TrainingFrameSource>), String> {
-    let mjlab = MjlabRun::new(&input.program, &input.args, working_dir, result_dir)?;
+    let reference = super::deepmimic::resolve(state, input)?;
+    let arguments = reference
+        .as_ref()
+        .map(|source| source.arguments())
+        .transpose()?;
+    let mjlab = MjlabRun::new(
+        &input.program,
+        arguments.as_deref().unwrap_or(&input.args),
+        working_dir,
+        result_dir,
+    )?;
     let machine = crate::runtime::machines::machine_resolution::virtual_machine(
         state,
         &input.virtual_machine_id,
@@ -132,7 +141,13 @@ fn prepare_mjlab_command(
                 .map(|body| body.name.as_str())
                 .collect::<Vec<_>>()
         });
-    let command = mjlab.command(operation, &environment, body_names.as_deref())?;
+    let mut command = mjlab.command(operation, &environment, body_names.as_deref())?;
+    super::rounds::install_initialization(
+        state.config_dir.as_deref(),
+        input,
+        result_dir,
+        &mut command,
+    )?;
     Ok((command, preview))
 }
 pub(crate) fn training_metadata(
@@ -140,6 +155,7 @@ pub(crate) fn training_metadata(
     input: &TrainingStartInput,
     run_id: &str,
 ) -> Result<TrainingRunMetadata, String> {
+    let reference = super::deepmimic::resolve(state, input)?;
     let machine = state
         .virtual_machines
         .lock()
@@ -210,6 +226,7 @@ pub(crate) fn training_metadata(
         )
     };
     Ok(TrainingRunMetadata {
+        deepmimic: reference.as_ref().map(|source| source.provenance()),
         experiment_id: input
             .experiment_id
             .as_deref()
@@ -223,8 +240,22 @@ pub(crate) fn training_metadata(
         policy_id,
         policy_layout,
         servo_profile: machine.servo_model,
-        recipe: input.recipe.trim().to_owned(),
-        teacher_motion_provenance: input.teacher_motion_provenance.trim().to_owned(),
+        recipe: reference
+            .as_ref()
+            .map(|source| source.options.method())
+            .unwrap_or(input.recipe.trim())
+            .to_owned(),
+        teacher_motion_provenance: reference
+            .as_ref()
+            .map(|source| {
+                format!(
+                    "{}:{}@{}",
+                    source.options.method(),
+                    source.options.bundle_id,
+                    source.manifest_sha256
+                )
+            })
+            .unwrap_or_else(|| input.teacher_motion_provenance.trim().to_owned()),
     })
 }
 fn persist_training_progress(progress: &TrainingProgress) {
@@ -241,6 +272,9 @@ fn persist_training_progress(progress: &TrainingProgress) {
 }
 
 fn parse_training_line(progress: &mut TrainingProgress, line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
     progress.phase = TrainingPhase::Running;
     progress.line = line.to_owned();
     progress.message = line.to_owned();
@@ -372,9 +406,6 @@ pub(crate) fn start(
     if input.program.trim().is_empty() {
         return Err("训练程序不能为空".into());
     }
-    if input.working_dir.trim().is_empty() {
-        return Err("训练工作目录不能为空".into());
-    }
     if input.virtual_machine_id.trim().is_empty() {
         return Err("训练必须选择模拟机".into());
     }
@@ -385,37 +416,223 @@ pub(crate) fn start(
         return Err("训练 teacher/motion provenance 不能为空".into());
     }
     ensure_process_idle(state)?;
-    let working_dir = std::path::absolute(&input.working_dir)
-        .map_err(|error| format!("解析训练目录失败：{error}"))?;
-    if !working_dir.is_dir() {
-        return Err(format!("训练目录不存在：{}", working_dir.display()));
-    }
+    let working_dir = microduck_training::bundle::project()?;
     let run_id = new_training_run_id();
     let metadata = training_metadata(state, &input, &run_id)?;
-    let result_dir = training_runs_root(state.config_dir.as_deref()).join(&run_id);
-    std::fs::create_dir_all(&result_dir)
-        .map_err(|error| format!("创建训练结果目录失败：{error}"))?;
     let app = state
         .app_handle
         .lock()
         .map_err(|error| error.to_string())?
         .clone()
         .ok_or_else(|| "训练事件通道尚未初始化".to_owned())?;
-    let (command, preview) = if let Some(dataset) = &input.dataset_path {
-        (
-            teacher_command(&input.program, dataset, &working_dir, &result_dir)?,
-            None,
-        )
-    } else {
-        prepare_rl_command(state, &input, &working_dir, &result_dir)?
+    let replacement = super::rounds::stage_fresh_experiment(
+        state.config_dir.as_deref(),
+        &input,
+        metadata.servo_profile,
+    )?;
+    let result = start_round(state, app, input, &working_dir, run_id, metadata);
+    if let Some(replacement) = replacement {
+        match &result {
+            Ok(_) => replacement.finish(),
+            Err(error) => {
+                if let Err(restore_error) = replacement.restore() {
+                    return Err(format!("{error}。{restore_error}"));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn start_round(
+    state: &DesktopState,
+    app: AppHandle<Wry>,
+    mut input: TrainingStartInput,
+    working_dir: &Path,
+    run_id: String,
+    metadata: TrainingRunMetadata,
+) -> Result<TrainingProgress, String> {
+    let starting = allocate_round(state, &mut input, run_id, metadata)?;
+    let result_dir = PathBuf::from(&starting.result_dir);
+    let prepared: Result<(ProcessCommand, Option<TrainingFrameSource>), String> = (|| {
+        if let Some(dataset) = &input.dataset_path {
+            Ok((
+                teacher_command(
+                    &input.program,
+                    dataset,
+                    working_dir,
+                    &result_dir,
+                    state.config_dir.as_deref(),
+                )?,
+                None,
+            ))
+        } else {
+            prepare_rl_command(state, &input, working_dir, &result_dir)
+        }
+    })();
+    let (command, preview) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            if input.replace_existing_experiment {
+                return Err(error);
+            }
+            let mut failed = starting;
+            failed.phase = TrainingPhase::Failed;
+            failed.message = error.clone();
+            persist_training_progress(&failed);
+            *state.training_progress.lock().map_err(|e| e.to_string())? = Some(failed.clone());
+            training_events::progress(&app, failed);
+            return Err(format!("{error}。轮次目录：{}", result_dir.display()));
+        }
     };
+    launch(state, app, command, preview, starting, false)
+}
+
+fn allocate_round(
+    state: &DesktopState,
+    input: &mut TrainingStartInput,
+    run_id: String,
+    mut metadata: TrainingRunMetadata,
+) -> Result<TrainingProgress, String> {
+    let result_dir = super::rounds::allocate(state.config_dir.as_deref(), input, &run_id)?;
+    metadata.experiment_id = input
+        .experiment_id
+        .clone()
+        .expect("allocated experiment ID");
     let starting = initial_progress(
         run_id,
         &result_dir,
         metadata,
         format!("正在启动：{} {}", input.program, input.args.join(" ")),
     );
-    launch(state, app, command, preview, starting, false)
+    persist_training_progress(&starting);
+    Ok(starting)
+}
+
+pub(crate) enum HeadlessPlan {
+    File(PathBuf),
+    Inline(serde_json::Value),
+}
+
+/// Headless training uses the same validated inputs, round layout and worker as the desktop.
+pub(crate) fn run_cli(
+    config: &Path,
+    mut input: TrainingStartInput,
+    plan: Option<HeadlessPlan>,
+) -> Result<(), String> {
+    let config = std::path::absolute(config).map_err(|error| error.to_string())?;
+    if !config.is_dir() {
+        return Err(format!("训练配置目录不存在：{}", config.display()));
+    }
+    if input.program != "uv" || input.replace_existing_experiment || input.deepmimic.is_none() {
+        return Err("命令行训练需要使用 uv、指定 DeepMimic 动作包及新的或可继承的训练 ID".into());
+    }
+    let state = DesktopState::try_new(Some(config))?;
+    let working_dir = microduck_training::bundle::project()?;
+    let run_id = new_training_run_id();
+    let metadata = training_metadata(&state, &input, &run_id)?;
+    super::rounds::stage_fresh_experiment(
+        state.config_dir.as_deref(),
+        &input,
+        metadata.servo_profile,
+    )?;
+    let mut progress = allocate_round(&state, &mut input, run_id, metadata)?;
+    println!(
+        "{}",
+        serde_json::to_string(&progress).map_err(|error| error.to_string())?
+    );
+    let result = run_headless(&state, &input, &working_dir, plan, &mut progress);
+    if let Err(error) = &result {
+        progress.phase = TrainingPhase::Failed;
+        progress.message = error.clone();
+    } else if Path::new(&progress.result_dir)
+        .join("reviews/stopped.json")
+        .is_file()
+    {
+        progress.phase = TrainingPhase::Stopped;
+        progress.message = "训练已在复核点停止".into();
+    } else {
+        progress.phase = TrainingPhase::Finished;
+        progress.message = "训练完成".into();
+        progress.percent = Some(100.0);
+    }
+    persist_training_progress(&progress);
+    println!(
+        "{}",
+        serde_json::to_string(&progress).map_err(|error| error.to_string())?
+    );
+    result
+}
+
+fn run_headless(
+    state: &DesktopState,
+    input: &TrainingStartInput,
+    working_dir: &Path,
+    plan: Option<HeadlessPlan>,
+    progress: &mut TrainingProgress,
+) -> Result<(), String> {
+    let directory = PathBuf::from(&progress.result_dir);
+    let (mut command, _) = prepare_rl_command(state, input, working_dir, &directory)?;
+    if let Some(plan) = plan {
+        let path = match plan {
+            HeadlessPlan::File(path) => path,
+            HeadlessPlan::Inline(document) => {
+                let path = directory.join("walking-plan.json");
+                let bytes =
+                    serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+                std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+                path
+            }
+        };
+        command.arg("--deepmimic-plan").arg(path);
+    }
+    let mut stdout = std::io::BufWriter::new(
+        std::fs::File::create(directory.join("stdout.log")).map_err(|error| error.to_string())?,
+    );
+    let stderr =
+        std::fs::File::create(directory.join("stderr.log")).map_err(|error| error.to_string())?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|error| format!("启动本地训练失败：{error}"))?;
+    let output = BufReader::new(child.stdout.take().expect("piped training stdout"));
+    progress.phase = TrainingPhase::Running;
+    persist_training_progress(progress);
+    let read_result = (|| -> std::io::Result<()> {
+        for line in output.lines() {
+            let line = line?;
+            writeln!(stdout, "{line}")?;
+            if let Some(review) = line.strip_prefix("MICRODUCK_TRAINING_REVIEW ") {
+                stdout.flush()?;
+                let review: serde_json::Value = serde_json::from_str(review)?;
+                progress.percent = review["progress_percent"].as_f64().or(progress.percent);
+                persist_training_progress(progress);
+                println!("{review}");
+            } else if line.contains("Learning iteration") {
+                stdout.flush()?;
+                parse_training_line(progress, &line);
+                persist_training_progress(progress);
+            } else if line.trim_start().starts_with("Mean reward:") {
+                parse_training_line(progress, &line);
+            }
+        }
+        stdout.flush()
+    })();
+    if read_result.is_err() {
+        let _ = stop_child(&mut child);
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
+    read_result.map_err(|error| error.to_string())?;
+    progress.exit_code = status.code();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "训练退出（{status}），详见 {}",
+            directory.join("stderr.log").display()
+        ))
+    }
 }
 
 pub(crate) fn start_teacher_evaluation(
@@ -429,7 +646,6 @@ pub(crate) fn start_teacher_evaluation(
     ensure_process_idle(state)?;
     if input.task_id.trim().is_empty()
         || input.virtual_machine_id.is_empty()
-        || input.working_dir.trim().is_empty()
         || !policy::is_training_policy(&input.teacher_policy_id)
         || !(1..=5000).contains(&input.steps)
         || input.seed > i32::MAX as u32
@@ -443,7 +659,21 @@ pub(crate) fn start_teacher_evaluation(
         .clone()
         .ok_or("训练事件通道尚未初始化")?;
     let run_id = new_training_run_id();
-    let result_dir = training_runs_root(state.config_dir.as_deref()).join(&run_id);
+    let mut evaluation_input = TrainingStartInput {
+        initialization: None,
+        replace_existing_experiment: false,
+        program: "uv".into(),
+        args: vec!["run".into(), "train".into(), input.task_id.clone()],
+        virtual_machine_id: input.virtual_machine_id.clone(),
+        policy_id: None,
+        experiment_id: None,
+        recipe: "teacher-evaluation".into(),
+        teacher_motion_provenance: input.teacher_policy_id.clone(),
+        dataset_path: None,
+        deepmimic: None,
+    };
+    let result_dir =
+        super::rounds::allocate(state.config_dir.as_deref(), &mut evaluation_input, &run_id)?;
     std::fs::create_dir_all(&result_dir).map_err(|error| error.to_string())?;
     let result = (|| {
         let (command, preview, metadata) =
@@ -503,8 +733,9 @@ fn prepare_teacher_evaluation(
         "home_pose_rad": teacher.spec.home, "policy_contract": contract,
     });
     let spec = install_evaluation(result_dir, &spec_data)?;
-    let working_dir = std::path::absolute(&input.working_dir).map_err(|error| error.to_string())?;
+    let working_dir = microduck_training::bundle::project()?;
     let metadata = TrainingRunMetadata {
+        deepmimic: None,
         experiment_id: run_id.to_owned(),
         body_template_id: identity.id,
         body_version: identity.version,
@@ -521,6 +752,8 @@ fn prepare_teacher_evaluation(
         teacher_motion_provenance: input.teacher_policy_id.clone(),
     };
     let upstream = TrainingStartInput {
+        initialization: None,
+        replace_existing_experiment: false,
         program: "uv".into(),
         args: [
             "run",
@@ -533,13 +766,13 @@ fn prepare_teacher_evaluation(
         ]
         .map(str::to_owned)
         .to_vec(),
-        working_dir: input.working_dir.clone(),
         virtual_machine_id: input.virtual_machine_id.clone(),
         policy_id: Some(input.teacher_policy_id.clone()),
         experiment_id: None,
         recipe: metadata.recipe.clone(),
         teacher_motion_provenance: metadata.teacher_motion_provenance.clone(),
         dataset_path: None,
+        deepmimic: None,
     };
     let (mut command, preview) = prepare_mjlab_command(
         state,
@@ -719,7 +952,7 @@ pub(crate) fn stop(state: &DesktopState) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn stop_child(child: &mut std::process::Child) -> std::io::Result<()> {
+pub(crate) fn stop_child(child: &mut std::process::Child) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
 
     if child.try_wait()?.is_some() {
@@ -741,15 +974,53 @@ fn stop_child(child: &mut std::process::Child) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn stop_child(child: &mut std::process::Child) -> std::io::Result<()> {
+pub(crate) fn stop_child(child: &mut std::process::Child) -> std::io::Result<()> {
     child.kill()
 }
 pub(crate) fn status(state: &DesktopState) -> Result<Option<TrainingProgress>, String> {
-    state
+    let mut current = state
         .training_progress
         .lock()
-        .map(|progress| progress.clone())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if current.is_none() {
+        *current = super::rounds::records(state.config_dir.as_deref())?
+            .into_iter()
+            .filter_map(|(directory, record)| {
+                let mut value: TrainingProgress =
+                    serde_json::from_slice(&std::fs::read(directory.join("progress.json")).ok()?)
+                        .ok()?;
+                if value.run_id != record.run_id
+                    || Path::new(&value.result_dir).canonicalize().ok()? != directory
+                {
+                    return None;
+                }
+                if matches!(
+                    value.phase,
+                    TrainingPhase::Starting | TrainingPhase::Running
+                ) {
+                    if microduck_training::artifacts::read_artifact::<
+                        serde_json::Value,
+                        serde_json::Value,
+                    >(&directory)
+                    .is_ok()
+                    {
+                        value.phase = TrainingPhase::Finished;
+                        value.percent = Some(100.0);
+                        value.message = "已恢复完成的训练产物".into();
+                    } else {
+                        value.phase = TrainingPhase::Failed;
+                        value.message = "上次训练进程的连接已中断，请查看结果目录中的日志".into();
+                    }
+                }
+                Some(value)
+            })
+            .max_by(|a, b| a.run_id.cmp(&b.run_id));
+    }
+    Ok(current.clone())
+}
+
+pub(crate) fn result_directory(state: &DesktopState, run_id: &str) -> Result<PathBuf, String> {
+    super::rounds::directory(state.config_dir.as_deref(), run_id)
 }
 
 #[cfg(test)]

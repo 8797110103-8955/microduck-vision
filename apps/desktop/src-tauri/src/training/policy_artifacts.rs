@@ -22,6 +22,7 @@ use microduck_training::artifacts::{digest_is_valid, read_artifact};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrainingPolicy {
+    pub(crate) requires_backlash: bool,
     pub(crate) sha256: String,
     pub(crate) spec: LocalPolicySpec,
     pub(crate) source: Value,
@@ -48,6 +49,9 @@ struct RlContract {
     policy_layout: Value,
     onnx_metadata: BTreeMap<String, String>,
     domain_randomization: bool,
+    training_method: Option<String>,
+    encoder_through_backlash: Option<bool>,
+    joint_velocity_delay_ticks: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -66,7 +70,19 @@ pub(crate) fn entry(run: &Path, id: String, selected: bool) -> Result<PolicyEntr
     let size = model.metadata().map_err(|error| error.to_string())?.len();
     let (name, kind) = match &manifest.contract {
         ManifestContract::Rl(contract) => (
-            format!("{} · {:?}", contract.task_id, contract.model_kind),
+            match contract.training_method.as_deref() {
+                Some("deepmimic") => format!(
+                    "DeepMimic · {:?} · {}",
+                    contract.model_kind,
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                Some("ppo-baseline") => format!(
+                    "PPO baseline · {:?} · {}",
+                    contract.model_kind,
+                    run.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                _ => format!("{} · {:?}", contract.task_id, contract.model_kind),
+            },
             "training",
         ),
         ManifestContract::Teacher(contract) => (
@@ -95,7 +111,8 @@ pub(crate) fn resolve(
     body: &BodyProfile,
 ) -> Result<PreviewPolicySelection, String> {
     let (manifest, path) = read_artifact::<TensorSpec, ManifestContract>(run)?;
-    let (names, mut descriptor, home, metadata, source) = match manifest.contract {
+    let (names, mut descriptor, home, metadata, source, requires_backlash) = match manifest.contract
+    {
         ManifestContract::Rl(contract) => {
             let descriptor = contract.descriptor(body)?;
             let source = json!({
@@ -103,6 +120,7 @@ pub(crate) fn resolve(
                 "model_kind": contract.model_kind, "execution_fingerprint": contract.execution_fingerprint,
                 "robot_xml": contract.robot_xml, "robot_sha256": contract.robot_sha256,
                 "domain_randomization": contract.domain_randomization,
+                "encoder_through_backlash": contract.encoder_through_backlash,
             });
             (
                 ["obs", "actions"],
@@ -110,6 +128,7 @@ pub(crate) fn resolve(
                 contract.home_pose_rad,
                 contract.onnx_metadata,
                 source,
+                contract.robot_xml == "robot_groundcontact_backlash.xml",
             )
         }
         ManifestContract::Teacher(contract) => {
@@ -125,6 +144,7 @@ pub(crate) fn resolve(
                 home,
                 BTreeMap::new(),
                 source,
+                false,
             )
         }
     };
@@ -160,6 +180,7 @@ pub(crate) fn resolve(
         episodic: false,
         duration: None,
         training: Some(TrainingPolicy {
+            requires_backlash,
             sha256: manifest.onnx_sha256,
             spec: LocalPolicySpec {
                 input,
@@ -223,12 +244,25 @@ impl RlContract {
         {
             return Err("训练产物的身体标识或规范槽位不匹配".into());
         }
-        if self.robot_xml != "robot_walk.xml"
-            || (self.control_s - 0.02).abs() > 1e-9
+        let backlash = self.robot_xml == "robot_groundcontact_backlash.xml";
+        if !matches!(
+            self.robot_xml.as_str(),
+            "robot_walk.xml" | "robot_groundcontact_backlash.xml"
+        ) || (self.control_s - 0.02).abs() > 1e-9
             || self.task_id.trim().is_empty()
             || !digest_is_valid(&self.execution_fingerprint)
         {
-            return Err("桌面预览需要支持的 walk 身体、执行来源和 50 Hz 控制周期".into());
+            return Err("桌面预览需要支持的机器人模型、执行来源和 50 Hz 控制周期".into());
+        }
+        if backlash
+            && (self.model_kind != ModelKindKey::Xl330
+                || self.encoder_through_backlash != Some(true)
+                || self.joint_velocity_delay_ticks != Some(1)
+                || self.policy_layout["action_len"] != ACTION_LEN)
+        {
+            return Err(
+                "Backlash 学生需要 XL330、输出侧 encoder、单步速度延迟和 14D action".into(),
+            );
         }
         let bytes = OfficialAssets::Embedded
             .read(Path::new(&self.robot_xml))
@@ -266,6 +300,13 @@ impl RlContract {
                 .map(String::as_str)
                 .unwrap_or_default()
         };
+        if backlash
+            && (meta("microduck_encoder_through_backlash") != "true"
+                || meta("microduck_joint_velocity_delay_ticks") != "1"
+                || meta("microduck_robot_sha256") != self.robot_sha256)
+        {
+            return Err("ONNX 的 backlash encoder、速度延迟或模型摘要不匹配".into());
+        }
         let home = meta("default_joint_pos")
             .split(',')
             .map(str::parse::<f64>)
@@ -319,7 +360,23 @@ impl RlContract {
         {
             return Err("训练观测拼接或历史长度与桌面预览不匹配".into());
         }
-        for (term, (name, func, delay)) in terms.iter().zip(WALK_TERMS) {
+        let backlash = self.robot_xml == "robot_groundcontact_backlash.xml";
+        for (term, (name, mut func, mut delay)) in terms.iter().zip(WALK_TERMS) {
+            if backlash {
+                match name {
+                    "base_ang_vel" => {
+                        func = "mjlab.envs.mdp.observations.base_ang_vel";
+                        delay = [0, 0];
+                    }
+                    "projected_gravity" => {
+                        func = "mjlab.envs.mdp.observations.projected_gravity";
+                        delay = [0, 0];
+                    }
+                    "joint_pos" => func = "mjlab_microduck.tasks.mdp.joint_pos_rel_backlash",
+                    "joint_vel" => func = "mjlab_microduck.tasks.mdp.joint_vel_rel_backlash",
+                    _ => {}
+                }
+            }
             let cfg = &term["configuration"];
             if term["name"] != name
                 || cfg["func"] != func
@@ -331,6 +388,9 @@ impl RlContract {
                 return Err(format!("训练观测项 {name} 的顺序、缩放或采样延迟不匹配"));
             }
             let params = &cfg["params"];
+            if backlash && name == "joint_pos" && params["biased"] != false {
+                return Err("Backlash encoder 不能包含未部署的编码器偏置".into());
+            }
             if matches!(name, "joint_pos" | "joint_vel")
                 && (params["asset_cfg"]["name"] != "robot"
                     || params["asset_cfg"]["joint_names"] != json!(["^(?!passive_).*"]))

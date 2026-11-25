@@ -2,6 +2,7 @@ import { defineComponent, onMounted, onScopeDispose, ref } from "vue";
 import { useIntervalFn } from "@vueuse/core";
 import * as commands from "../../../generated/types";
 import style from "./style.module.scss";
+import { DeepMimicConversion } from "./deepmimic";
 
 const stateLabels: Record<string, string> = {
   recording: "采集中",
@@ -15,6 +16,7 @@ export const LogsPage = defineComponent(() => {
   const records = ref<Awaited<ReturnType<typeof commands.recordingList>>>([]);
   const loaded = ref(false);
   const error = ref("");
+  const expanded = ref("");
   let disposed = false;
   let refreshing = false;
 
@@ -90,7 +92,19 @@ export const LogsPage = defineComponent(() => {
               >
                 动作轨迹数据
               </button>
+              <button
+                type="button"
+                aria-expanded={expanded.value === record.id}
+                onClick={() => {
+                  expanded.value = expanded.value === record.id ? "" : record.id;
+                }}
+              >
+                转换为 DeepMimic 训练数据
+              </button>
             </div>
+            {expanded.value === record.id && (
+              <DeepMimicConversion recordingId={record.id} recordingName={record.name} />
+            )}
           </li>
         ))}
       </ul>

@@ -152,9 +152,11 @@ impl From<&loop_body::ReadOnlySource> for crate::types::ReadSourceStatus {
 }
 
 #[cfg(test)]
-pub(crate) fn test_directory() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("DUCK_DESKTOP_TEST_DIR"))
-}
+#[path = "../../../../../.cargo/test_directory.rs"]
+mod test_paths;
+
+#[cfg(test)]
+pub(crate) use test_paths::test_directory;
 
 #[cfg(test)]
 mod tests {

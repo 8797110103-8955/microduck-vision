@@ -4,9 +4,9 @@
 > —— [Microduck](https://github.com/pollen-robotics/microduck)
 
 一个面向 MicroDuck 的桌面实验终端，把官方策略运行、MuJoCo 仿真、不同舵机测试、本地训练和实机控制放在同一个工作流里。  
-核心目标是：**在本机用运动轨迹作为教师，训练适配其他舵机与动力学条件的新策略模型，并探索更复杂的运动控制。**
+核心目标是：**在官方已有成熟onnx的背景下，探索其他舵机 & 动力学条件 & 训练策略**
 
-复现官方 ONNX + XL330 的运动轨迹是前期基准，HD1910 Compatible 接入官方 ONNX，用来验证仿真与执行流程可跨电机匹配，并为后续训练积累参考数据。
+复现官方 ONNX + XL330 的运动轨迹是前期基准，HD1910 Compatible 接入官方 ONNX，用来验证仿真与执行流程可跨电机匹配，并为后续积累参考数据。
 
 ## 快速开始
 
@@ -24,13 +24,17 @@ pnpm dev
 
 1. 创建或选择一台模拟机，选择要测试的模型。复现官方行为时先使用 XL330。
 2. 在“策略”页按需下载 [microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies) 提供的官方 ONNX。
-3. 回到 VLA 预览，选择模拟机和已缓存的策略，设置运动指令后开启控制环。
+3. 回到 ONNX 预览，选择模拟机和已缓存的策略，设置运动指令后开启控制环。
 
-接入实机时，先在机器与调试页面确认连接、关节映射、方向和零位，再在 VLA 预览中切换真机同步、开启力矩和真机控制环。
+接入实机时，先在机器与调试页面确认连接、关节映射、方向和零位，再在 ONNX 预览中切换真机同步、开启力矩和真机控制环。
 
 ### 本地训练
 
-本地 RL 训练还需要 `uv`，以及满足所选 MJLab 任务要求的 GPU 和驱动环境。
+本地训练需要支持 CUDA 的 NVIDIA GPU 和驱动，应用启动训练时会调用 `uv` 准备训练环境。
+
+```powershell
+.\target\bin\microduck-vision.exe --help | Out-Host
+```
 
 ### 检查与发布
 
@@ -46,12 +50,10 @@ pnpm release # 默认发布目录 `target/bin/`
 
 - `microduck_rl` 的 MJCF、网格和训练环境。MJCF 与网格在编译时从锁定的 vendor 版本读取；MuJoCo 从内存加载资源，3D 视图读取随应用分发的同源 STL。
 - `microduck` 的标准关节定义、运动学，以及 `duck-control` 中的观测构建、策略执行等模块。
-
-官方运行逻辑分布在机器人运行端、仿真和训练工具中。  
-本项目把执行流程整理为桌面端可以共同使用的控制环：读取反馈、构建观测、执行策略、生成关节目标，再交给模拟或实机后端。  
-机体定义和策略输入输出约定保持一致，具体设备 I/O、仿真参数和生命周期由各自的层负责。
-
-纯 Web 仿真也可参考官方的 [microduck-simulator](https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md)。
+  - 官方原运行逻辑分散在机器人运行端、仿真和训练工具中
+  - 项目把执行流程整理为桌面端可以共同使用的控制环：读取反馈、构建观测、执行策略、生成关节目标，再交给模拟或实机后端
+  - 各包细节描述可查看crates/*/Cargo.toml.description
+- 纯 Web 仿真也可参考官方的 [microduck-simulator](https://huggingface.co/spaces/pollen-robotics/microduck-simulator/blob/main/README.md)
 
 ### 仿真与不同舵机
 
@@ -76,5 +78,3 @@ pnpm release # 默认发布目录 `target/bin/`
 ---
 
 开发约定见 [AGENTS.md](AGENTS.md)。
-
-各 crate 的职责与边界见对应 `Cargo.toml` 中的 `description` 和紧随其后的注释。

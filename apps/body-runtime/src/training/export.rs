@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use duck_body::{AssetResolver, BodyProfile};
 use serde::Serialize;
 
+use crate::models::assets::{AssetBundle, SourceAsset};
 use crate::models::profile::BodyExecutionProfile;
 
 use super::task::{ResolvedTrainingBody, TaskBodyDescription};
@@ -21,6 +22,8 @@ struct SimulationExport<'a> {
     profile: &'a BodyExecutionProfile,
     task: Option<&'a TaskBodyDescription>,
     assets: Vec<AssetBytes<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<super::mjlab::MjlabBodyConfig>,
 }
 
 #[derive(Serialize)]
@@ -55,6 +58,55 @@ pub fn export_native_simulation(
     export(profile, source, None)
 }
 
+/// Preserve the recorded effective parameters while verifying every resource against
+/// this release. Recorded profiles contain dynamic strings and are kept as JSON.
+pub fn export_recorded_native_simulation(
+    profile: &serde_json::Value,
+    source: &dyn AssetResolver,
+) -> Result<Vec<u8>, String> {
+    let simulation = &profile["simulation"];
+    let scenario = &simulation["scenario"];
+    if profile["format_version"] != 1
+        || profile["execution_kind"] != "simulation"
+        || !scenario["task_id"].is_null()
+    {
+        return Err("Expected a recorded native simulation profile".into());
+    }
+    let scene = scenario["scene_xml"]
+        .as_str()
+        .ok_or("Missing recorded scene XML")?;
+    let robot = scenario["robot_xml"]
+        .as_str()
+        .ok_or("Missing recorded robot XML")?;
+    let expected: Vec<SourceAsset> = serde_json::from_value(simulation["source_assets"].clone())
+        .map_err(|error| error.to_string())?;
+    let roots: Vec<_> = expected
+        .iter()
+        .filter(|asset| asset.path.ends_with(".xml"))
+        .map(|asset| asset.path.as_str())
+        .collect();
+    if !roots.contains(&scene) || !roots.contains(&robot) {
+        return Err("Recorded resources omit scene or robot XML".into());
+    }
+    let resources = AssetBundle::read(source, &roots).map_err(|error| error.to_string())?;
+    if resources.manifest() != expected {
+        return Err("Recorded simulation resources differ from this release".into());
+    }
+    let assets: Vec<_> = resources
+        .files()
+        .map(|(path, bytes)| AssetBytes {
+            path,
+            base64: STANDARD.encode(bytes),
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "units": {"angle":"rad","angular_velocity":"rad/s","length":"m","time":"s","voltage":"V"},
+        "profile": profile, "task": null, "assets": assets,
+    }))
+    .map_err(|error| error.to_string())
+}
+
 fn export(
     profile: &BodyExecutionProfile,
     source: &dyn AssetResolver,
@@ -75,7 +127,7 @@ fn export(
         return Err("resolved resources changed before simulation profile export".into());
     }
     serde_json::to_vec(&SimulationExport {
-        format_version: 1,
+        format_version: if task.is_some() { 2 } else { 1 },
         units: Units {
             angle: "rad",
             angular_velocity: "rad/s",
@@ -85,6 +137,9 @@ fn export(
         },
         profile,
         task,
+        backend: task
+            .map(|_| super::mjlab::resolve_mjlab_body(profile))
+            .transpose()?,
         assets: assets
             .files()
             .map(|(path, bytes)| AssetBytes {

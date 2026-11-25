@@ -14,9 +14,9 @@ use crate::runtime::machines::body_catalog;
 use crate::runtime::policy::inference::{PolicyConfig, PolicyDescriptor};
 use crate::runtime::session::execution::PreviewPolicySelection;
 use crate::training::policy_artifacts as training_policy;
+use crate::training::rounds::published_root;
 use duck_control::policy::Net;
 use microduck_training::artifacts::ID_PREFIX as TRAINING_ID_PREFIX;
-use microduck_training::progress::training_runs_root;
 use serde::Deserialize;
 
 use crate::types::{PolicyCommand, PolicyEntry};
@@ -283,7 +283,7 @@ fn training_run(config_dir: Option<&Path>, id: &str) -> Result<PathBuf, String> 
     ) {
         return Err("训练任务目录无效".into());
     }
-    let root = training_runs_root(config_dir)
+    let root = published_root(config_dir)
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let path = root
@@ -319,15 +319,25 @@ pub(in crate::runtime) fn selected_training_policy(
 
 pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String> {
     let selected = read_selected(&cache_root(config_dir));
-    let mut local: Vec<_> = std::fs::read_dir(training_runs_root(config_dir))
+    let mut local: Vec<_> = std::fs::read_dir(published_root(config_dir))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .filter(|run| run.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|run| {
+            run.file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("published-"))
+        })
         .filter_map(|run| {
             let id = format!("{}{}", TRAINING_ID_PREFIX, run.file_name().to_str()?);
             let active = selected.as_deref() == Some(&id);
-            training_policy::entry(&run.path(), id, active).ok()
+            let mut entry = training_policy::entry(&run.path(), id, active).ok()?;
+            let publication: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(run.path().join("publication.json")).ok()?)
+                    .ok()?;
+            entry.name = publication["name"].as_str()?.to_owned();
+            Some(entry)
         })
         .collect();
     local.sort_by(|left, right| right.id.cmp(&left.id));

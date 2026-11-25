@@ -2617,12 +2617,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "specta",
 ]
 
 [[package]]
 name = "microduck-vision"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "duck-body",
  "duck-control",
  "loop-body",
@@ -2646,12 +2649,14 @@ dependencies = [
  "tauri-specta",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "microduck-vision-generate-types"
 version = "0.1.0"
 dependencies = [
+ "microduck-training",
  "quote",
  "serde",
  "specta",

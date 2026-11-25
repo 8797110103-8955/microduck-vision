@@ -138,6 +138,14 @@ mod tests {
         .simulation
         .unwrap();
         let hd_drive = crate::runtime::adapters::simulation::resolve(
+            crate::test_support::simulation_selection(ModelKind::Hd1910),
+            &crate::platform::helpers::default_simulation(ServoModelKey::Hd1910),
+            &body,
+        )
+        .unwrap()
+        .simulation
+        .unwrap();
+        let compatible_drive = crate::runtime::adapters::simulation::resolve(
             crate::test_support::simulation_selection(ModelKind::Hd1910Compatible),
             &crate::platform::helpers::default_simulation(ServoModelKey::Hd1910),
             &body,
@@ -182,10 +190,13 @@ mod tests {
         assert!(hd.register_count > 0);
         assert_eq!(hd_drive.response.delay_steps, [0, 0]);
         assert!(!hd_drive.response.encoder_through_backlash);
+        assert_eq!(compatible_drive.response.delay_steps, [3, 6]);
+        assert!(compatible_drive.response.encoder_through_backlash);
         assert!(
-            (hd_drive.response.position_gain_scale
+            (compatible_drive.response.position_gain_scale
                 - (xl.bam_vin * xl.bam_kt / xl.bam_resistance * xl.bam_kp * xl.bam_error_gain)
-                    / (hd.bam_vin * hd.bam_kt / hd.bam_resistance * hd.bam_kp * hd.bam_error_gain))
+                    / (hd.bam_vin * hd.bam_kt / hd.bam_resistance * hd.bam_kp * hd.bam_error_gain)
+                    * 0.989)
                 .abs()
                 < 1e-12
         );

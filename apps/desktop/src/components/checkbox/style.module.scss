@@ -1,0 +1,30 @@
+@use "../../styles/tokens" as *;
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.stacked {
+  display: grid;
+  align-items: stretch;
+  justify-items: var(--checkbox-align, start);
+  gap: 5px;
+}
+
+.control {
+  display: inline-grid;
+  min-block-size: 34px;
+  place-items: center;
+
+  input {
+    min-block-size: 0;
+    margin: 0;
+
+    &:focus-visible {
+      outline: 2px solid $accent;
+      outline-offset: 2px;
+    }
+  }
+}

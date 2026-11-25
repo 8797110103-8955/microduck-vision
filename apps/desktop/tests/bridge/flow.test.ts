@@ -212,7 +212,6 @@ describe("desktop to loop data flow", () => {
     const input = {
       program: "uv",
       args: ["run", "train", "task-a"],
-      workingDir: "vendor/microduck_rl",
       virtualMachineId: "official-hd1910",
       policyId: "alpha-walking",
       experimentId: null,

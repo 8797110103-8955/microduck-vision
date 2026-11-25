@@ -1,225 +1,14 @@
-"""Describe a pinned MJLab task, then execute it with the resolved robot profile."""
-
-from __future__ import annotations
+"""Compose the selected method with the upstream training runtime."""
 
 import argparse
-import hashlib
 import json
-import math
 import os
 import sys
 from contextlib import redirect_stdout
-from dataclasses import fields, is_dataclass
-from enum import Enum
-from functools import partial
 from pathlib import Path
 
-
-def _name(value):
-    return f"{value.__module__}.{value.__qualname__}"
-
-
-def _describe_value(value):
-    if value is None or type(value) in (bool, int, str):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else repr(value)
-    if isinstance(value, Enum):
-        return _describe_value(value.value)
-    if isinstance(value, dict):
-        return {str(key): _describe_value(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_describe_value(item) for item in value]
-    if isinstance(value, slice):
-        return {"slice": [value.start, value.stop, value.step]}
-    if isinstance(value, partial):
-        return {"function": _name(value.func), "args": _describe_value(value.args),
-                "kwargs": _describe_value(value.keywords)}
-    if isinstance(value, Path):
-        return value.as_posix()
-    if callable(value):
-        return _name(value)
-    if is_dataclass(value):
-        return {"type": _name(type(value)), **{
-            field.name: _describe_value(getattr(value, field.name)) for field in fields(value)
-        }}
-    if type(value).__module__.startswith("numpy"):
-        return _describe_value(value.tolist())
-    raise ValueError(f"unsupported task description field {_name(type(value))}")
-
-
-def describe_task(task_id, env_cfg, joint_order):
-    from mjlab.envs.mdp.actions import JointPositionActionCfg
-    from mjlab.utils.lab_api.string import resolve_matching_names
-    from mjlab.utils.spec import get_non_free_joints
-    from mjlab.utils.string import resolve_expr
-    from mjlab_microduck.actuator import BacklashEncoderBamActuatorCfg, FrictionDRBamActuatorCfg
-    from mjlab_microduck.robot import microduck_constants as robot_sources
-
-    variants = {
-        robot_sources.get_walk_spec: robot_sources.MICRODUCK_WALK_XML,
-        robot_sources.get_standup_spec: robot_sources.MICRODUCK_GROUNDCONTACT_XML,
-        robot_sources.get_ground_pick_spec: robot_sources.MICRODUCK_GROUNDCONTACT_XML,
-        robot_sources.get_allcollisions_spec: robot_sources.MICRODUCK_ALLCOLLISIONS_XML,
-        robot_sources.get_walk_rollers_spec: robot_sources.MICRODUCK_GROUNDCONTACT_ROLLERS_XML,
-        robot_sources.get_backlash_spec: robot_sources.MICRODUCK_GROUNDCONTACT_BACKLASH_XML,
-        robot_sources.get_walk_backlash_spec: robot_sources.MICRODUCK_WALK_BACKLASH_XML,
-        robot_sources.get_allcollisions_backlash_spec: robot_sources.MICRODUCK_ALLCOLLISIONS_BACKLASH_XML,
-        robot_sources.get_rollers_backlash_spec: robot_sources.MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML,
-    }
-    robot = env_cfg.scene.entities.get("robot")
-    if robot is None or robot.spec_fn not in variants:
-        raise ValueError(f"task {task_id} has no supported official robot entity")
-    source = variants[robot.spec_fn]
-    if robot.articulation is None or len(robot.articulation.actuators) != 1:
-        raise ValueError(f"task {task_id} does not define one MicroDuck actuator group")
-    actuator = robot.articulation.actuators[0]
-    if not isinstance(actuator, FrictionDRBamActuatorCfg):
-        raise ValueError(f"task {task_id} does not use a MicroDuck BAM actuator")
-    spec = robot.spec_fn()
-    names = tuple(joint.name for joint in get_non_free_joints(spec))
-    _, driven = resolve_matching_names(actuator.target_names_expr, names)
-    driven = list(driven)
-    robot_joints = [name if name in driven else None for name in joint_order]
-    if set(driven) != {name for name in robot_joints if name is not None}:
-        raise ValueError(f"task {task_id} actuates joint names outside the official body")
-    if robot.init_state.joint_pos is None:
-        raise ValueError(f"task {task_id} needs explicit robot home poses")
-    home = resolve_expr(robot.init_state.joint_pos, names, 0.0)
-    home_by_name = dict(zip(names, home, strict=True))
-    actions = []
-    for name, term in env_cfg.actions.items():
-        if term is None:
-            continue
-        if not isinstance(term, JointPositionActionCfg) or term.entity_name != "robot":
-            raise ValueError(f"task {task_id} has unsupported action term {name}")
-        _, joints = resolve_matching_names(term.actuator_names, driven)
-        actions.append({"name": name, "joints": list(joints), "configuration": _describe_value(term)})
-    actor = env_cfg.observations["actor"]
-    observations = [
-        {"name": name, "configuration": _describe_value(term)}
-        for name, term in actor.terms.items() if term is not None
-    ]
-    physics_s = env_cfg.sim.mujoco.timestep
-    terrain = env_cfg.scene.terrain
-    return {
-        "task_id": task_id,
-        "robot_xml": source.name,
-        "robot_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-        "joint_order": joint_order,
-        "robot_joints": robot_joints,
-        "home_pose_rad": [home_by_name.get(name, 0.0) for name in robot_joints],
-        "root_home_pose": [*robot.init_state.pos, *robot.init_state.rot],
-        "periods": {
-            "control_s": physics_s * env_cfg.decimation,
-            "physics_s": physics_s,
-            "physics_substeps": env_cfg.decimation,
-        },
-        "requires_backlash": isinstance(actuator, BacklashEncoderBamActuatorCfg),
-        "name_servo_collision_geoms": source.name.startswith("robot_allcollisions"),
-        "target_delay_steps": [actuator.delay_min_lag, actuator.delay_max_lag],
-        "policy_layout": {
-            "actions": actions,
-            "action_len": sum(len(term["joints"]) for term in actions),
-            "observations": observations,
-            "concatenate_observations": actor.concatenate_terms,
-            "observation_history_length": actor.history_length,
-        },
-        "assembly": {
-            "terrain": terrain.terrain_type if terrain is not None else None,
-            "num_envs": env_cfg.scene.num_envs,
-            "entities": list(env_cfg.scene.entities),
-            "sensors": [_describe_value(sensor) for sensor in env_cfg.scene.sensors],
-            "collisions": _describe_value(robot.collisions),
-        },
-    }
-
-
-def task_config(task_id, trailing, *, num_envs=None, terrain=None):
-    import mjlab
-    import mjlab_microduck.tasks  # noqa: F401 - registers the pinned tasks
-    import tyro
-    from mjlab.scripts.train import TrainConfig
-
-    cfg = TrainConfig.from_task(task_id)
-    if trailing:
-        cfg = tyro.cli(TrainConfig, args=trailing, default=cfg, config=mjlab.TYRO_FLAGS)
-    if num_envs is not None:
-        if num_envs < 1:
-            raise ValueError("num-envs must be positive")
-        cfg.env.scene.num_envs = num_envs
-    if terrain is not None:
-        actual = cfg.env.scene.terrain
-        if actual is None or actual.terrain_type != terrain:
-            raise ValueError(f"task {task_id} does not use terrain {terrain!r}")
-    return cfg
-
-
-def install_profile(task_id, cfg, profile, run_dir, *, domain_randomization):
-    from mjlab_adapter import adapter
-
-    description = describe_task(task_id, cfg.env, profile.execution["joint_order"])
-    if description != profile.task:
-        raise ValueError("task description or source changed after resolving its body")
-    adapter(profile.model_kind)(cfg.env, profile, run_dir, domain_randomization=domain_randomization)
-    if not domain_randomization:
-        removed = {
-            name for name in cfg.env.events
-            if name.startswith("randomize_") or name in {"encoder_bias", "push_robot"}
-        }
-        cfg.env.events = {
-            name: event for name, event in cfg.env.events.items() if name not in removed
-        }
-        cfg.env.curriculum = {
-            name: term for name, term in cfg.env.curriculum.items()
-            if term is None or term.params.get("event_name") not in removed
-        }
-        cfg.env.observations["actor"].enable_corruption = False
-
-
-def _write_artifact(run_dir, profile, *, domain_randomization):
-    import onnx
-
-    models = sorted((run_dir / "logs" / "rsl_rl").rglob("*.onnx"))
-    if len(models) != 1:
-        raise ValueError("training must produce one ONNX artifact for the desktop run")
-    path = models[0]
-    model = onnx.load(path, load_external_data=False)
-
-    def tensor(value):
-        tensor_type = value.type.tensor_type
-        return {
-            "name": value.name,
-            "element_type": onnx.TensorProto.DataType.Name(tensor_type.elem_type),
-            "dimensions": [
-                length.dim_value if length.HasField("dim_value") else length.dim_param or None
-                for length in tensor_type.shape.dim
-            ],
-        }
-
-    manifest = {
-        "format_version": 1,
-        "kind": "rl",
-        "onnx_path": path.relative_to(run_dir).as_posix(),
-        "onnx_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "task_id": profile.task["task_id"],
-        "robot_xml": profile.task["robot_xml"],
-        "robot_sha256": profile.task["robot_sha256"],
-        "joint_order": profile.execution["joint_order"],
-        "home_pose_rad": profile.execution["home_pose_rad"],
-        "policy_layout": profile.task["policy_layout"],
-        "inputs": [tensor(value) for value in model.graph.input],
-        "outputs": [tensor(value) for value in model.graph.output],
-        "onnx_metadata": {item.key: item.value for item in model.metadata_props},
-        "control_s": profile.execution["periods"]["control_s"],
-        "body": profile.execution["body"],
-        "model_kind": profile.model_kind,
-        "domain_randomization": domain_randomization,
-        "execution_fingerprint": profile.execution["execution_fingerprint"],
-    }
-    pending = run_dir / "artifact.json.tmp"
-    pending.write_text(json.dumps(manifest, allow_nan=False, indent=2), encoding="utf-8")
-    pending.replace(run_dir / "artifact.json")
+from training.runtime import task_config, describe_task, install_profile
+from training.artifacts import write_artifact
 
 
 def main(argv=None):
@@ -229,44 +18,111 @@ def main(argv=None):
     parser.add_argument("--joint-order", type=json.loads)
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--run-dir", type=Path)
-    parser.add_argument("--adapters", type=Path)
     parser.add_argument("--preview-bodies", type=json.loads)
     parser.add_argument("--num-envs", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--iterations", type=int)
+    parser.add_argument("--deepmimic-bundle", type=Path)
+    parser.add_argument("--deepmimic-manifest-sha256")
+    parser.add_argument("--deepmimic-baseline", action="store_true")
+    parser.add_argument("--deepmimic-plan", type=Path)
     parser.add_argument("--terrain")
-    parser.add_argument("--domain-randomization", choices=("on", "off"), default="on")
+    parser.add_argument("--domain-randomization", choices=("on", "off"))
     parser.add_argument("--teacher-spec", type=Path)
     parser.add_argument("--evaluation-steps", type=int, default=100)
     parser.add_argument("--evaluation-seed", type=int, default=0)
+    parser.add_argument("--initialization", type=Path)
     args, trailing = parser.parse_known_args(argv)
     if trailing and trailing[0] == "--":
         trailing = trailing[1:]
     if any(flag.split("=", 1)[0] == "--hf-jobs" for flag in trailing):
         parser.error("desktop training runs locally")
+    if args.task.startswith("Microduck-DeepMimic-") and any(
+        flag.split("=", 1)[0] == "--init-checkpoint" for flag in trailing
+    ):
+        parser.error("DeepMimic initializes actor and critic randomly; init-checkpoint is not supported")
     from mjlab_microduck.checkpoints import consume_init_flag
 
     trailing = consume_init_flag(trailing)
+    deepmimic = args.task.startswith("Microduck-DeepMimic-")
+    if deepmimic and (args.deepmimic_bundle is None or args.operation == "evaluate-teacher"):
+        parser.error("DeepMimic training requires a published --deepmimic-bundle")
+    if not deepmimic and (args.deepmimic_bundle or args.deepmimic_manifest_sha256 or args.deepmimic_baseline):
+        parser.error("DeepMimic options require the dedicated DeepMimic task")
+    domain_randomization = (args.domain_randomization or ("off" if deepmimic else "on")) == "on"
+    if deepmimic and domain_randomization:
+        parser.error("the first DeepMimic recipe requires domain randomization off")
+
+    def configure(joints):
+        if deepmimic:
+            from deepmimic.task import register_tasks
+
+            register_tasks()
+        cfg = task_config(args.task, trailing, num_envs=args.num_envs, terrain=args.terrain,
+                          seed=args.seed, iterations=args.iterations)
+        description = describe_task(args.task, cfg.env, joints)
+        binding = None
+        if deepmimic:
+            from deepmimic.task import TrainingBinding, validate_config
+
+            validate_config(cfg)
+
+            binding = TrainingBinding(cfg, args.deepmimic_bundle, description,
+                                      expected_hash=args.deepmimic_manifest_sha256,
+                                      baseline=args.deepmimic_baseline)
+        return cfg, description, binding
+
     if args.operation == "describe":
         if not isinstance(args.joint_order, list) or not args.joint_order:
             parser.error("describe requires --joint-order")
         with redirect_stdout(sys.stderr):
-            cfg = task_config(args.task, trailing, num_envs=args.num_envs, terrain=args.terrain)
-            result = describe_task(args.task, cfg.env, args.joint_order)
+            cfg, result, binding = configure(args.joint_order)
+            if binding is not None:
+                binding.describe(args.run_dir or Path.cwd())
         print(json.dumps(result, allow_nan=False))
         return
-    if args.profile is None or args.run_dir is None or args.adapters is None:
-        parser.error("run requires --profile, --run-dir and --adapters")
-    sys.path.insert(0, str(args.adapters.resolve()))
-    from simulation_profile import load_profile
+    if args.profile is None or args.run_dir is None:
+        parser.error("run requires --profile and --run-dir")
+    from training.body import load_profile
 
     profile = load_profile(args.profile)
-    cfg = task_config(args.task, trailing, num_envs=args.num_envs, terrain=args.terrain)
+    cfg, _, binding = configure(profile.execution["joint_order"])
+    walking = None
+    if args.deepmimic_plan is not None:
+        if binding is None or args.deepmimic_baseline or args.operation != "run":
+            parser.error("a walking plan requires a DeepMimic imitation run")
+        from deepmimic.walking import WalkingPlan
+
+        walking = WalkingPlan(args.deepmimic_plan, binding.motion)
+        walking.configure(cfg, binding)
+    if args.operation == "run" and cfg.gpu_ids and os.environ.get("CUDA_VISIBLE_DEVICES") != "":
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "MJLab requires a CUDA-enabled PyTorch environment for this run. "
+                "Check the NVIDIA driver and launch Microduck with the CUDA environment."
+            )
+    if binding is not None:
+        cfg.agent.save_interval = min(50, cfg.agent.save_interval)
     run_dir = args.run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    domain_randomization = args.domain_randomization == "on"
     install_profile(
         args.task, cfg, profile, run_dir,
         domain_randomization=domain_randomization,
     )
+    if args.operation == "run":
+        from training.rounds import install as install_round
+
+        install_round(args.task, cfg, profile, run_dir, args.initialization,
+                      domain_randomization=domain_randomization, walking=walking,
+                      reference=None if binding is None else {
+                          "method": binding.method, "manifest_sha256": binding.motion.manifest_sha256,
+                          "recipe": {key: value for key, value in binding.recipe.items() if key != "iterations"},
+                      })
+    if binding is not None:
+        cfg.agent.algorithm.class_name = "training.masked_ppo:MaskedPPO"
+        binding.install(cfg, profile, run_dir)
     run_id = os.environ.get("MICRODUCK_TRAINING_RUN_ID")
     if run_id and args.preview_bodies:
         from training_preview import install_training_preview
@@ -285,7 +141,9 @@ def main(argv=None):
 
     os.chdir(run_dir)
     launch_training(args.task, cfg)
-    _write_artifact(run_dir, profile, domain_randomization=domain_randomization)
+    if not (run_dir / "reviews" / "stopped.json").is_file():
+        write_artifact(run_dir, profile, domain_randomization=domain_randomization)
+
 
 
 if __name__ == "__main__":

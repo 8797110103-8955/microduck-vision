@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "native")]
 #[path = "../../.cargo/output_paths.rs"]
+#[allow(dead_code)]
 mod output_paths;
 
 #[cfg(feature = "native")]

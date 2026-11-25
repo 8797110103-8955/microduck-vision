@@ -1,4 +1,11 @@
+pub use microduck_training::tasks::TaskConfiguration;
 use serde::{Deserialize, Serialize};
+
+pub use microduck_training::deepmimic::{
+    BundleSummary as DeepMimicBundleSummary, ConversionJob as DeepMimicConversionJob,
+    ConversionRequest as DeepMimicConversionRequest, ScanReport as DeepMimicScanReport,
+    TrainingOptions as DeepMimicTrainingOptions, TrainingProvenance as DeepMimicTrainingProvenance,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -124,13 +131,59 @@ pub struct ActionInput {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InitializationMode {
+    Resume,
+    Adapt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Initialization {
+    pub mode: InitializationMode,
+    pub parent_run_id: String,
+    pub checkpoint: String,
+    #[serde(default)]
+    pub reset_normalization: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundRecord {
+    pub run_id: String,
+    pub experiment_id: String,
+    pub round: u32,
+    pub task_id: String,
+    pub initialization: Option<Initialization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct Checkpoint {
+    pub id: String,
+    pub file: String,
+    pub sha256: String,
+    pub iteration: u32,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RoundSummary {
+    pub record: RoundRecord,
+    pub progress: Option<TrainingProgress>,
+    pub checkpoints: Vec<Checkpoint>,
+}
+
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingStartInput {
+    #[serde(default)]
+    pub initialization: Option<Initialization>,
+    #[serde(default)]
+    pub replace_existing_experiment: bool,
     /// Executable to run without going through a shell (for example `uv`).
     pub program: String,
     pub args: Vec<String>,
-    pub working_dir: String,
     pub virtual_machine_id: String,
     pub policy_id: Option<String>,
     pub experiment_id: Option<String>,
@@ -138,12 +191,13 @@ pub struct TrainingStartInput {
     pub teacher_motion_provenance: String,
     #[serde(default)]
     pub dataset_path: Option<String>,
+    #[serde(default)]
+    pub deepmimic: Option<DeepMimicTrainingOptions>,
 }
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TeacherEvaluationInput {
-    pub working_dir: String,
     pub virtual_machine_id: String,
     pub teacher_policy_id: String,
     pub task_id: String,
@@ -151,7 +205,7 @@ pub struct TeacherEvaluationInput {
     pub seed: u32,
 }
 
-#[derive(Debug, Clone, Serialize, specta::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingPolicyLayout {
     #[specta(type = specta_typescript::Number)]
@@ -162,9 +216,11 @@ pub struct TrainingPolicyLayout {
     pub command_encoding: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, specta::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingRunMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deepmimic: Option<DeepMimicTrainingProvenance>,
     pub experiment_id: String,
     pub body_template_id: String,
     pub body_version: u32,
@@ -176,7 +232,7 @@ pub struct TrainingRunMetadata {
     pub teacher_motion_provenance: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum TrainingPhase {
     Starting,
@@ -186,7 +242,7 @@ pub enum TrainingPhase {
     Stopped,
 }
 
-#[derive(Debug, Clone, Serialize, specta::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingProgress {
     pub run_id: String,
@@ -219,6 +275,43 @@ pub struct TrainingFrame {
     pub trunk_quaternion: [f64; 4],
     pub frame: SceneFrame,
     pub preview_scene: Option<SceneInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreviewInput {
+    pub run_id: String,
+    pub checkpoint_id: String,
+    pub virtual_machine_id: String,
+    #[serde(default)]
+    pub steps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreviewReport {
+    pub directory: String,
+    pub run_id: String,
+    pub checkpoint_id: String,
+    pub policy_sha256: String,
+    pub execution_fingerprint: String,
+    pub command: PreviewInput,
+    pub steps: u32,
+    pub policy_steps: u32,
+    pub seconds: f64,
+    pub displacement_m: [f64; 2],
+    pub min_height_m: f64,
+    pub max_tilt_deg: f64,
+    pub upright_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreview {
+    pub report: TrainingPreviewReport,
+    pub scene: SceneInfo,
+    pub sample_interval_ms: u32,
+    pub frames: Vec<TrainingFrame>,
 }
 
 #[derive(Debug, Clone, Deserialize, specta::Type)]
