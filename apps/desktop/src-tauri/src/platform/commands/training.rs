@@ -52,11 +52,25 @@ pub(crate) async fn training_rounds(
 
 #[tauri::command]
 #[specta::specta]
+pub(crate) async fn training_publication_targets(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<crate::types::PublicationTarget>, String> {
+    let config = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::training::rounds::publication_targets(config.as_deref())
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub(crate) async fn training_publish(
     state: State<'_, DesktopState>,
     run_id: String,
     checkpoint_id: String,
     name: String,
+    append_to: Option<String>,
 ) -> Result<crate::types::PolicyEntry, String> {
     let app = state
         .app_handle
@@ -70,6 +84,7 @@ pub(crate) async fn training_publish(
             &run_id,
             &checkpoint_id,
             &name,
+            append_to.as_deref(),
         )
     })
     .await

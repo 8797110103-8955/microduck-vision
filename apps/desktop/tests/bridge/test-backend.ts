@@ -208,6 +208,7 @@ export class TestBackend {
 
     switch (command) {
       case "training_rounds":
+      case "training_publication_targets":
         return [];
       case "training_tasks":
         return ["Mjlab-Velocity-Flat-MicroDuck", "Microduck-DeepMimic-Velstand-Flat-v1"];
@@ -403,6 +404,7 @@ export class TestBackend {
         };
       }
       case "policy_list":
+      case "policy_refresh":
         return this.policies.map((policy) => ({ ...policy }));
       case "policy_download":
         return this.downloadPolicy(stringValue(payloadRecord(payload).id, "id"));

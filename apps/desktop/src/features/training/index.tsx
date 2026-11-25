@@ -96,6 +96,12 @@ export const TrainingPage = defineComponent(() => {
     | null
   >(null);
   const publicationName = ref<string | null>(null);
+  const publicationTargets = ref<Awaited<ReturnType<typeof commands.trainingPublicationTargets>>>(
+    [],
+  );
+  const publicationTargetId = ref("");
+  const loadingPublicationTargets = ref(false);
+  let publicationTargetsEpoch = 0;
   const resetNormalization = ref(false);
   const publishing = ref(false);
   const previewing = ref(false);
@@ -174,6 +180,11 @@ export const TrainingPage = defineComponent(() => {
   const canOpenPublication = computed(
     () => selectedRound.value?.progress?.phase === "finished" && !!selectedCheckpoint.value,
   );
+  const compatiblePublicationTargets = computed(() =>
+    publicationTargets.value.filter(
+      (target) => target.servoModel === selectedRound.value?.progress?.metadata.servoProfile,
+    ),
+  );
   const initializationMode = computed(() => {
     const round = selectedRound.value;
     const active = progress.value;
@@ -216,6 +227,7 @@ export const TrainingPage = defineComponent(() => {
       history.runId = "";
     }
     enteredExperimentId.value = null;
+    publicationTargetId.value = "";
     replaceExperiment.value = true;
     initializationChoice.value = null;
   });
@@ -582,14 +594,29 @@ export const TrainingPage = defineComponent(() => {
       if (alive && epoch === roundsEpoch) loadingRounds.value = false;
     }
   };
+  const refreshPublicationTargets = async () => {
+    const epoch = ++publicationTargetsEpoch;
+    loadingPublicationTargets.value = true;
+    try {
+      const result = await commands.trainingPublicationTargets();
+      if (alive && epoch === publicationTargetsEpoch) publicationTargets.value = result;
+    } catch (reason) {
+      if (alive && epoch === publicationTargetsEpoch && publicationOpen.value)
+        error.value = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      if (alive && epoch === publicationTargetsEpoch) loadingPublicationTargets.value = false;
+    }
+  };
   const openPublication = () => {
     if (!canOpenPublication.value || !selectedRound.value) return;
     error.value = null;
     publicationName.value = null;
+    publicationTargetId.value = "";
     publicationMessage.value = "";
     histories.publication.experimentId = selectedRound.value.record.experimentId;
     histories.publication.runId = selectedRound.value.record.runId;
     publicationOpen.value = true;
+    void refreshPublicationTargets();
   };
   const roundPolling = useIntervalFn(() => void refreshRounds(true), 5000, { immediate: false });
   watch(
@@ -646,6 +673,7 @@ export const TrainingPage = defineComponent(() => {
     const parent = selectedRound.value;
     const checkpoint = selectedCheckpoint.value;
     const name = chosenPublicationName.value;
+    const appendTo = publicationTargetId.value || null;
     if (publishing.value || parent?.progress?.phase !== "finished" || !checkpoint || !name) return;
     publishing.value = true;
     error.value = null;
@@ -653,9 +681,15 @@ export const TrainingPage = defineComponent(() => {
     try {
       store.state.policies = await commands.policyList();
       if (hasPublishedPolicy(name)) return;
-      const policy = await commands.trainingPublish(parent.record.runId, checkpoint.id, name);
+      const policy = await commands.trainingPublish(
+        parent.record.runId,
+        checkpoint.id,
+        name,
+        appendTo,
+      );
       store.state.policies = await commands.policyList();
       publicationMessage.value = `已发布：${policy.name}`;
+      void refreshPublicationTargets();
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
     } finally {
@@ -864,6 +898,21 @@ export const TrainingPage = defineComponent(() => {
         </header>
         <div class={style.form}>
           {renderHistoryFields(publishing.value)}
+          <label>
+            <span>追加到</span>
+            <Select
+              value={publicationTargetId.value}
+              disabled={publishing.value || loadingPublicationTargets.value}
+              onSelectionChange={(select) => (publicationTargetId.value = select.value)}
+            >
+              <option value="">新建发布</option>
+              {compatiblePublicationTargets.value.map((target) => (
+                <option key={target.id} value={target.id}>
+                  {target.name}
+                </option>
+              ))}
+            </Select>
+          </label>
           <label>
             <span>策略名称</span>
             <input

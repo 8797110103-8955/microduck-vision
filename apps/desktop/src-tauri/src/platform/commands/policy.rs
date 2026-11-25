@@ -17,6 +17,17 @@ pub(crate) fn policy_list(state: State<'_, DesktopState>) -> Result<Vec<PolicyEn
 
 #[tauri::command]
 #[specta::specta]
+pub(crate) async fn policy_refresh(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<PolicyEntry>, String> {
+    let config = state.config_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || policy::refresh_list(config.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+#[specta::specta]
 pub(crate) fn policy_download(
     state: State<'_, DesktopState>,
     id: String,

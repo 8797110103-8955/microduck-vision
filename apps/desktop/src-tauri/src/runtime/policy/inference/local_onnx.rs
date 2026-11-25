@@ -25,6 +25,24 @@ pub(crate) struct TensorSpec {
 }
 
 impl TensorSpec {
+    pub(crate) fn for_policy(name: &str, width: usize, batch_symbol: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            element_type: "FLOAT".into(),
+            dimensions: vec![
+                batch_symbol.map_or(Dimension::Fixed(1), Dimension::Named),
+                Dimension::Fixed(width as i64),
+            ],
+        }
+    }
+
+    pub(crate) fn batch_symbol(&self) -> Option<String> {
+        match self.dimensions.first() {
+            Some(Dimension::Named(symbol)) => Some(symbol.clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn validate(&self, name: &str, width: usize) -> bool {
         self.name == name
             && self.element_type == "FLOAT"

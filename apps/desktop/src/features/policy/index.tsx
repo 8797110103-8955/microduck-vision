@@ -10,15 +10,20 @@ const isLocal = (id: string) => id.startsWith("training:");
 export const PolicyPage = defineComponent(() => {
   const store = useDesktopStore();
   const busy = ref<string | null>(null);
+  const refreshing = ref(false);
   const error = ref<string | null>(null);
   const refreshButton = shallowRef<HTMLButtonElement>();
 
-  const refresh = async () => {
+  const refresh = async (list = commands.policyList) => {
+    if (refreshing.value) return;
+    refreshing.value = true;
     try {
-      store.state.policies = await commands.policyList();
+      store.state.policies = await list();
       error.value = null;
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
+    } finally {
+      refreshing.value = false;
     }
   };
 
@@ -49,9 +54,10 @@ export const PolicyPage = defineComponent(() => {
   };
 
   onMounted(() => {
-    if (!store.state.policies.length && !store.state.loading) void refresh();
+    if (!store.state.policies.some((policy) => !isLocal(policy.id)))
+      void refresh(commands.policyRefresh);
   });
-  useEventListener(refreshButton, "click", () => void refresh());
+  useEventListener(refreshButton, "click", () => void refresh(commands.policyRefresh));
   const PolicyDownloadButton = defineComponent({
     props: {
       policyId: { type: String, required: true },
@@ -60,7 +66,12 @@ export const PolicyPage = defineComponent(() => {
       const button = shallowRef<HTMLButtonElement>();
       useEventListener(button, "click", () => void download(props.policyId));
       return () => (
-        <button ref={button} type="button" disabled={busy.value !== null} class={style.primary}>
+        <button
+          ref={button}
+          type="button"
+          disabled={busy.value !== null || refreshing.value}
+          class={style.primary}
+        >
           {busy.value === props.policyId ? "下载中…" : "下载"}
         </button>
       );
@@ -74,8 +85,12 @@ export const PolicyPage = defineComponent(() => {
           <h1>策略</h1>
           <p>查看官方和本地训练的 ONNX 文件。</p>
         </div>
-        <button ref={refreshButton} type="button" disabled={busy.value !== null}>
-          刷新
+        <button
+          ref={refreshButton}
+          type="button"
+          disabled={busy.value !== null || refreshing.value}
+        >
+          {refreshing.value ? "刷新中…" : "刷新"}
         </button>
       </header>
 

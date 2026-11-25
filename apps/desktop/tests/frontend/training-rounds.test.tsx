@@ -221,10 +221,14 @@ describe("training rounds and explicit publication", () => {
       },
     ]);
     const openResult = vi.spyOn(commands, "trainingOpenResult").mockResolvedValue(null);
+    vi.spyOn(commands, "trainingPublicationTargets").mockResolvedValue([
+      { id: "published-xl330", name: "XL330 collection", servoModel: "xl330" },
+      { id: "published-hd1910", name: "HD1910 collection", servoModel: "hd1910" },
+    ]);
     const publishedPolicy = {
       id: "training:published-a",
       name: "Walk stable",
-      file: "policy.onnx",
+      file: "Walk stable.onnx",
       sourceUrl: "",
       cached: true,
       selected: false,
@@ -270,6 +274,7 @@ describe("training rounds and explicit publication", () => {
     expect(field(wrapper, "历史轮次（继承或发布）").attributes("disabled")).toBeUndefined();
     await field(wrapper, "历史轮次（继承或发布）").setValue(round.record.runId);
     await buttonByText(wrapper, "策略发布").trigger("click");
+    await flushPromises();
     const page = wrapper.get('section[aria-label="策略发布"]');
     expect(
       page
@@ -282,6 +287,12 @@ describe("training rounds and explicit publication", () => {
     expect(page.text()).not.toContain("开始训练");
     expect(page.text()).toContain("step 10");
     expect(field(wrapper, "训练历史").text()).toContain("ppo-baseline-velstand-1234567");
+    const appendTo = field(wrapper, "追加到");
+    expect(appendTo.element).toHaveProperty("value", "");
+    expect(appendTo.findAll("option").map((option) => option.text())).toEqual([
+      "新建发布",
+      "XL330 collection",
+    ]);
     await buttonByText(wrapper, "预览").trigger("click");
     await flushPromises();
     expect(preview).toHaveBeenCalledWith({
@@ -320,8 +331,20 @@ describe("training rounds and explicit publication", () => {
     expect(buttonByText(wrapper, "发布").attributes("disabled")).toBeUndefined();
     await buttonByText(wrapper, "发布").trigger("click");
     await flushPromises();
-    expect(publish).toHaveBeenCalledWith("run-other", "model_10", "Walk stable");
+    expect(publish).toHaveBeenCalledWith("run-other", "model_10", "Walk stable", null);
     expect(wrapper.text()).toContain("已发布：Walk stable");
+    await field(wrapper, "追加到").setValue("published-xl330");
+    await field(wrapper, "训练历史").setValue("ppo-baseline-velstand-1234567");
+    expect(field(wrapper, "追加到").element).toHaveProperty("value", "published-xl330");
+    await field(wrapper, "策略名称").setValue("Walk baseline");
+    await buttonByText(wrapper, "发布").trigger("click");
+    await flushPromises();
+    expect(publish).toHaveBeenLastCalledWith(
+      "run-baseline",
+      "model_10",
+      "Walk baseline",
+      "published-xl330",
+    );
     await buttonByText(wrapper, "返回训练").trigger("click");
     expect(wrapper.get('section[aria-label="本地训练"]').text()).toContain("停止");
     wrapper.unmount();

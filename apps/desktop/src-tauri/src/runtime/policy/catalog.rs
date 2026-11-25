@@ -4,92 +4,35 @@
 //! Downloads and cache layout stay here so a policy can be replaced without
 //! changing the loop-body crate.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::runtime::machines::body_catalog;
 use crate::runtime::policy::inference::{PolicyConfig, PolicyDescriptor};
+use crate::runtime::policy::manifest::{
+    MANIFEST_FILE, ManifestPolicy, is_onnx_filename, model_file, read_manifest,
+};
+use crate::runtime::policy::{
+    OFFICIAL_POLICIES, TRAINED_POLICIES, policy_directory, publication_directories,
+};
 use crate::runtime::session::execution::PreviewPolicySelection;
-use crate::training::policy_artifacts as training_policy;
-use crate::training::rounds::published_root;
+use crate::training::policy_artifacts::PublishedPolicy;
 use duck_control::policy::Net;
 use microduck_training::artifacts::ID_PREFIX as TRAINING_ID_PREFIX;
-use serde::Deserialize;
 
 use crate::types::{PolicyCommand, PolicyEntry};
 
-const CACHE_DIR: &str = "policies/official";
-const MANIFEST_FILE: &str = "manifest.json";
 const MANIFEST_URL: &str =
     "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/manifest.json";
 const SELECTED_FILE: &str = ".selected";
 const DOWNLOAD_ATTEMPTS: u8 = 3;
 const MANIFEST_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-
-#[derive(Debug, Clone, Deserialize)]
-struct OfficialManifest {
-    policies: Vec<ManifestPolicy>,
-    #[serde(default)]
-    obs_len: Option<usize>,
-    #[serde(default)]
-    action_len: Option<usize>,
-    #[serde(default)]
-    body_id: Option<String>,
-    #[serde(default)]
-    body_version: Option<u32>,
-    #[serde(default)]
-    control_hz: Option<u32>,
-    #[serde(default)]
-    robot: Option<ManifestRobot>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ManifestRobot {
-    #[serde(default)]
-    control_hz: Option<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ManifestPolicy {
-    file: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    slot: Option<String>,
-    #[serde(default)]
-    duration_s: Option<f64>,
-    #[serde(default)]
-    command: Option<PolicyCommand>,
-    #[serde(default)]
-    action_scale: Option<f64>,
-    #[serde(default)]
-    obs_len: Option<usize>,
-    #[serde(default)]
-    action_len: Option<usize>,
-    #[serde(default)]
-    body_id: Option<String>,
-    #[serde(default)]
-    body_version: Option<u32>,
-    #[serde(default)]
-    control_hz: Option<u32>,
-    #[serde(default)]
-    command_encoding: Option<String>,
-    #[serde(default)]
-    recurrent: Option<bool>,
-    #[serde(default)]
-    head_lowpass: Option<f64>,
-    #[serde(default)]
-    legs_lowpass: Option<f64>,
-    #[serde(default)]
-    joint_velocity_delay_ticks: Option<u32>,
-    #[serde(default)]
-    imu_required: bool,
-}
+static MANIFEST_REFRESH: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 struct OfficialSource {
@@ -118,21 +61,24 @@ struct OfficialSource {
 pub(crate) fn cached_policy_selections(
     config: &Path,
 ) -> Result<Option<Vec<PreviewPolicySelection>>, String> {
-    let root = cache_root(Some(config));
+    let root = policy_directory(Some(config), OFFICIAL_POLICIES);
     if !root.join(MANIFEST_FILE).is_file() {
         return Ok(None);
     }
-    official_entries(Some(config))?
+    sources(Some(config))?
         .into_iter()
-        .filter(|entry| entry.cached)
-        .map(|entry| {
+        .filter_map(|source| {
+            let (path, _) = model_file(&root, &source.file).ok()?;
+            Some((source, path))
+        })
+        .map(|(source, path)| {
             Ok(PreviewPolicySelection {
-                path: root.join(&entry.file),
-                command: entry.command.clone(),
-                descriptor: descriptor(Some(config), &entry)?,
-                config: runtime_config(Some(config), &entry)?,
-                episodic: entry.kind.as_deref() == Some("episodic"),
-                duration: entry
+                path,
+                descriptor: source_descriptor(&source),
+                config: source_runtime_config(&source)?,
+                command: source.command,
+                episodic: source.kind.as_deref() == Some("episodic"),
+                duration: source
                     .duration_s
                     .filter(|duration| duration.is_finite() && *duration > 0.0)
                     .and_then(|duration| Duration::try_from_secs_f64(duration).ok()),
@@ -154,20 +100,24 @@ pub(crate) fn descriptor(
         .into_iter()
         .find(|source| source.id == entry.id)
         .ok_or_else(|| format!("unknown official policy: {}", entry.id))?;
-    Ok(PolicyDescriptor {
-        id: source.id,
-        body_id: source.body_id.unwrap_or_else(|| "official".into()),
+    Ok(source_descriptor(&source))
+}
+
+fn source_descriptor(source: &OfficialSource) -> PolicyDescriptor {
+    PolicyDescriptor {
+        id: source.id.clone(),
+        body_id: source.body_id.clone().unwrap_or_else(|| "official".into()),
         body_version: source.body_version.unwrap_or(1),
         obs_len: source.obs_len.unwrap_or(61),
         action_len: source.action_len.unwrap_or(14),
         control_hz: source.control_hz.unwrap_or(50),
-        command_encoding: source.command_encoding,
+        command_encoding: source.command_encoding.clone(),
         recurrent: source.recurrent,
         action_scale: source.action_scale,
         head_lowpass: source.head_lowpass,
         legs_lowpass: source.legs_lowpass,
         joint_velocity_delay_ticks: source.joint_velocity_delay_ticks.unwrap_or(1),
-    })
+    }
 }
 
 /// Resolve controller tuning once, identically for preview and physical loops.
@@ -179,6 +129,10 @@ pub(crate) fn runtime_config(
         .into_iter()
         .find(|source| source.id == entry.id)
         .ok_or_else(|| format!("unknown official policy: {}", entry.id))?;
+    source_runtime_config(&source)
+}
+
+fn source_runtime_config(source: &OfficialSource) -> Result<PolicyConfig, String> {
     let name = Path::new(&source.file)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -202,7 +156,7 @@ pub(crate) fn runtime_config(
         .action_scale
         .unwrap_or(PolicyConfig::default().action_scale);
     if !action_scale.is_finite() || action_scale <= 0.0 {
-        return Err(format!("invalid action_scale for policy: {}", entry.id));
+        return Err(format!("invalid action_scale for policy: {}", source.id));
     }
     Ok(PolicyConfig {
         net,
@@ -213,19 +167,8 @@ pub(crate) fn runtime_config(
     })
 }
 
-pub(crate) fn cache_root(config_dir: Option<&Path>) -> PathBuf {
-    config_dir
-        .and_then(Path::parent)
-        .map(|root| root.join(CACHE_DIR))
-        .unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("microduck-vision")
-                .join(CACHE_DIR)
-        })
-}
-
 pub(crate) fn open_folder(config_dir: Option<&Path>) -> Result<(), String> {
-    let folder = std::path::absolute(cache_root(config_dir))
+    let folder = std::path::absolute(policy_directory(config_dir, OFFICIAL_POLICIES))
         .map_err(|error| format!("解析策略缓存目录失败：{error}"))?;
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     #[cfg(target_os = "windows")]
@@ -242,22 +185,21 @@ pub(crate) fn open_folder(config_dir: Option<&Path>) -> Result<(), String> {
 }
 
 fn official_entries(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String> {
-    let root = cache_root(config_dir);
+    let root = policy_directory(config_dir, OFFICIAL_POLICIES);
     let selected = read_selected(&root);
     let sources = sources(config_dir)?;
     Ok(sources
         .iter()
         .map(|source| {
-            let path = root.join(&source.file);
-            let size = std::fs::metadata(&path)
-                .map(|metadata| metadata.len())
+            let size = model_file(&root, &source.file)
+                .map(|(_, size)| size)
                 .unwrap_or(0);
             PolicyEntry {
                 id: source.id.clone(),
                 name: source.name.clone(),
                 file: source.file.clone(),
                 source_url: source.url.clone(),
-                cached: path.is_file() && size > 0,
+                cached: size > 0,
                 selected: selected.as_deref() == Some(&source.id),
                 size,
                 kind: source.kind.clone(),
@@ -273,74 +215,58 @@ pub(crate) fn is_training_policy(id: &str) -> bool {
     id.starts_with(TRAINING_ID_PREFIX)
 }
 
-fn training_run(config_dir: Option<&Path>, id: &str) -> Result<PathBuf, String> {
-    let run = id
+fn published_policies(config_dir: Option<&Path>) -> BTreeMap<String, PublishedPolicy> {
+    let mut policies = BTreeMap::new();
+    // Resolve duplicate IDs in directory order and then manifest order, before checking any models.
+    for directory in publication_directories(&policy_directory(config_dir, TRAINED_POLICIES)) {
+        if let Ok(listed) = PublishedPolicy::from_manifest(&directory) {
+            for policy in listed {
+                policies.insert(policy.id().to_owned(), policy);
+            }
+        }
+    }
+    policies
+}
+
+fn published_policy(config_dir: Option<&Path>, id: &str) -> Result<PublishedPolicy, String> {
+    let id = id
         .strip_prefix(TRAINING_ID_PREFIX)
         .ok_or("训练策略来源无效")?;
-    if !matches!(
-        Path::new(run).components().collect::<Vec<_>>().as_slice(),
-        [std::path::Component::Normal(_)]
-    ) {
-        return Err("训练任务目录无效".into());
-    }
-    let root = published_root(config_dir)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let path = root
-        .join(run)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    if path.parent() != Some(root.as_path()) {
-        return Err("训练任务目录超出工作区".into());
-    }
-    Ok(path)
+    published_policies(config_dir)
+        .remove(id)
+        .ok_or_else(|| format!("找不到已发布策略：{id}"))
 }
 
 pub(crate) fn resolve_training_policy(
     config_dir: Option<&Path>,
     id: &str,
 ) -> Result<PreviewPolicySelection, String> {
-    training_policy::resolve(
-        &training_run(config_dir, id)?,
-        id.to_owned(),
-        body_catalog::official()?,
-    )
+    published_policy(config_dir, id)?.resolve(body_catalog::official()?)
 }
 
 pub(in crate::runtime) fn selected_training_policy(
     config_dir: Option<&Path>,
     id: &str,
 ) -> Result<PreviewPolicySelection, String> {
-    if read_selected(&cache_root(config_dir)).as_deref() != Some(id) {
+    if read_selected(&policy_directory(config_dir, OFFICIAL_POLICIES)).as_deref() != Some(id) {
         return Err("请先选择该训练策略".into());
     }
     resolve_training_policy(config_dir, id)
 }
 
 pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String> {
-    let selected = read_selected(&cache_root(config_dir));
-    let mut local: Vec<_> = std::fs::read_dir(published_root(config_dir))
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|run| run.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|run| {
-            run.file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("published-"))
-        })
-        .filter_map(|run| {
-            let id = format!("{}{}", TRAINING_ID_PREFIX, run.file_name().to_str()?);
-            let active = selected.as_deref() == Some(&id);
-            let mut entry = training_policy::entry(&run.path(), id, active).ok()?;
-            let publication: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(run.path().join("publication.json")).ok()?)
-                    .ok()?;
-            entry.name = publication["name"].as_str()?.to_owned();
-            Some(entry)
+    let selected = read_selected(&policy_directory(config_dir, OFFICIAL_POLICIES));
+    let selected = selected
+        .as_deref()
+        .and_then(|id| id.strip_prefix(TRAINING_ID_PREFIX));
+    let local: Vec<_> = published_policies(config_dir)
+        .into_values()
+        .rev()
+        .map(|policy| {
+            let active = selected == Some(policy.id());
+            policy.entry(active)
         })
         .collect();
-    local.sort_by(|left, right| right.id.cmp(&left.id));
     match official_entries(config_dir) {
         Ok(mut official) => {
             official.extend(local);
@@ -351,12 +277,17 @@ pub(crate) fn list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String
     }
 }
 
+pub(crate) fn refresh_list(config_dir: Option<&Path>) -> Result<Vec<PolicyEntry>, String> {
+    refresh_manifest(config_dir)?;
+    list(config_dir)
+}
+
 pub(crate) fn download(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry, String> {
     let source = sources(config_dir)?
         .into_iter()
         .find(|source| source.id == id)
         .ok_or_else(|| format!("unknown official policy: {id}"))?;
-    let root = cache_root(config_dir);
+    let root = policy_directory(config_dir, OFFICIAL_POLICIES);
     std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let temporary = root.join(format!(".{}.download", source.file));
     let _ = std::fs::remove_file(&temporary);
@@ -419,7 +350,9 @@ fn download_file(url: &str, target: &Path) -> Result<(), String> {
 
 pub(crate) fn select(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry, String> {
     if is_training_policy(id) {
-        let selection = resolve_training_policy(config_dir, id)?;
+        let published = published_policy(config_dir, id)?;
+        let entry = published.entry(true);
+        let selection = published.resolve(body_catalog::official()?)?;
         let expected = &selection
             .training
             .as_ref()
@@ -430,8 +363,7 @@ pub(crate) fn select(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry,
         if format!("{:x}", Sha256::digest(&bytes)) != *expected {
             return Err("训练 ONNX 文件摘要与产物清单不一致".into());
         }
-        let entry = training_policy::entry(&training_run(config_dir, id)?, id.to_owned(), true)?;
-        let root = cache_root(config_dir);
+        let root = policy_directory(config_dir, OFFICIAL_POLICIES);
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
         std::fs::write(root.join(SELECTED_FILE), id).map_err(|error| error.to_string())?;
         return Ok(entry);
@@ -441,14 +373,8 @@ pub(crate) fn select(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry,
         .iter()
         .find(|source| source.id == id)
         .ok_or_else(|| format!("unknown official policy: {id}"))?;
-    let root = cache_root(config_dir);
-    let path = root.join(&source.file);
-    let size = std::fs::metadata(&path)
-        .map_err(|_| "请先下载这个官方策略".to_owned())?
-        .len();
-    if size == 0 {
-        return Err("请先下载这个官方策略".into());
-    }
+    let root = policy_directory(config_dir, OFFICIAL_POLICIES);
+    model_file(&root, &source.file).map_err(|_| "请先下载这个官方策略".to_owned())?;
     std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     std::fs::write(root.join(SELECTED_FILE), &source.id).map_err(|error| error.to_string())?;
     official_entries(config_dir)?
@@ -458,62 +384,53 @@ pub(crate) fn select(config_dir: Option<&Path>, id: &str) -> Result<PolicyEntry,
 }
 
 pub(crate) fn selected_path(config_dir: Option<&Path>) -> Option<PathBuf> {
-    let root = cache_root(config_dir);
+    let root = policy_directory(config_dir, OFFICIAL_POLICIES);
     let id = read_selected(&root)?;
     let source = sources(config_dir)
         .ok()?
         .into_iter()
         .find(|source| source.id == id)?;
-    let path = root.join(source.file);
-    path.is_file().then_some(path)
+    model_file(&root, &source.file).ok().map(|(path, _)| path)
 }
 
 fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
-    let manifest = load_manifest(config_dir)?;
-    let default_obs_len = manifest.obs_len;
-    let default_action_len = manifest.action_len;
-    let default_body_id = manifest.body_id;
-    let default_body_version = manifest.body_version;
-    let default_control_hz = manifest
-        .control_hz
-        .or_else(|| manifest.robot.and_then(|robot| robot.control_hz));
+    let Some(manifest) = read_manifest::<ManifestPolicy>(
+        &policy_directory(config_dir, OFFICIAL_POLICIES).join(MANIFEST_FILE),
+    )?
+    else {
+        return Ok(Vec::new());
+    };
     Ok(manifest
         .policies
         .into_iter()
-        .filter_map(|policy| {
-            let path = Path::new(&policy.file);
-            let file_name = path.file_name()?.to_str()?;
-            if file_name != policy.file || !file_name.ends_with(".onnx") {
+        .filter_map(|mut policy| {
+            if !is_onnx_filename(&policy.file) {
                 return None;
             }
+            policy.apply_defaults(&manifest.defaults);
+            let path = Path::new(&policy.file);
             let stem = path.file_stem()?.to_str()?;
             let id = stem.replace('_', "-");
             let name = policy.name.unwrap_or_else(|| stem.replace('_', " "));
-            let command_encoding = policy.command_encoding.or_else(|| {
-                policy
-                    .command
-                    .as_ref()
-                    .and_then(|command| command.encoding.clone())
-            });
             Some(OfficialSource {
                 id,
                 name,
                 file: policy.file.clone(),
                 url: format!(
                     "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/{}",
-                    file_name
+                    policy.file
                 ),
                 kind: policy.kind,
                 slot: policy.slot,
                 duration_s: policy.duration_s,
                 command: policy.command,
                 action_scale: policy.action_scale,
-                obs_len: policy.obs_len.or(default_obs_len),
-                action_len: policy.action_len.or(default_action_len),
-                body_id: policy.body_id.or_else(|| default_body_id.clone()),
-                body_version: policy.body_version.or(default_body_version),
-                control_hz: policy.control_hz.or(default_control_hz),
-                command_encoding,
+                obs_len: policy.obs_len,
+                action_len: policy.action_len,
+                body_id: policy.body_id,
+                body_version: policy.body_version,
+                control_hz: policy.control_hz,
+                command_encoding: policy.command_encoding,
                 recurrent: policy.recurrent,
                 head_lowpass: policy.head_lowpass,
                 legs_lowpass: policy.legs_lowpass,
@@ -524,13 +441,15 @@ fn sources(config_dir: Option<&Path>) -> Result<Vec<OfficialSource>, String> {
         .collect())
 }
 
-fn load_manifest(config_dir: Option<&Path>) -> Result<OfficialManifest, String> {
-    let root = cache_root(config_dir);
+fn refresh_manifest(config_dir: Option<&Path>) -> Result<(), String> {
+    let _refresh = MANIFEST_REFRESH.lock().map_err(|error| error.to_string())?;
+    let root = policy_directory(config_dir, OFFICIAL_POLICIES);
     std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let cache = root.join(MANIFEST_FILE);
-    let cached = std::fs::read(&cache)
+    let has_cache = read_manifest::<ManifestPolicy>(&cache)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<OfficialManifest>(&bytes).ok());
+        .flatten()
+        .is_some();
     let cache_is_fresh = std::fs::metadata(&cache)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -538,24 +457,24 @@ fn load_manifest(config_dir: Option<&Path>) -> Result<OfficialManifest, String> 
         .map(|age| age < MANIFEST_MAX_AGE)
         .unwrap_or(false);
 
-    if let Some(manifest) = cached.as_ref().filter(|_| cache_is_fresh) {
-        return Ok(manifest.clone());
+    if has_cache && cache_is_fresh {
+        return Ok(());
     }
 
     let temporary = root.join(format!(".{MANIFEST_FILE}.download"));
     let _ = std::fs::remove_file(&temporary);
-    match download_file(MANIFEST_URL, &temporary).and_then(|_| {
-        let bytes = std::fs::read(&temporary)
-            .map_err(|error| format!("读取官方 manifest 失败：{error}"))?;
-        let manifest = serde_json::from_slice::<OfficialManifest>(&bytes)
-            .map_err(|error| format!("解析官方 manifest 失败：{error}"))?;
+    let result = download_file(MANIFEST_URL, &temporary).and_then(|_| {
+        read_manifest::<ManifestPolicy>(&temporary)?.ok_or("下载的官方 manifest 不存在")?;
         std::fs::rename(&temporary, &cache)
-            .map_err(|error| format!("缓存官方 manifest 失败：{error}"))?;
-        Ok(manifest)
-    }) {
-        Ok(manifest) => Ok(manifest),
-        Err(error) => cached.ok_or(error),
+            .map_err(|error| format!("缓存官方 manifest 失败：{error}"))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        if has_cache {
+            return Ok(());
+        }
     }
+    result
 }
 
 fn read_selected(root: &Path) -> Option<String> {
@@ -567,11 +486,16 @@ fn read_selected(root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MANIFEST_FILE, cache_root, list, select};
+    use super::{
+        MANIFEST_FILE, MANIFEST_MAX_AGE, OFFICIAL_POLICIES, cached_policy_selections, list,
+        policy_directory, select,
+    };
+    use std::fs::{self, FileTimes, OpenOptions};
     use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     fn write_manifest(config: &Path) {
-        let root = cache_root(Some(config));
+        let root = policy_directory(Some(config), OFFICIAL_POLICIES);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(MANIFEST_FILE),
@@ -589,7 +513,7 @@ mod tests {
     fn policy_cache_is_next_to_config_not_inside_it() {
         let config = PathBuf::from("C:/microduck/config");
         assert_eq!(
-            cache_root(Some(&config)),
+            policy_directory(Some(&config), OFFICIAL_POLICIES),
             PathBuf::from("C:/microduck/policies/official")
         );
     }
@@ -620,6 +544,37 @@ mod tests {
             Some("constant")
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn onnx_preview_uses_expired_manifest_during_a_refresh() {
+        let root = crate::platform::helpers::test_directory().join("onnx-preview-cache");
+        let config = root.join("config");
+        write_manifest(&config);
+        let cache = policy_directory(Some(&config), OFFICIAL_POLICIES);
+        OpenOptions::new()
+            .write(true)
+            .open(cache.join(MANIFEST_FILE))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now() - MANIFEST_MAX_AGE))
+            .unwrap();
+        let download = cache.join(format!(".{MANIFEST_FILE}.download"));
+        fs::write(&download, b"in-flight manifest download").unwrap();
+        fs::write(cache.join("velstand.onnx"), b"cached ONNX").unwrap();
+        fs::write(cache.join("unlisted.onnx"), b"unlisted ONNX").unwrap();
+
+        let entries = list(Some(&config)).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id == "velstand" && entry.cached)
+        );
+        assert!(!entries.iter().any(|entry| entry.id == "unlisted"));
+        let policies = cached_policy_selections(&config).unwrap().unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].descriptor.id, "velstand");
+        assert_eq!(fs::read(download).unwrap(), b"in-flight manifest download");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

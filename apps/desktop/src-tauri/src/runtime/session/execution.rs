@@ -620,7 +620,7 @@ impl PolicyExecution {
             return Err("当前真机后端无法提供该策略所需的 IMU 反馈".into());
         }
         let runtime = if let Some(training) = &selection.training {
-            if training.requires_backlash
+            if training.requires_backlash()
                 && !self.simulation_body.as_ref().is_some_and(|body| {
                     body.profile.model_kind
                         == microduck_body_runtime::models::profile::ModelKind::Xl330

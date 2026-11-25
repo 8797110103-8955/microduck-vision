@@ -937,6 +937,14 @@ pub struct PolicyEntry {
     pub command: Option<PolicyCommand>,
 }
 
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationTarget {
+    pub id: String,
+    pub name: String,
+    pub servo_model: ServoModelKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ServoModelKey {

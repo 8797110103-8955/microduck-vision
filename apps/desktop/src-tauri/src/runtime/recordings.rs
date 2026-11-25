@@ -499,6 +499,13 @@ fn recording_path(config: Option<&Path>, id: &str) -> Result<PathBuf, String> {
     Ok(root(config).join(id))
 }
 
+pub(crate) fn recording_name(config: Option<&Path>, id: &str) -> Result<String, String> {
+    let path = recording_path(config, id)?.join("manifest.json");
+    let info: RecordingInfo = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(info.name)
+}
+
 pub(crate) fn reveal_file(config: Option<&Path>, id: &str, motion: bool) -> Result<(), String> {
     let file = if motion {
         "motion.jsonl"

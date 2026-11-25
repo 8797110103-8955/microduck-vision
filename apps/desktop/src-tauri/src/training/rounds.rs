@@ -1,13 +1,17 @@
 //! Experiment rounds, checkpoint lineage and explicit immutable policy publication.
 
 use crate::{
+    runtime::policy::{TRAINED_POLICIES, policy_directory},
     runtime::session::state::DesktopState,
     types::{
-        Checkpoint, PolicyEntry, RoundRecord, RoundSummary, ServoModelKey, TrainingProgress,
-        TrainingStartInput,
+        Checkpoint, PolicyEntry, PublicationTarget, RoundRecord, RoundSummary, ServoModelKey,
+        TrainingProgress, TrainingStartInput,
     },
 };
-use microduck_training::{deepmimic::valid_id, progress::training_runs_root};
+use microduck_training::{
+    deepmimic::{MotionManifest, valid_id},
+    progress::training_runs_root,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -342,12 +346,40 @@ pub(crate) fn install_initialization(
     Ok(())
 }
 
-pub(crate) fn published_root(config: Option<&Path>) -> PathBuf {
-    training_runs_root(config)
-        .parent()
-        .and_then(Path::parent)
-        .expect("application data directory")
-        .join("policies/trained")
+fn publication_reference(
+    config: Option<&Path>,
+    directory: &Path,
+    progress: Option<&TrainingProgress>,
+) -> super::policy_artifacts::PublicationReference {
+    #[derive(serde::Deserialize)]
+    struct MotionReference {
+        bundle_manifest: MotionManifest,
+    }
+
+    let motion = read::<MotionReference>(&directory.join("training-metadata.json"))
+        .ok()
+        .map(|reference| reference.bundle_manifest);
+    let training_policy_name = if let Some(motion) = &motion {
+        crate::runtime::recordings::recording_name(config, &motion.source.recording_id).ok()
+    } else {
+        progress
+            .and_then(|progress| progress.metadata.policy_id.clone())
+            .map(|id| {
+                crate::runtime::policy::catalog::list(config)
+                    .ok()
+                    .and_then(|policies| policies.into_iter().find(|policy| policy.id == id))
+                    .map_or(id, |policy| policy.name)
+            })
+    };
+    super::policy_artifacts::PublicationReference {
+        task_id: None,
+        motion_name: motion.map(|motion| motion.name),
+        training_policy_name,
+    }
+}
+
+pub(crate) fn publication_targets(config: Option<&Path>) -> Vec<PublicationTarget> {
+    super::policy_artifacts::publication_targets(&policy_directory(config, TRAINED_POLICIES))
 }
 
 pub(crate) fn publish(
@@ -355,42 +387,41 @@ pub(crate) fn publish(
     run_id: &str,
     checkpoint_id: &str,
     name: &str,
+    append_to: Option<&str>,
 ) -> Result<PolicyEntry, String> {
     let _guard = state.training_start.lock().map_err(|e| e.to_string())?;
     if name.trim().is_empty() {
         return Err("请填写发布名称".into());
     }
-    let directory = directory(state.config_dir.as_deref(), run_id)?;
-    let (_, info, snapshot) = checkpoint(&directory, checkpoint_id)?;
-    let selection = super::policy_artifacts::resolve(
-        &snapshot,
-        "candidate".into(),
-        crate::runtime::machines::body_catalog::official()?,
-    )?;
-    let bytes = fs::read(&selection.path).map_err(|e| e.to_string())?;
-    let training = selection.training.ok_or("候选策略缺少合同")?;
-    if format!("{:x}", Sha256::digest(&bytes)) != training.sha256 {
-        return Err("ONNX 摘要无效".into());
-    }
-    crate::runtime::policy::inference::validate_candidate(&bytes, &training.spec)?;
-    let id = format!("published-{}", uuid::Uuid::new_v4());
-    let root = published_root(state.config_dir.as_deref());
-    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let pending = root.join(format!(".{id}"));
-    fs::create_dir(&pending).map_err(|e| e.to_string())?;
-    fs::write(pending.join("policy.onnx"), bytes).map_err(|e| e.to_string())?;
-    let mut artifact: serde_json::Value = read(&snapshot.join("artifact.json"))?;
-    artifact["onnx_path"] = "policy.onnx".into();
-    write(&pending.join("artifact.json"), &artifact)?;
-    write(
-        &pending.join("publication.json"),
-        &serde_json::json!({"name":name.trim(),"runId":run_id,"checkpoint":info,"round":read::<RoundRecord>(&directory.join("round.json"))?}),
-    )?;
-    let target = root.join(&id);
-    fs::rename(&pending, &target).map_err(|e| e.to_string())?;
-    let mut entry = super::policy_artifacts::entry(&target, format!("training:{id}"), false)?;
-    entry.name = name.trim().into();
-    Ok(entry)
+    let config = state.config_dir.as_deref();
+    let directory = directory(config, run_id)?;
+    let (_, _, snapshot) = checkpoint(&directory, checkpoint_id)?;
+    let progress = read::<TrainingProgress>(&directory.join("progress.json")).ok();
+    let body = crate::runtime::machines::body_catalog::official()?;
+    let selection = super::policy_artifacts::resolve(&snapshot, "candidate".into(), body)?;
+    let _publication_lock = if append_to.is_some() {
+        // Serialize appends across desktop instances while keeping lock files out of policy bundles.
+        let lock = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(training_runs_root(config).with_file_name(".publication.lock"))
+            .map_err(|error| format!("打开发布锁失败：{error}"))?;
+        lock.lock()
+            .map_err(|error| format!("锁定发布目录失败：{error}"))?;
+        Some(lock)
+    } else {
+        None
+    };
+    super::policy_artifacts::publish(
+        &policy_directory(config, TRAINED_POLICIES),
+        name.trim(),
+        body,
+        selection,
+        publication_reference(config, &directory, progress.as_ref()),
+        progress.map(|progress| progress.metadata.servo_profile),
+        append_to,
+    )
 }
 
 #[cfg(test)]
@@ -447,7 +478,7 @@ mod tests {
         assert!(first.ends_with("rehearsal/round-0001"));
         assert!(second.ends_with("rehearsal/round-0002"));
         assert_eq!(list(Some(&config)).unwrap().len(), 2);
-        assert!(!published_root(Some(&config)).exists());
+        assert!(!policy_directory(Some(&config), TRAINED_POLICIES).exists());
         assert!(directory(Some(&config), "../outside").is_err());
         request.experiment_id = Some("../outside".into());
         assert!(allocate(Some(&config), &mut request, "run-three").is_err());
