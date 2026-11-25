@@ -74,7 +74,7 @@ pnpm release # 默认发布目录 `target/bin/`
 ## ON MY WAY
 
 > 自训练 ONNX 默认加载 %APPDATA%/microduck-vision/policies/trained/****/manifest.json  
-> aaa
+> 可左转 [release](https://github.com/8797110103-8955/microduck-vision/releases) 下载模仿策略
 
 - [x] DeepMimic 风格的运动模仿训练。
 - [ ] DeepMimic -> Eureka
